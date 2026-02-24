@@ -771,6 +771,7 @@ export async function processReviewJob(data: ReviewJobData) {
     const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), diffPatch);
     await runCodexStage({
       stage: "editor",
+      repoPath,
       bundleDir,
       outDir,
       codexHomeDir,
