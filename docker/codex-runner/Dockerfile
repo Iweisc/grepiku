@@ -14,7 +14,7 @@ RUN cargo build -p codex-exec --release --locked
 
 FROM node:20-bookworm
 RUN apt-get update \
-  && apt-get install -y ripgrep git ca-certificates \
+  && apt-get install -y ripgrep git ca-certificates libcap2 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=codex-build /opt/codex/target/release/codex-exec /usr/local/bin/codex-exec
 
