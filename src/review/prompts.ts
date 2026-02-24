@@ -18,7 +18,7 @@ Rules:
 - Only comment on lines that exist in diff.patch.
 - Default to RIGHT side unless the issue is on removed code.
 - Evidence is required for every comment (quote from diff/context).
-- Do not include evidence quotes in `body`; put them only in `evidence`.
+- Do not include evidence quotes in body; put them only in evidence.
 - Avoid formatting/style nits.
 - Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.
 - Blocking requires concrete evidence and a clear fix/suggested patch.
@@ -80,7 +80,7 @@ ${draftReviewJson}
 Rules to enforce:
 - Only comment on diff lines.
 - Evidence required.
-- Do not include evidence quotes in `body`; keep quotes only in `evidence`.
+- Do not include evidence quotes in body; keep quotes only in evidence.
 - Blocking requires clear fix/suggested patch.
 - Inline comments must include a suggested_patch or be converted to summary comments.
 - Drop weak, speculative, or style-only comments.
