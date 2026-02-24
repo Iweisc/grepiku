@@ -13,7 +13,8 @@ import {
   VerdictsSchema,
   ChecksSchema,
   ReviewComment,
-  ReviewCommentSchema
+  ReviewCommentSchema,
+  ChecksOutput
 } from "./schemas.js";
 import {
   buildDiffIndex,
