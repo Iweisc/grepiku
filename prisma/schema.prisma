@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RunStatus {
+  queued
+  running
+  completed
+  failed
+}
+
+enum FindingStatus {
+  open
+  fixed
+  obsolete
+}
+
+enum ToolKind {
+  lint
+  build
+  test
+}
+
+enum ToolStatus {
+  pass
+  fail
+  timeout
+  skipped
+  error
+}
+
+model RepoInstallation {
+  id              Int      @id @default(autoincrement())
+  installationId  Int      @unique
+  owner           String
+  repo            String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  pullRequests    PullRequest[]
+  toolRuns        ToolRun[]
+}
+
+model PullRequest {
+  id                  Int      @id @default(autoincrement())
+  repoInstallationId  Int
+  number              Int
+  title               String?
+  url                 String?
+  headSha             String
+  baseSha             String
+  state               String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  repoInstallation RepoInstallation @relation(fields: [repoInstallationId], references: [id])
+  runs            Run[]
+  findings        Finding[]
+  statusComment   StatusComment?
+
+  @@unique([repoInstallationId, number])
+}
+
+model Run {
+  id            Int       @id @default(autoincrement())
+  pullRequestId Int
+  headSha       String
+  status        RunStatus
+  startedAt     DateTime?
+  completedAt   DateTime?
+  draftJson     Json?
+  finalJson     Json?
+  verdictsJson  Json?
+  checksJson    Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  pullRequest PullRequest @relation(fields: [pullRequestId], references: [id])
+  findings    Finding[]
+
+  @@unique([pullRequestId, headSha])
+}
+
+model Finding {
+  id             Int           @id @default(autoincrement())
+  pullRequestId  Int
+  runId          Int
+  status         FindingStatus
+  fingerprint    String
+  hunkHash       String
+  contextHash    String
+  commentId      String
+  commentKey     String
+  path           String
+  line           Int
+  side           String
+  severity       String
+  category       String
+  title          String
+  body           String
+  evidence       String
+  suggestedPatch String?
+  githubCommentId String?
+  githubReviewId  String?
+  firstSeenRunId Int
+  lastSeenRunId  Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  pullRequest PullRequest @relation(fields: [pullRequestId], references: [id])
+  run         Run         @relation(fields: [runId], references: [id])
+}
+
+model ToolRun {
+  id                 Int        @id @default(autoincrement())
+  repoInstallationId Int
+  prNumber           Int
+  headSha            String
+  tool               ToolKind
+  status             ToolStatus
+  summary            String
+  topErrors          Json
+  logPath            String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  repoInstallation RepoInstallation @relation(fields: [repoInstallationId], references: [id])
+
+  @@unique([repoInstallationId, prNumber, headSha, tool])
+}
+
+model StatusComment {
+  id              Int      @id @default(autoincrement())
+  pullRequestId   Int      @unique
+  githubCommentId String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  pullRequest PullRequest @relation(fields: [pullRequestId], references: [id])
+}
