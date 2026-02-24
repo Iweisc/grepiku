@@ -25,8 +25,10 @@ import { fingerprintForComment, matchKeyForComment } from "./findings.js";
 import { ReviewOutput } from "./schemas.js";
 import { minimatch } from "minimatch";
 import {
+  buildLocalDiffPatch,
   ensureRepoCheckout,
   fetchDiffPatch,
+  isDiffTooLargeError,
   listChangedFiles,
   renderPrMarkdown
 } from "./pr-data.js";
@@ -469,7 +471,17 @@ export async function processReviewJob(data: ReviewJobData) {
     });
 
     const repoConfig = await loadRepoConfig(repoPath);
-    const diffPatch = await fetchDiffPatch(octokit, owner, repo, prNumber);
+    let diffPatch: string;
+    try {
+      diffPatch = await fetchDiffPatch(octokit, owner, repo, prNumber);
+    } catch (err) {
+      if (!isDiffTooLargeError(err)) throw err;
+      diffPatch = await buildLocalDiffPatch({
+        repoPath,
+        baseSha: pr.data.base.sha,
+        headSha: head
+      });
+    }
     const changedFiles = await listChangedFiles(octokit, owner, repo, prNumber);
 
     const prMarkdown = renderPrMarkdown({

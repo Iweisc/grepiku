@@ -75,6 +75,49 @@ export async function fetchDiffPatch(
   return response.data as unknown as string;
 }
 
+type DiffTooLargeError = {
+  status?: number;
+  message?: string;
+  response?: {
+    data?: {
+      message?: string;
+      errors?: Array<{ field?: string; code?: string }>;
+    };
+  };
+};
+
+export function isDiffTooLargeError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const data = err as DiffTooLargeError;
+  if (data.status !== 406) return false;
+
+  const message = data.message || data.response?.data?.message;
+  if (typeof message === "string" && message.toLowerCase().includes("diff exceeded")) {
+    return true;
+  }
+
+  const errors = data.response?.data?.errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((e) => e?.field === "diff" && e?.code === "too_large");
+}
+
+export async function buildLocalDiffPatch(params: {
+  repoPath: string;
+  baseSha: string;
+  headSha: string;
+}): Promise<string> {
+  const { repoPath, baseSha, headSha } = params;
+  const { stdout } = await execa(
+    "git",
+    ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
+    {
+      maxBuffer: 1024 * 1024 * 200
+    }
+  );
+
+  return stdout;
+}
+
 export async function listChangedFiles(
   octokit: ReturnType<typeof getInstallationOctokit>,
   owner: string,
