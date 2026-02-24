@@ -387,10 +387,22 @@ function buildSummaryBlock(
     patternMatches.length > 0
       ? patternMatches.map((match) => `- ${match}`).join("\n")
       : "- (none)";
+  const fixPrompt = buildFixPrompt(comments);
+  const fixBlock = [
+    "<details>",
+    "<summary>Fix with AI</summary>",
+    "",
+    "<pre><code>",
+    fixPrompt,
+    "</code></pre>",
+    "</details>"
+  ].join("\n");
 
   return [
     start,
     "## Grepiku Summary",
+    "",
+    fixBlock,
     "",
     summary.overview,
     "",
