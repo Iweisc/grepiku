@@ -27,6 +27,7 @@ export async function processGraphJob(job: GraphJob) {
   }
 
   const symbolNodes = new Map<number, number>();
+  const symbolNodeToSymbolId = new Map<number, number>();
   const symbolFile = new Map<number, number>();
   const symbolByName = new Map<string, number[]>();
   for (const symbol of symbols) {
@@ -46,6 +47,7 @@ export async function processGraphJob(job: GraphJob) {
       }
     });
     symbolNodes.set(symbol.id, node.id);
+    symbolNodeToSymbolId.set(node.id, symbol.id);
     symbolFile.set(symbol.id, symbol.fileId);
     const list = symbolByName.get(symbol.name) || [];
     list.push(node.id);
@@ -78,7 +80,7 @@ export async function processGraphJob(job: GraphJob) {
           data: { line: ref.line }
         }
       });
-      const targetSymbolId = [...symbolNodes.entries()].find(([_, nodeId]) => nodeId === target)?.[0];
+      const targetSymbolId = symbolNodeToSymbolId.get(target) ?? null;
       const targetFileId = targetSymbolId ? symbolFile.get(targetSymbolId) : null;
       const toFileNode = targetFileId ? fileNodes.get(targetFileId) : null;
       if (toFileNode && toFileNode !== fromFileNode) {

@@ -29,33 +29,21 @@ type IndexJob = {
 
 type LanguageConfig = {
   name: string;
-  parser: Parser;
+  language: Parser.Language;
 };
 
 const languageMap: Record<string, LanguageConfig> = {};
 
 function initParsers() {
   if (Object.keys(languageMap).length > 0) return;
-  const jsParser = new Parser();
-  jsParser.setLanguage(JavaScript);
-  const tsParser = new Parser();
-  tsParser.setLanguage(TypeScript.typescript);
-  const tsxParser = new Parser();
-  tsxParser.setLanguage(TypeScript.tsx);
-  const pyParser = new Parser();
-  pyParser.setLanguage(Python);
-  const goParser = new Parser();
-  goParser.setLanguage(Go);
-  const rsParser = new Parser();
-  rsParser.setLanguage(Rust);
 
-  languageMap[".js"] = { name: "javascript", parser: jsParser };
-  languageMap[".jsx"] = { name: "javascript", parser: jsParser };
-  languageMap[".ts"] = { name: "typescript", parser: tsParser };
-  languageMap[".tsx"] = { name: "tsx", parser: tsxParser };
-  languageMap[".py"] = { name: "python", parser: pyParser };
-  languageMap[".go"] = { name: "go", parser: goParser };
-  languageMap[".rs"] = { name: "rust", parser: rsParser };
+  languageMap[".js"] = { name: "javascript", language: JavaScript };
+  languageMap[".jsx"] = { name: "javascript", language: JavaScript };
+  languageMap[".ts"] = { name: "typescript", language: TypeScript.typescript };
+  languageMap[".tsx"] = { name: "tsx", language: TypeScript.tsx };
+  languageMap[".py"] = { name: "python", language: Python };
+  languageMap[".go"] = { name: "go", language: Go };
+  languageMap[".rs"] = { name: "rust", language: Rust };
 }
 
 function hashContent(text: string): string {
@@ -171,7 +159,7 @@ async function indexFile(params: {
   await prisma.symbol.deleteMany({ where: { fileId: fileRecord.id } });
   await prisma.embedding.deleteMany({ where: { fileId: fileRecord.id } });
 
-  const parser = languageMap[path.extname(params.relativePath)]?.parser;
+  const languageConfig = languageMap[path.extname(params.relativePath)];
   let symbols: Array<{
     name: string;
     kind: string;
@@ -181,8 +169,10 @@ async function indexFile(params: {
     doc?: string;
   }> = [];
   let references: Array<{ name: string; line: number; kind: string }> = [];
-  if (parser) {
+  if (languageConfig) {
     try {
+      const parser = new Parser();
+      parser.setLanguage(languageConfig.language);
       const parseContent =
         params.content.length > MAX_PARSE_CHARS
           ? params.content.slice(0, MAX_PARSE_CHARS)
@@ -317,7 +307,7 @@ export async function processIndexJob(job: IndexJob) {
         await execa("git", ["-C", patternDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
       }
       if (job.patternRepo.ref) {
-        await execa("git", ["-C", patternDir, "checkout", job.patternRepo.ref], { stdio: "inherit" });
+        await execa("git", ["-C", patternDir, "checkout", "--", job.patternRepo.ref], { stdio: "inherit" });
       }
       repoPath = patternDir;
     }

@@ -112,11 +112,6 @@ function buildFeedbackHint(policy: FeedbackPolicy): string {
 
 function formatInlineComment(comment: ReviewComment): string {
   const marker = `<!-- grepiku:${comment.comment_id} -->`;
-  const escapeHtml = (text: string) =>
-    text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
   const normalizeSuggestedPatch = (patch: string) => {
     let normalized = patch.replace(/\\n/g, "\n");
     normalized = normalized
@@ -171,22 +166,6 @@ function formatInlineComment(comment: ReviewComment): string {
     bodyParts.push("Suggested change:", "```suggestion", suggestedPatch, "```");
   }
 
-  const fixPrompt = [
-    "You are an AI coding assistant.",
-    `Fix the issue in ${comment.path}:${comment.line} (${comment.side}).`,
-    `Title: ${comment.title}`,
-    `Category: ${comment.category}`,
-    `Severity: ${comment.severity}`,
-    `Details: ${comment.body}`
-  ];
-  if (suggestedPatch) {
-    fixPrompt.push("Suggested change:", suggestedPatch);
-  }
-
-  bodyParts.push("<details>", "<summary>Fix with AI</summary>", "");
-  bodyParts.push("<pre><code>");
-  bodyParts.push(escapeHtml(fixPrompt.join("\n")));
-  bodyParts.push("</code></pre>", "</details>");
   return bodyParts.join("\n\n");
 }
 
@@ -409,24 +388,9 @@ function buildSummaryBlock(
       ? patternMatches.map((match) => `- ${match}`).join("\n")
       : "- (none)";
 
-  const fixPrompt = buildFixPrompt(comments);
-  const escapeHtml = (text: string) =>
-    text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-
   return [
     start,
     "## Grepiku Summary",
-    "",
-    "<details>",
-    "<summary>Fix with AI</summary>",
-    "",
-    "<pre><code>",
-    escapeHtml(fixPrompt),
-    "</code></pre>",
-    "</details>",
     "",
     summary.overview,
     "",
