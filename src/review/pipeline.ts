@@ -564,6 +564,16 @@ export async function processReviewJob(data: ReviewJobData) {
       repoConfig.limits.max_inline_comments,
       repoConfig.ignore
     );
+    const inlineContext = {
+      head_sha: head,
+      summary: finalReview.summary,
+      comments: filteredComments
+    };
+    await fs.writeFile(
+      path.join(outDir, "inline_findings.json"),
+      JSON.stringify(inlineContext, null, 2),
+      "utf8"
+    );
 
     const summaryBlock = buildSummaryBlock(finalReview.summary, filteredComments);
     const originalBody = pr.data.body || "";

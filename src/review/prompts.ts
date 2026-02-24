@@ -82,11 +82,17 @@ Do not print anything else. Ensure valid JSON files.`;
 }
 
 export function buildVerifierPrompt(headSha: string): string {
-  return `You are the execution verifier. You can call only these tools: lint, build, test.
-Each tool runs the configured command from /work/repo/.prreviewer.yml (if configured) and returns structured results.
-Each tool may be called at most once; repeated calls return cached results.
+  return `You are the execution verifier. You can call these tools: read_file, search, lint, build, test.
+read_file/search let you inspect repo and bundle outputs; lint/build/test run commands configured in /work/repo/.prreviewer.yml (if configured).
+Each lint/build/test tool may be called at most once; repeated calls return cached results.
 
-If a tool is not configured, it will return status "skipped".
+Context files:
+- /work/out/inline_findings.json (current inline review comments to verify)
+- /work/bundle/diff.patch
+- /work/bundle/changed_files.json
+- Repo checkout: /work/repo (read-only)
+
+Use the inline findings to decide which tools are relevant. If no tool is applicable, mark it "skipped".
 
 After running the needed tools, write /work/out/checks.json with this schema:
 {
