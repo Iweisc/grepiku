@@ -10,8 +10,10 @@ import { runCodexStage } from "../runner/codexRunner.js";
 import { readAndValidateJson } from "./json.js";
 import { ReplySchema } from "./schemas.js";
 import {
+  buildLocalDiffPatch,
   ensureRepoCheckout,
   fetchDiffPatch,
+  isDiffTooLargeError,
   listChangedFiles,
   renderPrMarkdown
 } from "./pr-data.js";
@@ -63,7 +65,17 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   });
 
   const repoConfig = await loadRepoConfig(repoPath);
-  const diffPatch = await fetchDiffPatch(octokit, owner, repo, prNumber);
+  let diffPatch: string;
+  try {
+    diffPatch = await fetchDiffPatch(octokit, owner, repo, prNumber);
+  } catch (err) {
+    if (!isDiffTooLargeError(err)) throw err;
+    diffPatch = await buildLocalDiffPatch({
+      repoPath,
+      baseSha: pr.data.base.sha,
+      headSha: head
+    });
+  }
   const changedFiles = await listChangedFiles(octokit, owner, repo, prNumber);
 
   const prMarkdown = renderPrMarkdown({

@@ -76,12 +76,22 @@ async function resolveRunnerNetwork(): Promise<string> {
 }
 
 function configForStage(stage: CodexStage): string {
-  const base = `approval_policy = "never"\n`;
-  const sandbox = `sandbox_mode = "workspace-write"\n`;
+  const base = [
+    `approval_policy = "never"`,
+    `sandbox_mode = "workspace-write"`,
+    `web_search = "disabled"`,
+    `model_reasoning_effort = "xhigh"`,
+    "",
+    "[features]",
+    "shell_tool = false",
+    "apply_patch_freeform = false",
+    "web_search_request = false",
+    "web_search_cached = false",
+    ""
+  ].join("\n");
   if (stage === "reviewer") {
     return (
       base +
-      sandbox +
       `\n[mcp_servers.readonly]\n` +
       `command = "node"\n` +
       `args = ["/opt/grepiku-tools/tools/readonly_mcp.js"]\n` +
@@ -92,7 +102,6 @@ function configForStage(stage: CodexStage): string {
   if (stage === "verifier") {
     return (
       base +
-      sandbox +
       `\n[mcp_servers.verifier]\n` +
       `command = "node"\n` +
       `args = ["/opt/grepiku-tools/tools/verifier_mcp.js"]\n` +
@@ -100,7 +109,7 @@ function configForStage(stage: CodexStage): string {
       `tool_timeout_sec = 10\n`
     );
   }
-  return base + sandbox;
+  return base;
 }
 
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
@@ -150,8 +159,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
 
   args.push(
     env.runnerImage,
-    "codex",
-    "exec",
+    "codex-exec",
     "--json",
     "--sandbox",
     "workspace-write",
@@ -159,15 +167,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "--model",
     env.openaiModel,
     "--output-last-message",
-    "/work/out/last_message.txt",
-    "--disable",
-    "shell_tool",
-    "--disable",
-    "apply_patch_freeform",
-    "--disable",
-    "web_search_request",
-    "--disable",
-    "web_search_cached"
+    "/work/out/last_message.txt"
   );
 
   args.push("-");

@@ -5,12 +5,14 @@ import { spawn } from "child_process";
 
 const repoRoot = "/work/repo";
 const bundleRoot = "/work/bundle";
-const allowedRoots = [repoRoot, bundleRoot];
+const outRoot = "/work/out";
+const searchRoots = [repoRoot, bundleRoot];
+const readRoots = [repoRoot, bundleRoot, outRoot];
 
 const tools = [
   {
     name: "read_file",
-    description: "Read a file from the repo.",
+    description: "Read a file from the repo or bundle (JSON/text outputs allowed).",
     inputSchema: {
       type: "object",
       properties: {
@@ -50,11 +52,11 @@ function asText(text) {
   return { content: [{ type: "text", text }] };
 }
 
-function resolveAllowedPath(inputPath) {
+function resolveAllowedPath(inputPath, roots) {
   const resolved = path.isAbsolute(inputPath)
     ? path.resolve(inputPath)
     : path.resolve(repoRoot, inputPath);
-  const isAllowed = allowedRoots.some((root) => resolved.startsWith(root));
+  const isAllowed = roots.some((root) => resolved.startsWith(root));
   if (!isAllowed) {
     throw new Error("Path escapes allowed roots");
   }
@@ -62,7 +64,14 @@ function resolveAllowedPath(inputPath) {
 }
 
 async function handleReadFile(args) {
-  const target = resolveAllowedPath(args.path);
+  const target = resolveAllowedPath(args.path, readRoots);
+  if (target.startsWith(outRoot)) {
+    const isAllowedOutput =
+      target.endsWith(".json") || target.endsWith(".txt");
+    if (!isAllowedOutput) {
+      throw new Error("Path not allowed in output dir");
+    }
+  }
   const maxBytes = Number.isInteger(args.max_bytes) ? args.max_bytes : 20000;
   const data = await fs.readFile(target);
   const sliced = data.slice(0, maxBytes).toString("utf8");
@@ -72,7 +81,7 @@ async function handleReadFile(args) {
 async function runRipgrep(args) {
   const query = args.query;
   const maxResults = Number.isInteger(args.max_results) ? args.max_results : 50;
-  const searchRoot = args.path ? resolveAllowedPath(args.path) : repoRoot;
+  const searchRoot = args.path ? resolveAllowedPath(args.path, searchRoots) : repoRoot;
 
   const rgArgs = ["--no-heading", "--line-number", "--color", "never", query, searchRoot];
   if (args.glob) {
