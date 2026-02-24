@@ -307,7 +307,9 @@ export async function processIndexJob(job: IndexJob) {
         await execa("git", ["-C", patternDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
       }
       if (job.patternRepo.ref) {
-        await execa("git", ["-C", patternDir, "checkout", "--", job.patternRepo.ref], { stdio: "inherit" });
+        await execa("git", ["-C", patternDir, "checkout", "--detach", "--", job.patternRepo.ref], {
+          stdio: "inherit"
+        });
       }
       repoPath = patternDir;
     }

@@ -49,11 +49,22 @@ function containsAny(text: string, keywords: string[]): boolean {
   return keywords.some((k) => lower.includes(k.toLowerCase()));
 }
 
-export function isManualTrigger(text: string, config: RepoConfig): boolean {
-  if (!text) return false;
-  return config.triggers.commentTriggers.some((token) =>
-    text.toLowerCase().includes(token.toLowerCase())
-  );
+export type CommentTrigger = "review" | "mention";
+
+export function detectCommentTrigger(text: string, config: RepoConfig): CommentTrigger | null {
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const tokens = config.triggers.commentTriggers || [];
+  const reviewTokens = tokens.filter((token) => token.trim().startsWith("/"));
+  const mentionTokens = tokens.filter((token) => !token.trim().startsWith("/"));
+
+  if (reviewTokens.some((token) => lower.includes(token.toLowerCase()))) {
+    return "review";
+  }
+  if (mentionTokens.some((token) => lower.includes(token.toLowerCase()))) {
+    return "mention";
+  }
+  return null;
 }
 
 export function shouldTriggerReview(params: {

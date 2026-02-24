@@ -1,5 +1,20 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db/client.js";
+import { loadEnv } from "../config/env.js";
+
+const env = loadEnv();
+
+function authorize(request: any): boolean {
+  if (!env.internalApiKey) return false;
+  const header = request.headers["x-internal-key"] || request.headers["authorization"];
+  if (!header) return false;
+  const token = Array.isArray(header) ? header[0] : header;
+  if (!token) return false;
+  if (token.startsWith("Bearer ")) {
+    return token.slice("Bearer ".length) === env.internalApiKey;
+  }
+  return token === env.internalApiKey;
+}
 
 export function registerDashboard(app: FastifyInstance) {
   app.get("/dashboard", async (_request, reply) => {
@@ -105,6 +120,10 @@ export function registerDashboard(app: FastifyInstance) {
   });
 
   app.post("/api/rules/suggestions/:id/approve", async (request, reply) => {
+    if (!authorize(request)) {
+      reply.code(401).send({ error: "Unauthorized" });
+      return;
+    }
     const id = Number((request.params as any).id);
     const suggestion = await prisma.ruleSuggestion.findFirst({ where: { id } });
     if (!suggestion) {
@@ -122,6 +141,10 @@ export function registerDashboard(app: FastifyInstance) {
   });
 
   app.post("/api/rules/suggestions/:id/reject", async (request, reply) => {
+    if (!authorize(request)) {
+      reply.code(401).send({ error: "Unauthorized" });
+      return;
+    }
     const id = Number((request.params as any).id);
     await prisma.ruleSuggestion.update({ where: { id }, data: { status: "rejected" } });
     reply.send({ ok: true });

@@ -2,7 +2,9 @@ import { prisma } from "../db/client.js";
 import { ensureInstallation, ensureProvider, ensureRepo, ensureRepoInstallation, ensureUser, upsertPullRequest } from "../db/records.js";
 import { enqueueCommentReplyJob, enqueueReviewJob } from "../queue/enqueue.js";
 import { ProviderWebhookEvent } from "./types.js";
-import { resolveRepoConfig, shouldTriggerReview, isManualTrigger } from "../review/triggers.js";
+import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "../review/triggers.js";
+import { getProviderAdapter } from "./registry.js";
+import { resolveGithubBotLogin } from "./github/adapter.js";
 
 export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<void> {
   const provider = await ensureProvider({
@@ -94,8 +96,12 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   }
 
   if (event.type === "comment") {
+    const botLogin = await resolveGithubBotLogin().catch(() => "");
+    if (botLogin && event.author.login.toLowerCase() === botLogin.toLowerCase()) {
+      return;
+    }
     const commentBody = event.comment.body || "";
-    const manual = isManualTrigger(commentBody, config);
+    const commentTrigger = detectCommentTrigger(commentBody, config);
 
     const latestRun = await prisma.reviewRun.findFirst({
       where: { pullRequestId: pullRequest.id },
@@ -126,7 +132,23 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         }
       });
     }
-    if (!manual) return;
+    if (!commentTrigger) return;
+
+    if (installation.externalId) {
+      try {
+        const adapter = getProviderAdapter(event.provider);
+        const client = await adapter.createClient({
+          installationId: installation.externalId,
+          repo: event.repo,
+          pullRequest: event.pullRequest
+        });
+        if (client.addReaction) {
+          await client.addReaction(event.comment.id, "eyes");
+        }
+      } catch {
+        // Ignore reaction failures (comment types or permissions may not support it)
+      }
+    }
 
     await enqueueCommentReplyJob({
       provider: event.provider,
@@ -140,16 +162,18 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       commentUrl: event.comment.url
     });
 
-    await enqueueReviewJob({
-      provider: event.provider,
-      installationId: installation.externalId,
-      repoId: repo.id,
-      pullRequestId: pullRequest.id,
-      prNumber: event.pullRequest.number,
-      headSha: event.pullRequest.headSha,
-      trigger: "manual",
-      force: true
-    });
+    if (commentTrigger === "review") {
+      await enqueueReviewJob({
+        provider: event.provider,
+        installationId: installation.externalId,
+        repoId: repo.id,
+        pullRequestId: pullRequest.id,
+        prNumber: event.pullRequest.number,
+        headSha: event.pullRequest.headSha,
+        trigger: "manual",
+        force: true
+      });
+    }
 
     return;
   }

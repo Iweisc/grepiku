@@ -325,7 +325,7 @@ export function createGithubAdapter(): ProviderAdapter {
         return {
           provider: "github",
           type: "reaction",
-          action: payload.action,
+          action: payload.reaction?.content || payload.action,
           repo,
           pullRequest: mapPullRequest(payload),
           comment: mapComment(payload),
