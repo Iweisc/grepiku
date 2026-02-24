@@ -29,7 +29,7 @@ type IndexJob = {
 
 type LanguageConfig = {
   name: string;
-  language: Parser.Language;
+  language: any;
 };
 
 const languageMap: Record<string, LanguageConfig> = {};
@@ -172,7 +172,7 @@ async function indexFile(params: {
   if (languageConfig) {
     try {
       const parser = new Parser();
-      parser.setLanguage(languageConfig.language);
+      parser.setLanguage(languageConfig.language as any);
       const parseContent =
         params.content.length > MAX_PARSE_CHARS
           ? params.content.slice(0, MAX_PARSE_CHARS)
