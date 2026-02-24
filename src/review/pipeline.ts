@@ -387,7 +387,13 @@ function buildSummaryBlock(
     patternMatches.length > 0
       ? patternMatches.map((match) => `- ${match}`).join("\n")
       : "- (none)";
-  const fixPrompt = buildFixPrompt(comments);
+  const fixPrompt =
+    comments.length > 0
+      ? buildFixPrompt(comments)
+      : [
+          "There are no review findings to fix.",
+          "If you made changes, ensure tests and lint still pass."
+        ].join("\n");
   const fixBlock = [
     "<details>",
     "<summary>Fix with AI</summary>",
@@ -430,7 +436,7 @@ function buildSummaryBlock(
     summary.diagram_mermaid || "",
     summary.diagram_mermaid ? "```" : "",
     end
-  ].filter((line) => line !== "").join("\n");
+  ].filter((line) => line !== null).join("\n");
 }
 
 function computeConfidence(summary: ReviewOutput["summary"], comments: ReviewComment[]): number {
