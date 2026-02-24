@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: grepiku
+      POSTGRES_PASSWORD: grepiku
+      POSTGRES_DB: grepiku
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  web:
+    build: .
+    command: ["node", "dist/server.js"]
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql://grepiku:grepiku@postgres:5432/grepiku
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${PORT:-3000}:3000"
+
+  worker:
+    build: .
+    command: ["node", "dist/worker.js"]
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROJECT_ROOT:?err}:${PROJECT_ROOT:?err}
+    environment:
+      DATABASE_URL: postgresql://grepiku:grepiku@postgres:5432/grepiku
+      REDIS_URL: redis://redis:6379
+      PROJECT_ROOT: ${PROJECT_ROOT}
+      RUNNER_IMAGE: ${RUNNER_IMAGE:-grepiku-codex-runner}
+      RUNNER_NETWORK: ${RUNNER_NETWORK:-grepiku_default}
+
+  codex-runner:
+    build:
+      context: .
+      dockerfile: docker/codex-runner/Dockerfile
+    profiles: ["runner"]
+
+volumes:
+  postgres-data:
