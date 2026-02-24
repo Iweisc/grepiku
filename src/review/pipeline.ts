@@ -1,3 +1,4 @@
+import fs from "fs/promises";
 import path from "path";
 import { prisma } from "../db/client.js";
 import { getInstallationOctokit, getInstallationToken } from "../github/auth.js";
@@ -6,7 +7,7 @@ import { loadRepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
 import { buildReviewerPrompt, buildEditorPrompt, buildVerifierPrompt } from "./prompts.js";
 import { runCodexStage } from "../runner/codexRunner.js";
-import { readAndValidateJson } from "./json.js";
+import { parseAndValidateJson, readAndValidateJson } from "./json.js";
 import {
   ReviewSchema,
   VerdictsSchema,
@@ -587,7 +588,17 @@ export async function processReviewJob(data: ReviewJobData) {
       repoInstallationId: repoInstallation.id,
       prNumber
     });
-    const checks = await readAndValidateJson(path.join(outDir, "checks.json"), ChecksSchema);
+    const checksPath = path.join(outDir, "checks.json");
+    let checks: ChecksOutput;
+    try {
+      checks = await readAndValidateJson(checksPath, ChecksSchema);
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+      const lastMessagePath = path.join(outDir, "last_message.txt");
+      const lastMessage = await fs.readFile(lastMessagePath, "utf8").catch(() => "");
+      if (!lastMessage.trim()) throw err;
+      checks = parseAndValidateJson(lastMessage, ChecksSchema);
+    }
 
     const existingOpen = await prisma.finding.findMany({
       where: {
