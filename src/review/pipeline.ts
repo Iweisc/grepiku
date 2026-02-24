@@ -31,11 +31,12 @@ import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewC
 import { enqueueAnalyticsJob, enqueueGraphJob, enqueueIndexJob } from "../queue/enqueue.js";
 import { resolveRules } from "./triggers.js";
 import { buildContextPack } from "./context.js";
+import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 
 const env = loadEnv();
 
 export type ReviewJobData = {
-  provider: "github" | "gitlab" | "ghes";
+  provider: "github";
   installationId?: string | null;
   repoId: number;
   pullRequestId: number;
@@ -55,10 +56,12 @@ function filterAndNormalizeComments(
   ignoreGlobs: string[],
   allowedTypes: Array<"inline" | "summary">,
   summaryOnly: boolean,
-  strictness: "low" | "medium" | "high"
+  strictness: "low" | "medium" | "high",
+  feedbackPolicy?: FeedbackPolicy
 ): { inline: ReviewComment[]; summary: ReviewComment[] } {
   const inline: ReviewComment[] = [];
   const summary: ReviewComment[] = [];
+  const negativeCategories = feedbackPolicy ? new Set(feedbackPolicy.negativeCategories) : null;
   for (const comment of review.comments) {
     if (ignoreGlobs.some((pattern) => minimatch(comment.path, pattern))) continue;
     const evidence = (comment.evidence || "").trim();
@@ -74,6 +77,9 @@ function filterAndNormalizeComments(
     if (strictness === "medium") {
       if (comment.severity === "nit" && confidence === "low") continue;
     }
+    if (negativeCategories?.has(comment.category)) {
+      if (comment.severity !== "blocking" && confidence !== "high") continue;
+    }
     if (!allowedTypes.includes(type)) continue;
     if (type === "summary") {
       summary.push(comment);
@@ -85,6 +91,22 @@ function filterAndNormalizeComments(
     }
   }
   return { inline, summary };
+}
+
+function buildFeedbackHint(policy: FeedbackPolicy): string {
+  const lines: string[] = [];
+  if (policy.negativeCategories.length > 0) {
+    lines.push(
+      `- Be extra strict for categories often rejected: ${policy.negativeCategories.join(", ")}.`
+    );
+  }
+  if (policy.positiveCategories.length > 0) {
+    lines.push(
+      `- Give extra attention to categories often accepted: ${policy.positiveCategories.join(", ")}.`
+    );
+  }
+  if (lines.length === 0) return "";
+  return `\n\nFeedback guidance:\n${lines.join("\n")}`;
 }
 
 function formatInlineComment(comment: ReviewComment): string {
@@ -752,7 +774,8 @@ export async function processReviewJob(data: ReviewJobData) {
       warnings
     });
 
-    const reviewerPrompt = buildReviewerPrompt(resolvedConfig);
+    const feedbackPolicy = await getFeedbackPolicy(repo.id);
+    const reviewerPrompt = buildReviewerPrompt(resolvedConfig) + buildFeedbackHint(feedbackPolicy);
     await runCodexStage({
       stage: "reviewer",
       repoPath,
@@ -815,7 +838,8 @@ export async function processReviewJob(data: ReviewJobData) {
       resolvedConfig.ignore,
       resolvedConfig.commentTypes.allow,
       resolvedConfig.output.summaryOnly,
-      resolvedConfig.strictness
+      resolvedConfig.strictness,
+      feedbackPolicy
     );
     const hasBlocking = filteredComments.inline.some((comment) => comment.severity === "blocking");
 

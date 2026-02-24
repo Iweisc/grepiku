@@ -1,6 +1,6 @@
 # Grepiku
 
-Provider-agnostic PR review bot powered by Codex (GitHub, GitLab, GHES).
+GitHub PR review bot powered by Codex.
 
 ## What It Does
 
@@ -24,7 +24,7 @@ Provider-agnostic PR review bot powered by Codex (GitHub, GitLab, GHES).
 
 ## Setup
 
-1) Create a GitHub App (or GitLab token / GHES app)
+1) Create a GitHub App
 - Permissions (minimum):
   - Pull requests: read
   - Issues: read & write
@@ -32,15 +32,12 @@ Provider-agnostic PR review bot powered by Codex (GitHub, GitLab, GHES).
   - Contents: read
   - Checks: read
 - Subscribe to webhook events:
-  - GitHub/GHES: `pull_request`, `issue_comment`, `pull_request_review_comment`, `reaction`
-  - GitLab: Merge Request Hook, Note Hook
+  - `pull_request`, `issue_comment`, `pull_request_review_comment`, `reaction`
 
 2) Configure environment
 
 Copy `.env.example` to `.env` and set values. `PROJECT_ROOT` must be an absolute path to this repo.
 Additional vars:
-- `GITLAB_BASE_URL`, `GITLAB_API_TOKEN`, `GITLAB_WEBHOOK_SECRET`
-- `GHES_BASE_URL` (if using GitHub Enterprise Server)
 - `INTERNAL_API_KEY` (optional for internal APIs)
 
 3) Build Codex runner image

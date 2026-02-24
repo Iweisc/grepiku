@@ -11,13 +11,13 @@ import Rust from "tree-sitter-rust";
 import { prisma } from "../db/client.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
-import { embedText } from "./embeddings.js";
+import { embedText, embedTexts } from "./embeddings.js";
 import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
 
 type IndexJob = {
-  provider?: "github" | "gitlab" | "ghes";
+  provider?: "github";
   installationId?: string | null;
   repoId: number;
   headSha: string | null;
@@ -174,7 +174,10 @@ async function indexFile(params: {
   const tree = parser.parse(params.content);
   const { symbols, references } = extractSymbols(params.language, tree, params.content);
 
-  for (const symbol of symbols) {
+  const symbolTexts = symbols.map((symbol) => `${symbol.name} ${symbol.signature || ""}`);
+  const symbolVectors = symbolTexts.length > 0 ? await embedTexts(symbolTexts) : [];
+
+  for (const [idx, symbol] of symbols.entries()) {
     const hash = hashContent(`${symbol.name}:${symbol.kind}:${symbol.startLine}:${symbol.endLine}`);
     const symbolRecord = await prisma.symbol.create({
       data: {
@@ -189,7 +192,7 @@ async function indexFile(params: {
         hash
       }
     });
-    const embeddingVector = embedText(`${symbol.name} ${symbol.signature || ""}`);
+    const embeddingVector = symbolVectors[idx] || (await embedText(`${symbol.name} ${symbol.signature || ""}`));
     await prisma.embedding.create({
       data: {
         repoId: params.repoId,
@@ -214,12 +217,13 @@ async function indexFile(params: {
     });
   }
 
+  const fileVector = await embedText(params.content);
   await prisma.embedding.create({
     data: {
       repoId: params.repoId,
       fileId: fileRecord.id,
       kind: "file",
-      vector: embedText(params.content),
+      vector: fileVector,
       text: params.content.slice(0, 4000)
     }
   });
@@ -242,8 +246,7 @@ export async function processIndexJob(job: IndexJob) {
   let repoPath: string | null = null;
   const targetSha = job.headSha || "HEAD";
   if (!job.patternRepo) {
-    const providerKind = job.provider || (repo.provider.kind as "github" | "gitlab" | "ghes");
-    const adapter = getProviderAdapter(providerKind);
+    const adapter = getProviderAdapter("github");
     const providerRepo: ProviderRepo = {
       externalId: repo.externalId,
       owner: repo.owner,

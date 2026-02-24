@@ -92,21 +92,19 @@ function createClient(params: {
   installationId: string | null;
   repo: ProviderRepo;
   pullRequest: ProviderPullRequest;
-  baseUrl?: string | null;
 }): ProviderClient {
   const installationId = params.installationId ? Number(params.installationId) : null;
-  const baseUrl = params.baseUrl || undefined;
   if (!installationId) {
     throw new Error("GitHub installationId required for provider client");
   }
-  const octokit = getInstallationOctokit(installationId, baseUrl);
+  const octokit = getInstallationOctokit(installationId);
   const owner = params.repo.owner;
   const repo = params.repo.name;
   const prNumber = params.pullRequest.number;
   const headSha = params.pullRequest.headSha;
 
   return {
-    provider: params.baseUrl ? "ghes" : "github",
+    provider: "github",
     repo: params.repo,
     pullRequest: params.pullRequest,
     fetchPullRequest: async () => {
@@ -147,8 +145,7 @@ function createClient(params: {
         headSha,
         owner,
         repo,
-        token,
-        baseUrl: params.baseUrl || undefined
+        token
       });
     },
     updatePullRequestBody: async (body: string) => {
@@ -272,9 +269,9 @@ function createClient(params: {
   };
 }
 
-export function createGithubAdapter(kind: "github" | "ghes", baseUrl?: string): ProviderAdapter {
+export function createGithubAdapter(): ProviderAdapter {
   return {
-    kind,
+    kind: "github",
     verifyWebhook: async ({ headers, body }): Promise<ProviderWebhookEvent | null> => {
       const eventName = (headers["x-github-event"] as string | undefined) || "";
       const signature = headers["x-hub-signature-256"] as string | undefined;
@@ -289,7 +286,7 @@ export function createGithubAdapter(kind: "github" | "ghes", baseUrl?: string): 
 
       if (eventName === "pull_request") {
         return {
-          provider: kind,
+          provider: "github",
           type: "pull_request",
           action: payload.action,
           repo,
@@ -300,7 +297,7 @@ export function createGithubAdapter(kind: "github" | "ghes", baseUrl?: string): 
 
       if (eventName === "issue_comment" && payload.issue?.pull_request) {
         return {
-          provider: kind,
+          provider: "github",
           type: "comment",
           action: payload.action,
           repo,
@@ -313,7 +310,7 @@ export function createGithubAdapter(kind: "github" | "ghes", baseUrl?: string): 
 
       if (eventName === "pull_request_review_comment") {
         return {
-          provider: kind,
+          provider: "github",
           type: "comment",
           action: payload.action,
           repo,
@@ -326,7 +323,7 @@ export function createGithubAdapter(kind: "github" | "ghes", baseUrl?: string): 
 
       if (eventName === "reaction") {
         return {
-          provider: kind,
+          provider: "github",
           type: "reaction",
           action: payload.action,
           repo,
@@ -340,12 +337,12 @@ export function createGithubAdapter(kind: "github" | "ghes", baseUrl?: string): 
       return null;
     },
     createClient: async ({ installationId, repo, pullRequest }) =>
-      createClient({ installationId, repo, pullRequest, baseUrl })
+      createClient({ installationId, repo, pullRequest })
   };
 }
 
-export async function resolveGithubBotLogin(baseUrl?: string): Promise<string> {
+export async function resolveGithubBotLogin(): Promise<string> {
   const configured = env.githubBotLogin;
   if (configured) return configured;
-  return getAppSlug(baseUrl);
+  return getAppSlug();
 }

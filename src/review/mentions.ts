@@ -16,7 +16,7 @@ import { execa } from "execa";
 const env = loadEnv();
 
 export type CommentReplyJobData = {
-  provider: "github" | "gitlab" | "ghes";
+  provider: "github";
   installationId?: string | null;
   repoId: number;
   pullRequestId: number;

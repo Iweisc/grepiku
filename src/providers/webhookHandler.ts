@@ -1,24 +1,15 @@
 import { prisma } from "../db/client.js";
 import { ensureInstallation, ensureProvider, ensureRepo, ensureRepoInstallation, ensureUser, upsertPullRequest } from "../db/records.js";
 import { enqueueCommentReplyJob, enqueueReviewJob } from "../queue/enqueue.js";
-import { loadEnv } from "../config/env.js";
 import { ProviderWebhookEvent } from "./types.js";
 import { resolveRepoConfig, shouldTriggerReview, isManualTrigger } from "../review/triggers.js";
-
-const env = loadEnv();
-
-function providerBaseUrl(kind: string): string {
-  if (kind === "gitlab") return env.gitlabBaseUrl;
-  if (kind === "ghes" && env.ghesBaseUrl) return env.ghesBaseUrl;
-  return "https://github.com";
-}
 
 export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<void> {
   const provider = await ensureProvider({
     kind: event.provider,
-    name: event.provider === "gitlab" ? "GitLab" : event.provider === "ghes" ? "GitHub Enterprise" : "GitHub",
-    baseUrl: providerBaseUrl(event.provider),
-    apiUrl: event.provider === "gitlab" ? `${env.gitlabBaseUrl.replace(/\/$/, "")}/api/v4` : null
+    name: "GitHub",
+    baseUrl: "https://github.com",
+    apiUrl: null
   });
 
   const installationExternalId = event.installationId || event.repo.owner || event.repo.fullName;
@@ -100,6 +91,12 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       orderBy: { createdAt: "desc" }
     });
     if (latestRun) {
+      const providerCommentId = event.comment.id;
+      const reviewComment = await prisma.reviewComment.findFirst({
+        where: { pullRequestId: pullRequest.id, providerCommentId },
+        include: { finding: true }
+      });
+      const canonicalCommentId = reviewComment?.finding?.commentId || providerCommentId;
       const normalized = commentBody.toLowerCase();
       const action = normalized.includes("fixed") || normalized.includes("resolved") || normalized.includes("done")
         ? "resolved"
@@ -109,10 +106,11 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
           reviewRunId: latestRun.id,
           type: "reply",
           action,
-          commentId: event.comment.id,
+          commentId: canonicalCommentId,
           metadata: {
             author: event.author.login,
-            body: commentBody
+            body: commentBody,
+            providerCommentId
           }
         }
       });
@@ -151,15 +149,22 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       orderBy: { createdAt: "desc" }
     });
     if (latestRun) {
+      const providerCommentId = event.comment.id;
+      const reviewComment = await prisma.reviewComment.findFirst({
+        where: { pullRequestId: pullRequest.id, providerCommentId },
+        include: { finding: true }
+      });
+      const canonicalCommentId = reviewComment?.finding?.commentId || providerCommentId;
       await prisma.feedback.create({
         data: {
           reviewRunId: latestRun.id,
           type: "reaction",
           sentiment: event.action,
-          commentId: event.comment.id,
+          commentId: canonicalCommentId,
           metadata: {
             provider: event.provider,
-            author: event.author.login
+            author: event.author.login,
+            providerCommentId
           }
         }
       });

@@ -5,18 +5,9 @@ import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
 
-function buildRemoteUrl(params: { owner: string; repo: string; token: string; baseUrl?: string }) {
-  const base = params.baseUrl ? params.baseUrl.replace(/\/$/, "") : "https://github.com";
+function buildRemoteUrl(params: { owner: string; repo: string; token: string }) {
   const encodedToken = encodeURIComponent(params.token);
-  if (base.includes("gitlab")) {
-    const host = base.replace(/https?:\/\//, "");
-    return `https://oauth2:${encodedToken}@${host}/${params.owner}/${params.repo}.git`;
-  }
-  if (base.includes("github") || base.includes("ghe")) {
-    const host = base.replace(/https?:\/\//, "");
-    return `https://x-access-token:${encodedToken}@${host}/${params.owner}/${params.repo}.git`;
-  }
-  return `${base.replace(/https?:\/\//, "https://")}/${params.owner}/${params.repo}.git`;
+  return `https://x-access-token:${encodedToken}@github.com/${params.owner}/${params.repo}.git`;
 }
 
 export async function ensureGitRepoCheckout(params: {
@@ -24,9 +15,8 @@ export async function ensureGitRepoCheckout(params: {
   repo: string;
   headSha: string;
   token: string;
-  baseUrl?: string;
 }): Promise<string> {
-  const { owner, repo, headSha, token, baseUrl } = params;
+  const { owner, repo, headSha, token } = params;
   const baseDir = path.join(env.projectRoot, "var", "repos", owner, repo);
   const worktreesDir = path.join(env.projectRoot, "var", "repos", owner, `${repo}-worktrees`);
   const worktreePath = path.join(worktreesDir, headSha);
@@ -39,7 +29,7 @@ export async function ensureGitRepoCheckout(params: {
     .then(() => true)
     .catch(() => false);
 
-  const remoteUrl = buildRemoteUrl({ owner, repo, token, baseUrl });
+  const remoteUrl = buildRemoteUrl({ owner, repo, token });
 
   if (!repoExists) {
     await execa("git", ["clone", remoteUrl, baseDir], { stdio: "inherit" });

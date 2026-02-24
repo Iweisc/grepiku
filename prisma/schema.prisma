@@ -9,8 +9,6 @@ datasource db {
 
 enum ProviderKind {
   github
-  gitlab
-  ghes
 }
 
 enum ReviewRunStatus {

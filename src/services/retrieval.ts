@@ -1,5 +1,5 @@
 import { prisma } from "../db/client.js";
-import { cosineSimilarity, embedText } from "./embeddings.js";
+import { cosineSimilarity, embedQueryWithCache } from "./embeddings.js";
 
 export type RetrievalResult = {
   kind: "file" | "symbol";
@@ -16,9 +16,9 @@ export async function retrieveContext(params: {
   topK?: number;
 }): Promise<RetrievalResult[]> {
   const topK = params.topK ?? 8;
-  const queryVec = embedText(params.query);
+  const queryVec = await embedQueryWithCache({ repoId: params.repoId, query: params.query });
   const embeddings = await prisma.embedding.findMany({
-    where: { repoId: params.repoId },
+    where: { repoId: params.repoId, kind: { in: ["file", "symbol"] } },
     take: 5000
   });
   const fileMap = new Map<number, { path: string; isPattern: boolean }>();

@@ -1,4 +1,4 @@
-export type ProviderKind = "github" | "gitlab" | "ghes";
+export type ProviderKind = "github";
 
 export type ProviderUser = {
   externalId: string;
