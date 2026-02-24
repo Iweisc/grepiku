@@ -22,6 +22,23 @@ const env = loadEnv();
 let runnerImageReady = false;
 let resolvedNetwork: string | null = null;
 
+function systemPrompt(stage: CodexStage): string {
+  const toolNote =
+    stage === "verifier"
+      ? "Tools available: readonly, verifier."
+      : "Tools available: readonly, retrieval.";
+  return [
+    "SYSTEM: You are a code-review agent running inside a sandboxed repo checkout.",
+    "You must use tools and files correctly.",
+    toolNote,
+    "Allowed file roots: /work/repo, /work/bundle, /work/out.",
+    "Never access /work/src or other paths outside allowed roots.",
+    "If a tool call fails due to ENOENT or bad path, correct the path and retry.",
+    "Never fabricate file contents. Use tools to read files.",
+    "Only write outputs to /work/out as instructed by the prompt."
+  ].join("\n");
+}
+
 async function writeAuthFiles(codexHomeDir: string, outDir: string): Promise<string> {
   const authPayload = JSON.stringify({ OPENAI_API_KEY: env.openaiApiKey }, null, 2);
   const codexAuthPath = path.join(codexHomeDir, "auth.json");
@@ -201,8 +218,10 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
 
   args.push("-");
 
+  const fullPrompt = `${systemPrompt(params.stage)}\n\n${params.prompt}`;
+
   await execa("docker", args, {
-    input: params.prompt,
+    input: fullPrompt,
     stdio: "inherit"
   });
 }
