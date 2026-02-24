@@ -66,9 +66,9 @@ function filterAndNormalizeComments(
     if (ignoreGlobs.some((pattern) => minimatch(comment.path, pattern))) continue;
     const evidence = (comment.evidence || "").trim();
     if (evidence.length === 0 || evidence === "\"\"" || evidence === "''") continue;
+    const requestedType = comment.comment_type || "inline";
+    const type = summaryOnly ? "summary" : requestedType;
     if (comment.severity === "blocking" && !comment.suggested_patch) continue;
-    const type = comment.comment_type || "inline";
-    if (type !== "summary" && !comment.suggested_patch) continue;
     if (type !== "summary" && !isLineInDiff(diffIndex, comment)) continue;
     const confidence = comment.confidence || "medium";
     if (strictness === "high") {
@@ -864,9 +864,15 @@ export async function processReviewJob(data: ReviewJobData) {
     );
     const originalBody = pullRequest.body || "";
     const updatedBody = upsertSummaryBlock(originalBody, summaryBlock);
-    if (resolvedConfig.output.destination === "pr_body" || resolvedConfig.output.destination === "both") {
-      if (updatedBody !== originalBody) {
+    const shouldUpdateBody =
+      resolvedConfig.output.destination === "pr_body" ||
+      resolvedConfig.output.destination === "both" ||
+      originalBody.trim().length === 0;
+    if (shouldUpdateBody && updatedBody !== originalBody) {
+      try {
         await client.updatePullRequestBody(updatedBody);
+      } catch (err) {
+        console.warn("Failed to update PR body summary block", err);
       }
     }
 

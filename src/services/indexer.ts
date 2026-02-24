@@ -15,6 +15,8 @@ import { embedText, embedTexts } from "./embeddings.js";
 import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
+const MAX_INDEX_BYTES = 1_000_000;
+const MAX_PARSE_CHARS = 200_000;
 
 type IndexJob = {
   provider?: "github";
@@ -170,9 +172,29 @@ async function indexFile(params: {
   await prisma.embedding.deleteMany({ where: { fileId: fileRecord.id } });
 
   const parser = languageMap[path.extname(params.relativePath)]?.parser;
-  if (!parser) return;
-  const tree = parser.parse(params.content);
-  const { symbols, references } = extractSymbols(params.language, tree, params.content);
+  let symbols: Array<{
+    name: string;
+    kind: string;
+    startLine: number;
+    endLine: number;
+    signature?: string;
+    doc?: string;
+  }> = [];
+  let references: Array<{ name: string; line: number; kind: string }> = [];
+  if (parser) {
+    try {
+      const parseContent =
+        params.content.length > MAX_PARSE_CHARS
+          ? params.content.slice(0, MAX_PARSE_CHARS)
+          : params.content;
+      const tree = parser.parse(parseContent);
+      const extracted = extractSymbols(params.language, tree, parseContent);
+      symbols = extracted.symbols;
+      references = extracted.references;
+    } catch (err) {
+      console.warn(`Indexer parse failed for ${params.relativePath}`, err);
+    }
+  }
 
   const symbolTexts = symbols.map((symbol) => `${symbol.name} ${symbol.signature || ""}`);
   const symbolVectors = symbolTexts.length > 0 ? await embedTexts(symbolTexts) : [];
@@ -310,7 +332,10 @@ export async function processIndexJob(job: IndexJob) {
       const ext = path.extname(filePath);
       const languageConfig = languageMap[ext];
       if (!languageConfig) continue;
-      const content = await fs.readFile(filePath, "utf8");
+      const raw = await fs.readFile(filePath);
+      if (raw.length > MAX_INDEX_BYTES) continue;
+      if (raw.includes(0)) continue;
+      const content = raw.toString("utf8");
       const relativePath = path.relative(repoPath, filePath);
       await indexFile({
         repoId: repo.id,

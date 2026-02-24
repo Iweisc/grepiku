@@ -451,11 +451,11 @@ BEGIN
     SELECT newpr."id", newrun."id", f."status", f."fingerprint", f."hunkHash", f."contextHash", f."commentId", f."commentKey", f."path", f."line", f."side", f."severity", f."category", f."title", f."body", f."evidence", f."suggestedPatch", f."createdAt", f."updatedAt", f."firstSeenRunId", f."lastSeenRunId"
     FROM "Legacy_Finding" f
     JOIN "Legacy_Run" r ON r."id"=f."runId"
-    JOIN "ReviewRun" newrun ON newrun."headSha"=r."headSha"
     JOIN "Legacy_PullRequest" pr ON pr."id"=r."pullRequestId"
     JOIN "Legacy_RepoInstallation" ri ON ri."id"=pr."repoInstallationId"
     JOIN "Repo" repo ON repo."owner"=ri."owner" AND repo."name"=ri."repo"
     JOIN "PullRequest" newpr ON newpr."number"=pr."number" AND newpr."repoId"=repo."id"
+    JOIN "ReviewRun" newrun ON newrun."headSha"=r."headSha" AND newrun."pullRequestId"=newpr."id"
     ON CONFLICT DO NOTHING;
 
     INSERT INTO "ToolRun" ("reviewRunId","tool","status","summary","topErrors","logPath","createdAt","updatedAt")
@@ -464,7 +464,8 @@ BEGIN
     JOIN "Legacy_RepoInstallation" ri ON ri."id"=t."repoInstallationId"
     JOIN "Repo" repo ON repo."owner"=ri."owner" AND repo."name"=ri."repo"
     JOIN "Legacy_PullRequest" pr ON pr."number"=t."prNumber" AND pr."repoInstallationId"=ri."id"
-    JOIN "ReviewRun" newrun ON newrun."headSha"=t."headSha"
+    JOIN "PullRequest" newpr ON newpr."number"=pr."number" AND newpr."repoId"=repo."id"
+    JOIN "ReviewRun" newrun ON newrun."headSha"=t."headSha" AND newrun."pullRequestId"=newpr."id"
     ON CONFLICT DO NOTHING;
   END IF;
 END $$;
