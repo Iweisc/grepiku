@@ -7,3 +7,10 @@ tmp
 coverage
 *.log
 codex
+internal_harness/codex-rs
+internal_harness/codex-slim/target
+internal_harness/codex-slim/cloud-requirements
+internal_harness/codex-slim/utils/oss
+internal_harness/codex-slim/lmstudio
+internal_harness/codex-slim/ollama
+!internal_harness/codex-slim/vendor/bubblewrap/**
