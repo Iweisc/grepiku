@@ -161,8 +161,8 @@ export async function upsertPullRequest(params: {
         state: params.state,
         baseRef: params.baseRef || null,
         headRef: params.headRef || null,
-        baseSha: params.baseSha || null,
-        headSha: params.headSha,
+        baseSha: params.baseSha || existing.baseSha || null,
+        headSha: params.headSha || existing.headSha,
         draft: params.draft ?? existing.draft,
         authorId: params.authorId ?? existing.authorId
       }
