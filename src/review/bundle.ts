@@ -76,11 +76,9 @@ export async function writeBundleFiles(params: {
       "utf8"
     );
   }
-  if (warnings && warnings.length > 0) {
-    await fs.writeFile(
-      path.join(bundleDir, "config_warnings.json"),
-      JSON.stringify(warnings, null, 2),
-      "utf8"
-    );
-  }
+  await fs.writeFile(
+    path.join(bundleDir, "config_warnings.json"),
+    JSON.stringify(warnings ?? [], null, 2),
+    "utf8"
+  );
 }
