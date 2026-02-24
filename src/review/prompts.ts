@@ -19,6 +19,7 @@ Rules:
 - Default to RIGHT side unless the issue is on removed code.
 - Evidence is required for every comment (quote from diff/context).
 - Avoid formatting/style nits.
+- Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.
 - Blocking requires concrete evidence and a clear fix/suggested patch.
 - Cap inline comments at ${config.limits.max_inline_comments}.
 - Keep key concerns to ${config.limits.max_key_concerns}.
@@ -79,6 +80,7 @@ Rules to enforce:
 - Only comment on diff lines.
 - Evidence required.
 - Blocking requires clear fix/suggested patch.
+- Inline comments must include a suggested_patch or be converted to summary comments.
 - Drop weak, speculative, or style-only comments.
 - Ensure comment_type matches rules and config.
 - Preserve rule_id and rule_reason when applicable.

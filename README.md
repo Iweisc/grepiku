@@ -38,7 +38,7 @@ GitHub PR review bot powered by Codex.
 
 Copy `.env.example` to `.env` and set values. `PROJECT_ROOT` must be an absolute path to this repo.
 Additional vars:
-- `INTERNAL_API_KEY` (optional for internal APIs)
+- `INTERNAL_API_KEY` (required for internal APIs and retrieval tool access)
 
 3) Build Codex runner image
 

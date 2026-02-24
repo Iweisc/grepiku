@@ -68,6 +68,7 @@ function filterAndNormalizeComments(
     if (evidence.length === 0 || evidence === "\"\"" || evidence === "''") continue;
     if (comment.severity === "blocking" && !comment.suggested_patch) continue;
     const type = comment.comment_type || "inline";
+    if (type !== "summary" && !comment.suggested_patch) continue;
     if (type !== "summary" && !isLineInDiff(diffIndex, comment)) continue;
     const confidence = comment.confidence || "medium";
     if (strictness === "high") {
@@ -159,7 +160,6 @@ function formatInlineComment(comment: ReviewComment): string {
     `**${comment.severity.toUpperCase()}** ${comment.title}`,
     `Category: ${comment.category}`,
     comment.rule_id ? `Rule: ${comment.rule_id}` : null,
-    `Evidence: ${comment.evidence}`,
     comment.body
   ].filter((line) => line !== null);
 
@@ -177,7 +177,6 @@ function formatInlineComment(comment: ReviewComment): string {
     `Title: ${comment.title}`,
     `Category: ${comment.category}`,
     `Severity: ${comment.severity}`,
-    `Evidence: ${comment.evidence}`,
     `Details: ${comment.body}`
   ];
   if (suggestedPatch) {

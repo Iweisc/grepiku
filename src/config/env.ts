@@ -56,6 +56,16 @@ export function loadEnv(): Env {
   if (cached) return cached;
   const parsed = EnvSchema.parse(process.env);
   const privateKey = parsed.GITHUB_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const embeddingsBatchRaw = Number(parsed.OPENAI_EMBEDDINGS_BATCH_SIZE);
+  const embeddingsBatchSize =
+    Number.isFinite(embeddingsBatchRaw) && embeddingsBatchRaw > 0
+      ? Math.floor(embeddingsBatchRaw)
+      : 16;
+  const embeddingsMaxCharsRaw = Number(parsed.OPENAI_EMBEDDINGS_MAX_CHARS);
+  const embeddingsMaxChars =
+    Number.isFinite(embeddingsMaxCharsRaw) && embeddingsMaxCharsRaw > 0
+      ? Math.floor(embeddingsMaxCharsRaw)
+      : 12000;
   cached = {
     port: Number(parsed.PORT),
     databaseUrl: parsed.DATABASE_URL,
@@ -72,8 +82,8 @@ export function loadEnv(): Env {
     openaiEmbeddingsDimensions: parsed.OPENAI_EMBEDDINGS_DIMENSIONS
       ? Number(parsed.OPENAI_EMBEDDINGS_DIMENSIONS)
       : null,
-    openaiEmbeddingsMaxChars: Number(parsed.OPENAI_EMBEDDINGS_MAX_CHARS),
-    openaiEmbeddingsBatchSize: Number(parsed.OPENAI_EMBEDDINGS_BATCH_SIZE),
+    openaiEmbeddingsMaxChars: embeddingsMaxChars,
+    openaiEmbeddingsBatchSize: embeddingsBatchSize,
     openaiTimeoutMs: Number(parsed.OPENAI_TIMEOUT_MS),
     openaiMaxRetries: Number(parsed.OPENAI_MAX_RETRIES),
     projectRoot: parsed.PROJECT_ROOT,

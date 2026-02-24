@@ -243,87 +243,98 @@ export async function processIndexJob(job: IndexJob) {
     }
   });
 
-  let repoPath: string | null = null;
-  const targetSha = job.headSha || "HEAD";
-  if (!job.patternRepo) {
-    const adapter = getProviderAdapter("github");
-    const providerRepo: ProviderRepo = {
-      externalId: repo.externalId,
-      owner: repo.owner,
-      name: repo.name,
-      fullName: repo.fullName
-    };
-    const dummyPr: ProviderPullRequest = {
-      externalId: repo.externalId,
-      number: 0,
-      title: null,
-      body: null,
-      url: null,
-      state: "open",
-      headSha: targetSha
-    };
-    const installationExternalId =
-      job.installationId ||
-      repo.installations[0]?.installation.externalId ||
-      null;
-    const client = await adapter.createClient({
-      installationId: installationExternalId,
-      repo: providerRepo,
-      pullRequest: dummyPr
-    });
-    repoPath = await client.ensureRepoCheckout({ headSha: targetSha });
-  } else {
-    const patternName = job.patternRepo.name || "pattern-repo";
-    const patternDir = path.join(env.projectRoot, "var", "patterns", patternName);
-    const gitDir = path.join(patternDir, ".git");
-    await fs.mkdir(patternDir, { recursive: true });
-    const exists = await fs
-      .stat(gitDir)
-      .then(() => true)
-      .catch(() => false);
-    if (!exists) {
-      await execa("git", ["clone", job.patternRepo.url, patternDir], { stdio: "inherit" });
+  try {
+    let repoPath: string | null = null;
+    const targetSha = job.headSha || "HEAD";
+    if (!job.patternRepo) {
+      const adapter = getProviderAdapter("github");
+      const providerRepo: ProviderRepo = {
+        externalId: repo.externalId,
+        owner: repo.owner,
+        name: repo.name,
+        fullName: repo.fullName
+      };
+      const dummyPr: ProviderPullRequest = {
+        externalId: repo.externalId,
+        number: 0,
+        title: null,
+        body: null,
+        url: null,
+        state: "open",
+        headSha: targetSha
+      };
+      const installationExternalId =
+        job.installationId ||
+        repo.installations[0]?.installation.externalId ||
+        null;
+      const client = await adapter.createClient({
+        installationId: installationExternalId,
+        repo: providerRepo,
+        pullRequest: dummyPr
+      });
+      repoPath = await client.ensureRepoCheckout({ headSha: targetSha });
     } else {
-      await execa("git", ["-C", patternDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
+      const rawName = job.patternRepo.name || "pattern-repo";
+      const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, "_") || "pattern-repo";
+      const basePatternsDir = path.join(env.projectRoot, "var", "patterns");
+      const patternDir = path.join(basePatternsDir, safeName);
+      const resolvedBase = path.resolve(basePatternsDir);
+      const resolvedPattern = path.resolve(patternDir);
+      if (!resolvedPattern.startsWith(resolvedBase + path.sep)) {
+        throw new Error(`Invalid pattern repo name: ${rawName}`);
+      }
+      const gitDir = path.join(patternDir, ".git");
+      await fs.mkdir(patternDir, { recursive: true });
+      const exists = await fs
+        .stat(gitDir)
+        .then(() => true)
+        .catch(() => false);
+      if (!exists) {
+        await execa("git", ["clone", job.patternRepo.url, patternDir], { stdio: "inherit" });
+      } else {
+        await execa("git", ["-C", patternDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
+      }
+      if (job.patternRepo.ref) {
+        await execa("git", ["-C", patternDir, "checkout", job.patternRepo.ref], { stdio: "inherit" });
+      }
+      repoPath = patternDir;
     }
-    if (job.patternRepo.ref) {
-      await execa("git", ["-C", patternDir, "checkout", job.patternRepo.ref], { stdio: "inherit" });
-    }
-    repoPath = patternDir;
-  }
 
-  if (!repoPath) {
+    if (!repoPath) {
+      throw new Error("Unable to resolve repo path for indexing");
+    }
+
+    const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var"]);
+    const files = await walk(repoPath, ignoreDirs);
+    for (const filePath of files) {
+      const ext = path.extname(filePath);
+      const languageConfig = languageMap[ext];
+      if (!languageConfig) continue;
+      const content = await fs.readFile(filePath, "utf8");
+      const relativePath = path.relative(repoPath, filePath);
+      await indexFile({
+        repoId: repo.id,
+        filePath,
+        relativePath,
+        content,
+        language: languageConfig.name,
+        force: Boolean(job.force),
+        isPattern: Boolean(job.patternRepo)
+      });
+    }
+
+    await prisma.indexRun.update({
+      where: { id: indexRun.id },
+      data: {
+        status: "completed",
+        completedAt: new Date()
+      }
+    });
+  } catch (err) {
     await prisma.indexRun.update({
       where: { id: indexRun.id },
       data: { status: "failed", completedAt: new Date() }
     });
-    return;
+    throw err;
   }
-
-  const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var"]);
-  const files = await walk(repoPath, ignoreDirs);
-  for (const filePath of files) {
-    const ext = path.extname(filePath);
-    const languageConfig = languageMap[ext];
-    if (!languageConfig) continue;
-    const content = await fs.readFile(filePath, "utf8");
-    const relativePath = path.relative(repoPath, filePath);
-    await indexFile({
-      repoId: repo.id,
-      filePath,
-      relativePath,
-      content,
-      language: languageConfig.name,
-      force: Boolean(job.force),
-      isPattern: Boolean(job.patternRepo)
-    });
-  }
-
-  await prisma.indexRun.update({
-    where: { id: indexRun.id },
-    data: {
-      status: "completed",
-      completedAt: new Date()
-    }
-  });
 }

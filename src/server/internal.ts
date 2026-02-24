@@ -8,7 +8,7 @@ import { prisma } from "../db/client.js";
 const env = loadEnv();
 
 function authorize(request: any): boolean {
-  if (!env.internalApiKey) return true;
+  if (!env.internalApiKey) return false;
   const header = request.headers["x-internal-key"] || request.headers["authorization"];
   if (!header) return false;
   const token = Array.isArray(header) ? header[0] : header;

@@ -129,9 +129,9 @@ const GrepikuSchema = z.object({
   output: z
     .object({
       summaryOnly: z.boolean().default(false),
-      destination: z.enum(["comment", "pr_body", "both"]).default("comment")
+      destination: z.enum(["comment", "pr_body", "both"]).default("both")
     })
-    .default({ summaryOnly: false, destination: "comment" }),
+    .default({ summaryOnly: false, destination: "both" }),
   statusChecks: z
     .object({
       name: z.string().default("Grepiku Review"),
