@@ -98,7 +98,7 @@ function configForStage(stage: CodexStage): string {
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
-    `model_reasoning_effort = "xhigh"`,
+    `model_reasoning_effort = "high"`,
     "",
     "[features]",
     "shell_tool = false",
