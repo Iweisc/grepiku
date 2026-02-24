@@ -909,6 +909,7 @@ export async function processReviewJob(data: ReviewJobData) {
     }
 
     const newFindings: Array<{ title: string; url?: string; commentId: string }> = [];
+    const newFindingIds = new Map<string, number>();
     const stillOpen: Array<{ title: string; url?: string; commentId: string }> = [];
     const matchedOldIds = new Set<number>();
 
@@ -939,7 +940,7 @@ export async function processReviewJob(data: ReviewJobData) {
       }
 
       newFindings.push({ title: comment.title, commentId: comment.comment_id });
-      await prisma.finding.create({
+      const createdFinding = await prisma.finding.create({
         data: {
           pullRequestId: pullRequest.id,
           reviewRunId: run.id,
@@ -964,6 +965,7 @@ export async function processReviewJob(data: ReviewJobData) {
           lastSeenRunId: run.id
         }
       });
+      newFindingIds.set(comment.comment_id, createdFinding.id);
     }
 
     const fixed = existingOpen.filter((f) => !matchedOldIds.has(f.id));
@@ -985,16 +987,31 @@ export async function processReviewJob(data: ReviewJobData) {
           side: comment.side,
           body: formatInlineComment(comment)
         });
-        await prisma.reviewComment.create({
-          data: {
-            pullRequestId: pullRequest.id,
-            findingId: (await prisma.finding.findFirst({ where: { pullRequestId: pullRequest.id, commentId: comment.comment_id } }))?.id || undefined,
-            kind: "inline",
-            providerCommentId: created.id,
-            body: created.body,
-            url: created.url || null
+        const findingId = newFindingIds.get(comment.comment_id);
+        if (findingId) {
+          const existingReviewComment = await prisma.reviewComment.findFirst({ where: { findingId } });
+          if (existingReviewComment) {
+            await prisma.reviewComment.update({
+              where: { id: existingReviewComment.id },
+              data: {
+                providerCommentId: created.id,
+                body: created.body,
+                url: created.url || null
+              }
+            });
+          } else {
+            await prisma.reviewComment.create({
+              data: {
+                pullRequestId: pullRequest.id,
+                findingId,
+                kind: "inline",
+                providerCommentId: created.id,
+                body: created.body,
+                url: created.url || null
+              }
+            });
           }
-        });
+        }
       }
 
       const existingComments = await client.listInlineComments();
