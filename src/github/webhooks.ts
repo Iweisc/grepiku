@@ -139,7 +139,9 @@ webhooks.on("issue_comment.created", async ({ payload }) => {
     });
   }
 
-  if (!/(^|\s)\/review(\s|$)/i.test(body)) return;
+
+  if (!/(^|\s)\/review(?=\b|\s|$|[.,!?])/i.test(body)) return;
+
   const pr = await octokit.pulls.get({ owner, repo, pull_number: prNumber });
   const headSha = pr.data.head.sha;
 
