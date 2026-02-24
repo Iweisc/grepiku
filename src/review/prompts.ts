@@ -51,11 +51,11 @@ Do not print anything else to stdout. Ensure the JSON is valid.`;
 export function buildEditorPrompt(draftReviewJson: string, diffPatch: string): string {
   return `You are the editor pass. Your job is to reduce false positives and enforce all constraints.
 
-Inputs (inline):
-- Draft review JSON:
+Inputs:
+- Draft review JSON (inline):
 ${draftReviewJson}
-- Diff patch:
-${diffPatch}
+- Diff patch file: /work/bundle/diff.patch
+- Changed files list: /work/bundle/changed_files.json
 
 Rules to enforce:
 - Only comment on diff lines.
