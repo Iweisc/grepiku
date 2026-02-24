@@ -63,6 +63,17 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
 
   if (event.type === "pull_request") {
     if (event.pullRequest.state === "closed") return;
+    const latestRun = await prisma.reviewRun.findFirst({
+      where: { pullRequestId: pullRequest.id },
+      orderBy: { createdAt: "desc" }
+    });
+    if (
+      latestRun &&
+      latestRun.headSha === event.pullRequest.headSha &&
+      latestRun.status !== "failed"
+    ) {
+      return;
+    }
     const shouldTrigger = shouldTriggerReview({
       trigger: event.action,
       config,
