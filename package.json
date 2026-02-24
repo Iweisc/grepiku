@@ -1,0 +1,41 @@
+{
+  "name": "grepiku",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:server": "tsx watch src/server.ts",
+    "dev:worker": "tsx watch src/worker.ts",
+    "build": "tsc -p tsconfig.json",
+    "start:server": "node dist/server.js",
+    "start:worker": "node dist/worker.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "dependencies": {
+    "@octokit/auth-app": "^6.0.1",
+    "@octokit/rest": "^21.0.0",
+    "@octokit/webhooks": "^12.0.10",
+    "bullmq": "^5.12.1",
+    "dotenv": "^16.4.5",
+    "execa": "^9.5.1",
+    "fastify": "^4.28.1",
+    "ioredis": "^5.4.1",
+    "js-yaml": "^4.1.0",
+    "jsonrepair": "^3.8.1",
+    "parse-diff": "^0.11.1",
+    "pino": "^9.2.0",
+    "simple-git": "^3.26.0",
+    "zod": "^3.23.8",
+    "@prisma/client": "^5.20.0",
+    "pg": "^8.12.0",
+    "minimatch": "^9.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/js-yaml": "^4.0.9",
+    "prisma": "^5.20.0",
+    "tsx": "^4.16.2",
+    "typescript": "^5.6.3"
+  }
+}
