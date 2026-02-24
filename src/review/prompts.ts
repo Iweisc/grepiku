@@ -8,6 +8,10 @@ Context files:
 - /work/bundle/diff.patch
 - /work/bundle/changed_files.json
 - /work/bundle/bot_config.json
+- /work/bundle/rules.json
+- /work/bundle/scopes.json
+- /work/bundle/context_pack.json
+- /work/bundle/config_warnings.json
 - Repo checkout: /work/repo (read-only)
 
 Rules:
@@ -18,6 +22,9 @@ Rules:
 - Blocking requires concrete evidence and a clear fix/suggested patch.
 - Cap inline comments at ${config.limits.max_inline_comments}.
 - Keep key concerns to ${config.limits.max_key_concerns}.
+- Use rules.json and scopes.json to scope findings and include rule_id + rule_reason where applicable.
+- Use context_pack.json to reason about cross-file changes.
+- Respect commentTypes/output/strictness from bot_config.json (summary-only means no inline comments).
 
 Output requirements:
 - Write JSON to /work/out/draft_review.json with this schema:
@@ -25,8 +32,13 @@ Output requirements:
   "summary": {
     "overview": "string",
     "risk": "low|medium|high",
+    "confidence": 0.0,
     "key_concerns": ["string"],
-    "what_to_test": ["string"]
+    "what_to_test": ["string"],
+    "file_breakdown": [
+      { "path": "string", "summary": "string", "risk": "low|medium|high (optional)" }
+    ],
+    "diagram_mermaid": "string (optional)"
   },
   "comments": [
     {
@@ -40,7 +52,11 @@ Output requirements:
       "title": "string",
       "body": "string",
       "evidence": "string",
-      "suggested_patch": "string (optional)"
+      "suggested_patch": "string (optional)",
+      "comment_type": "inline|summary (optional)",
+      "rule_id": "string (optional)",
+      "rule_reason": "string (optional)",
+      "confidence": "high|medium|low (optional)"
     }
   ]
 }
@@ -56,12 +72,16 @@ Inputs:
 ${draftReviewJson}
 - Diff patch file: /work/bundle/diff.patch
 - Changed files list: /work/bundle/changed_files.json
+- Rules: /work/bundle/rules.json
+- Context pack: /work/bundle/context_pack.json
 
 Rules to enforce:
 - Only comment on diff lines.
 - Evidence required.
 - Blocking requires clear fix/suggested patch.
 - Drop weak, speculative, or style-only comments.
+- Ensure comment_type matches rules and config.
+- Preserve rule_id and rule_reason when applicable.
 
 Outputs:
 1) /work/out/final_review.json (same schema as draft)
@@ -83,7 +103,7 @@ Do not print anything else. Ensure valid JSON files.`;
 
 export function buildVerifierPrompt(headSha: string): string {
   return `You are the execution verifier. You can call these tools: read_file, search, lint, build, test.
-read_file/search let you inspect repo and bundle outputs; lint/build/test run commands configured in /work/repo/.prreviewer.yml (if configured).
+read_file/search let you inspect repo and bundle outputs; lint/build/test run commands configured in /work/repo/grepiku.json (or legacy greptile.json / .prreviewer.yml).
 Each lint/build/test tool may be called at most once; repeated calls return cached results.
 
 Context files:

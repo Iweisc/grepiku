@@ -8,6 +8,18 @@ export const redisConnection = new Redis(env.redisUrl, {
   maxRetriesPerRequest: null
 });
 
-export const reviewQueue = new Queue("pr-review", {
+export const reviewQueue = new Queue("review-orchestrator", {
+  connection: redisConnection
+});
+
+export const indexQueue = new Queue("indexer", {
+  connection: redisConnection
+});
+
+export const graphQueue = new Queue("graph-builder", {
+  connection: redisConnection
+});
+
+export const analyticsQueue = new Queue("analytics-ingest", {
   connection: redisConnection
 });

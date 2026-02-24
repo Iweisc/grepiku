@@ -1,9 +1,10 @@
 import fs from "fs/promises";
 import path from "path";
+import { minimatch } from "minimatch";
+import { execa } from "execa";
 import { prisma } from "../db/client.js";
-import { getInstallationOctokit, getInstallationToken } from "../github/auth.js";
 import { loadEnv } from "../config/env.js";
-import { loadRepoConfig } from "./config.js";
+import { loadRepoConfig, saveRepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
 import { buildReviewerPrompt, buildEditorPrompt, buildVerifierPrompt } from "./prompts.js";
 import { runCodexStage } from "../runner/codexRunner.js";
@@ -25,26 +26,24 @@ import {
 } from "./diff.js";
 import { fingerprintForComment, matchKeyForComment } from "./findings.js";
 import { ReviewOutput } from "./schemas.js";
-import { minimatch } from "minimatch";
-import {
-  buildLocalDiffPatch,
-  ensureRepoCheckout,
-  fetchDiffPatch,
-  isDiffTooLargeError,
-  listChangedFiles,
-  renderPrMarkdown
-} from "./pr-data.js";
+import { getProviderAdapter } from "../providers/registry.js";
+import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
+import { enqueueAnalyticsJob, enqueueGraphJob, enqueueIndexJob } from "../queue/enqueue.js";
+import { resolveRules } from "./triggers.js";
+import { buildContextPack } from "./context.js";
 
 const env = loadEnv();
 
 export type ReviewJobData = {
-  installationId: number;
-  owner: string;
-  repo: string;
+  provider: "github" | "gitlab" | "ghes";
+  installationId?: string | null;
+  repoId: number;
+  pullRequestId: number;
   prNumber: number;
   headSha: string;
   trigger: string;
   force?: boolean;
+  rulesOverride?: any;
 };
 
  
@@ -53,19 +52,39 @@ function filterAndNormalizeComments(
   review: ReviewOutput,
   diffIndex: ReturnType<typeof buildDiffIndex>,
   maxInline: number,
-  ignoreGlobs: string[]
-): ReviewComment[] {
-  const comments: ReviewComment[] = [];
+  ignoreGlobs: string[],
+  allowedTypes: Array<"inline" | "summary">,
+  summaryOnly: boolean,
+  strictness: "low" | "medium" | "high"
+): { inline: ReviewComment[]; summary: ReviewComment[] } {
+  const inline: ReviewComment[] = [];
+  const summary: ReviewComment[] = [];
   for (const comment of review.comments) {
     if (ignoreGlobs.some((pattern) => minimatch(comment.path, pattern))) continue;
     const evidence = (comment.evidence || "").trim();
     if (evidence.length === 0 || evidence === "\"\"" || evidence === "''") continue;
     if (comment.severity === "blocking" && !comment.suggested_patch) continue;
-    if (!isLineInDiff(diffIndex, comment)) continue;
-    comments.push(comment);
-    if (comments.length >= maxInline) break;
+    const type = comment.comment_type || "inline";
+    if (type !== "summary" && !isLineInDiff(diffIndex, comment)) continue;
+    const confidence = comment.confidence || "medium";
+    if (strictness === "high") {
+      if (comment.severity === "nit") continue;
+      if (confidence === "low") continue;
+    }
+    if (strictness === "medium") {
+      if (comment.severity === "nit" && confidence === "low") continue;
+    }
+    if (!allowedTypes.includes(type)) continue;
+    if (type === "summary") {
+      summary.push(comment);
+      continue;
+    }
+    if (!summaryOnly) {
+      inline.push(comment);
+      if (inline.length >= maxInline) break;
+    }
   }
-  return comments;
+  return { inline, summary };
 }
 
 function formatInlineComment(comment: ReviewComment): string {
@@ -117,9 +136,10 @@ function formatInlineComment(comment: ReviewComment): string {
     marker,
     `**${comment.severity.toUpperCase()}** ${comment.title}`,
     `Category: ${comment.category}`,
+    comment.rule_id ? `Rule: ${comment.rule_id}` : null,
     `Evidence: ${comment.evidence}`,
     comment.body
-  ];
+  ].filter((line) => line !== null);
 
   const suggestedPatch = comment.suggested_patch
     ? normalizeSuggestedPatch(comment.suggested_patch)
@@ -164,8 +184,9 @@ function renderStatusComment(params: {
     build: { status: string; summary: string; top_errors: string[] };
     test: { status: string; summary: string; top_errors: string[] };
   };
+  warnings?: string[];
 }): string {
-  const { summary, newFindings, openFindings, fixedFindings, checks } = params;
+  const { summary, newFindings, openFindings, fixedFindings, checks, warnings } = params;
   const renderList = (items: Array<{ title: string; url?: string }>) => {
     if (items.length === 0) return "- (none)";
     return items.map((item) => (item.url ? `- [${item.title}](${item.url})` : `- ${item.title}`)).join("\n");
@@ -186,6 +207,7 @@ function renderStatusComment(params: {
     "",
     `**Overview:** ${summary.overview}`,
     `**Risk:** ${summary.risk}`,
+    summary.confidence !== undefined ? `**Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : "",
     "",
     "### New",
     renderList(newFindings),
@@ -195,6 +217,8 @@ function renderStatusComment(params: {
     "",
     "### Fixed Since Last Run",
     renderFixed(),
+    "",
+    warnings && warnings.length > 0 ? "### Config Warnings\n" + warnings.map((w) => `- ${w}`).join("\n") : "",
     "",
     "### Checks",
     renderCheck("lint", checks.lint),
@@ -214,47 +238,39 @@ function renderReviewingComment(): string {
 }
 
 async function upsertStatusComment(params: {
-  octokit: ReturnType<typeof getInstallationOctokit>;
-  owner: string;
-  repo: string;
-  prNumber: number;
+  client: {
+    createSummaryComment: (body: string) => Promise<{ id: string; body: string; url?: string | null }>;
+    updateSummaryComment: (commentId: string, body: string) => Promise<{ id: string; body: string; url?: string | null }>;
+  };
   pullRequestId: number;
   body: string;
 }) {
-  const { octokit, owner, repo, prNumber, pullRequestId, body } = params;
-  const statusComment = await prisma.statusComment.findUnique({
-    where: { pullRequestId }
+  const { client, pullRequestId, body } = params;
+  const statusComment = await prisma.reviewComment.findFirst({
+    where: { pullRequestId, kind: "summary" }
   });
 
   if (statusComment) {
     try {
-      await octokit.issues.updateComment({
-        owner,
-        repo,
-        comment_id: Number(statusComment.githubCommentId),
-        body
+      await client.updateSummaryComment(statusComment.providerCommentId, body);
+      await prisma.reviewComment.update({
+        where: { id: statusComment.id },
+        data: { body }
       });
       return;
     } catch (err: unknown) {
-      const status = (err as { status?: number; response?: { status?: number } })?.status ??
-        (err as { response?: { status?: number } })?.response?.status;
-      if (status !== 404) {
-        throw err;
-      }
-      await prisma.statusComment.delete({ where: { pullRequestId } }).catch(() => undefined);
+      await prisma.reviewComment.delete({ where: { id: statusComment.id } }).catch(() => undefined);
     }
   }
 
-  const created = await octokit.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body
-  });
-  await prisma.statusComment.create({
+  const created = await client.createSummaryComment(body);
+  await prisma.reviewComment.create({
     data: {
       pullRequestId,
-      githubCommentId: String(created.data.id)
+      kind: "summary",
+      providerCommentId: created.id,
+      body: created.body,
+      url: created.url || null
     }
   });
 }
@@ -330,7 +346,12 @@ function buildFixPrompt(comments: ReviewComment[]): string {
   return lines.join("\n");
 }
 
-function buildSummaryBlock(summary: ReviewOutput["summary"], comments: ReviewComment[]): string {
+function buildSummaryBlock(
+  summary: ReviewOutput["summary"],
+  comments: ReviewComment[],
+  summaryComments: ReviewComment[],
+  patternMatches: string[]
+): string {
   const start = "<!-- grepiku-summary:start -->";
   const end = "<!-- grepiku-summary:end -->";
   const severityOrder = { blocking: 0, important: 1, nit: 2 } as const;
@@ -349,6 +370,23 @@ function buildSummaryBlock(summary: ReviewOutput["summary"], comments: ReviewCom
   const notableLine = notable
     ? `Notable issue: ${notable.title} (${notable.severity})`
     : "Notable issue: (none)";
+
+  const fileBreakdown =
+    summary.file_breakdown?.length
+      ? summary.file_breakdown
+          .map((file) => `- ${file.path}: ${file.summary}${file.risk ? ` (risk: ${file.risk})` : ""}`)
+          .join("\n")
+      : "- (none)";
+
+  const summaryFindings =
+    summaryComments.length > 0
+      ? summaryComments.map((c) => `- ${c.title}: ${c.body}`).join("\n")
+      : "- (none)";
+
+  const patternBlock =
+    patternMatches.length > 0
+      ? patternMatches.map((match) => `- ${match}`).join("\n")
+      : "- (none)";
 
   const fixPrompt = buildFixPrompt(comments);
   const escapeHtml = (text: string) =>
@@ -372,15 +410,87 @@ function buildSummaryBlock(summary: ReviewOutput["summary"], comments: ReviewCom
     summary.overview,
     "",
     `Risk: ${summary.risk}`,
+    summary.confidence !== undefined ? `Confidence: ${(summary.confidence * 100).toFixed(0)}%` : "",
     notableLine,
+    "",
+    "File breakdown:",
+    fileBreakdown,
+    "",
+    "Summary findings:",
+    summaryFindings,
+    "",
+    "Pattern matches:",
+    patternBlock,
     "",
     "Key concerns:",
     keyConcerns,
     "",
     "What to test:",
     whatToTest,
+    summary.diagram_mermaid ? "" : "",
+    summary.diagram_mermaid ? "Diagram:" : "",
+    summary.diagram_mermaid ? "```mermaid" : "",
+    summary.diagram_mermaid || "",
+    summary.diagram_mermaid ? "```" : "",
     end
-  ].join("\n");
+  ].filter((line) => line !== "").join("\n");
+}
+
+function computeConfidence(summary: ReviewOutput["summary"], comments: ReviewComment[]): number {
+  if (summary.confidence !== undefined) return summary.confidence;
+  const blocking = comments.filter((c) => c.severity === "blocking").length;
+  const important = comments.filter((c) => c.severity === "important").length;
+  const nit = comments.filter((c) => c.severity === "nit").length;
+  const penalty = blocking * 0.18 + important * 0.08 + nit * 0.02;
+  const base = summary.risk === "high" ? 0.45 : summary.risk === "medium" ? 0.6 : 0.75;
+  return Math.max(0.2, Math.min(0.95, base - penalty));
+}
+
+function generateMermaidDiagram(changedFiles: Array<{ filename?: string; path?: string }>, relatedFiles: string[]): string {
+  const nodes = new Set<string>();
+  const edges: string[] = [];
+  const changed = changedFiles
+    .map((file) => file.filename || file.path)
+    .filter((value): value is string => Boolean(value));
+  for (const file of changed) nodes.add(file);
+  for (const rel of relatedFiles) nodes.add(rel);
+  for (const file of changed) {
+    for (const rel of relatedFiles.slice(0, 5)) {
+      if (file !== rel) edges.push(`"${file}" --> "${rel}"`);
+    }
+  }
+  if (nodes.size === 0) return "";
+  return ["graph TD", ...edges].join("\n");
+}
+
+function enrichSummary(params: {
+  summary: ReviewOutput["summary"];
+  comments: ReviewComment[];
+  changedFiles: Array<{ filename?: string; path?: string }>;
+  relatedFiles: string[];
+}): ReviewOutput["summary"] {
+  const summary = { ...params.summary };
+  if (!summary.file_breakdown || summary.file_breakdown.length === 0) {
+    const counts = new Map<string, number>();
+    for (const comment of params.comments) {
+      counts.set(comment.path, (counts.get(comment.path) || 0) + 1);
+    }
+    summary.file_breakdown = params.changedFiles
+      .map((file) => file.filename || file.path)
+      .filter((value): value is string => Boolean(value))
+      .map((path) => ({
+        path,
+        summary: counts.get(path) ? `${counts.get(path)} review comment(s)` : "No major issues"
+      }));
+  }
+  if (!summary.diagram_mermaid) {
+    const diagram = generateMermaidDiagram(params.changedFiles, params.relatedFiles);
+    if (diagram) summary.diagram_mermaid = diagram;
+  }
+  if (summary.confidence === undefined) {
+    summary.confidence = computeConfidence(summary, params.comments);
+  }
+  return summary;
 }
 
 function upsertSummaryBlock(body: string, block: string): string {
@@ -398,103 +508,236 @@ function upsertSummaryBlock(body: string, block: string): string {
   return `${trimmed}\n\n${block}`;
 }
 
-export async function processReviewJob(data: ReviewJobData) {
-  const { installationId, owner, repo, prNumber } = data;
-  const octokit = getInstallationOctokit(installationId);
-  const pr = await octokit.pulls.get({ owner, repo, pull_number: prNumber });
-  const head = pr.data.head.sha;
+async function buildLocalDiffPatch(params: {
+  repoPath: string;
+  baseSha: string | null | undefined;
+  headSha: string;
+}): Promise<string> {
+  const { repoPath, baseSha, headSha } = params;
+  if (!baseSha) return "";
+  const { stdout } = await execa(
+    "git",
+    ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
+    { maxBuffer: 1024 * 1024 * 200 }
+  );
+  return stdout;
+}
 
-  const repoInstallation = await prisma.repoInstallation.upsert({
-    where: { installationId },
-    update: { owner, repo },
-    create: { installationId, owner, repo }
+function renderPrMarkdown(params: {
+  title: string;
+  number: number;
+  author: string;
+  body?: string | null;
+  baseRef?: string | null;
+  headRef?: string | null;
+  headSha: string;
+  url?: string | null;
+}): string {
+  const { title, number, author, body, baseRef, headRef, headSha, url } = params;
+  return `# PR #${number}: ${title}
+
+Author: ${author}
+Base: ${baseRef || ""}
+Head: ${headRef || ""}
+Head SHA: ${headSha}
+URL: ${url || ""}
+
+## Description
+${body || "(no description)"}
+`;
+}
+
+export async function processReviewJob(data: ReviewJobData) {
+  const { provider, installationId, repoId, pullRequestId, prNumber, headSha, trigger, rulesOverride } = data;
+  const repo = await prisma.repo.findFirst({ where: { id: repoId } });
+  const pullRequestRecord = await prisma.pullRequest.findFirst({ where: { id: pullRequestId } });
+  if (!repo || !pullRequestRecord) return;
+
+  const installation = installationId
+    ? await prisma.installation.findFirst({ where: { externalId: installationId } })
+    : null;
+
+  const adapter = getProviderAdapter(provider);
+  const providerRepo: ProviderRepo = {
+    externalId: repo.externalId,
+    owner: repo.owner,
+    name: repo.name,
+    fullName: repo.fullName,
+    defaultBranch: repo.defaultBranch || undefined
+  };
+  const providerPull: ProviderPullRequest = {
+    externalId: pullRequestRecord.externalId,
+    number: prNumber,
+    title: pullRequestRecord.title || null,
+    body: pullRequestRecord.body || null,
+    url: pullRequestRecord.url || null,
+    state: pullRequestRecord.state,
+    baseRef: pullRequestRecord.baseRef || null,
+    headRef: pullRequestRecord.headRef || null,
+    baseSha: pullRequestRecord.baseSha || null,
+    headSha: headSha || pullRequestRecord.headSha
+  };
+  let client = await adapter.createClient({
+    installationId: installationId || null,
+    repo: providerRepo,
+    pullRequest: providerPull
+  });
+  const refreshed = await client.fetchPullRequest();
+  client = await adapter.createClient({
+    installationId: installationId || null,
+    repo: providerRepo,
+    pullRequest: refreshed
   });
 
-  const pullRequest = await prisma.pullRequest.upsert({
-    where: {
-      repoInstallationId_number: {
-        repoInstallationId: repoInstallation.id,
-        number: prNumber
-      }
-    },
-    update: {
-      title: pr.data.title,
-      url: pr.data.html_url,
-      headSha: head,
-      baseSha: pr.data.base.sha,
-      state: pr.data.state
-    },
-    create: {
-      repoInstallationId: repoInstallation.id,
-      number: prNumber,
-      title: pr.data.title,
-      url: pr.data.html_url,
-      headSha: head,
-      baseSha: pr.data.base.sha,
-      state: pr.data.state
+  const authorUser = refreshed.author
+    ? await prisma.user.upsert({
+        where: { providerId_externalId: { providerId: repo.providerId, externalId: refreshed.author.externalId } },
+        update: {
+          login: refreshed.author.login,
+          name: refreshed.author.name || null,
+          avatarUrl: refreshed.author.avatarUrl || null
+        },
+        create: {
+          providerId: repo.providerId,
+          externalId: refreshed.author.externalId,
+          login: refreshed.author.login,
+          name: refreshed.author.name || null,
+          avatarUrl: refreshed.author.avatarUrl || null
+        }
+      })
+    : null;
+
+  const pullRequest = await prisma.pullRequest.update({
+    where: { id: pullRequestRecord.id },
+    data: {
+      title: refreshed.title || pullRequestRecord.title,
+      body: refreshed.body || pullRequestRecord.body,
+      url: refreshed.url || pullRequestRecord.url,
+      state: refreshed.state,
+      baseRef: refreshed.baseRef || pullRequestRecord.baseRef,
+      headRef: refreshed.headRef || pullRequestRecord.headRef,
+      baseSha: refreshed.baseSha || pullRequestRecord.baseSha,
+      headSha: refreshed.headSha,
+      draft: refreshed.draft ?? pullRequestRecord.draft,
+      authorId: authorUser?.id || pullRequestRecord.authorId
     }
   });
 
-  const run = await prisma.run.upsert({
+  const run = await prisma.reviewRun.upsert({
     where: {
       pullRequestId_headSha: {
         pullRequestId: pullRequest.id,
-        headSha: head
+        headSha: refreshed.headSha
       }
     },
     update: {
       status: "running",
-      startedAt: new Date()
+      startedAt: new Date(),
+      trigger
     },
     create: {
       pullRequestId: pullRequest.id,
-      headSha: head,
+      installationId: installation?.id || null,
+      headSha: refreshed.headSha,
       status: "running",
-      startedAt: new Date()
+      startedAt: new Date(),
+      trigger
     }
   });
 
-  await upsertStatusComment({
-    octokit,
-    owner,
-    repo,
-    prNumber,
-    pullRequestId: pullRequest.id,
-    body: renderReviewingComment()
-  });
+  let statusCheckRecord: ProviderStatusCheck | null = null;
+  let statusCheckRowId: number | null = null;
 
   try {
-    const installationToken = await getInstallationToken(installationId);
-    const repoPath = await ensureRepoCheckout({
-      installationToken,
-      owner,
-      repo,
-      headSha: head
-    });
+    const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
 
-    const repoConfig = await loadRepoConfig(repoPath);
-    let diffPatch: string;
+    const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
+    await saveRepoConfig(repo.id, repoConfig, warnings);
+    const resolvedConfig = resolveRules(repoConfig, {
+      orgDefaults: (installation?.configJson as any) || undefined,
+      uiRules: rulesOverride?.rules || [],
+      strictness: rulesOverride?.strictness,
+      commentTypes: rulesOverride?.commentTypes,
+      output: rulesOverride?.output,
+      triggers: rulesOverride?.triggers
+    });
     try {
-      diffPatch = await fetchDiffPatch(octokit, owner, repo, prNumber);
-    } catch (err) {
-      if (!isDiffTooLargeError(err)) throw err;
-      diffPatch = await buildLocalDiffPatch({
-        repoPath,
-        baseSha: pr.data.base.sha,
-        headSha: head
+      statusCheckRecord = await client.createStatusCheck({
+        name: resolvedConfig.statusChecks.name,
+        status: "in_progress",
+        summary: "Review in progress"
+      });
+      const row = await prisma.statusCheck.create({
+        data: {
+          reviewRunId: run.id,
+          name: statusCheckRecord.name,
+          status: "in_progress",
+          providerCheckId: statusCheckRecord.id || null,
+          outputJson: {
+            summary: statusCheckRecord.summary,
+            required: resolvedConfig.statusChecks.required
+          }
+        }
+      });
+      statusCheckRowId = row.id;
+    } catch {
+      statusCheckRecord = null;
+    }
+    if (resolvedConfig.output.destination === "comment" || resolvedConfig.output.destination === "both") {
+      await upsertStatusComment({
+        client,
+        pullRequestId: pullRequest.id,
+        body: renderReviewingComment()
       });
     }
-    const changedFiles = await listChangedFiles(octokit, owner, repo, prNumber);
+
+    for (const patternRepo of resolvedConfig.patternRepositories) {
+      const pattern = await prisma.patternRepository.upsert({
+        where: { url: patternRepo.url },
+        update: { name: patternRepo.name, ref: patternRepo.ref || null },
+        create: { name: patternRepo.name, url: patternRepo.url, ref: patternRepo.ref || null }
+      });
+      await prisma.patternRepositoryLink.upsert({
+        where: { repoId_patternRepoId: { repoId: repo.id, patternRepoId: pattern.id } },
+        update: { scope: patternRepo.scope || null },
+        create: { repoId: repo.id, patternRepoId: pattern.id, scope: patternRepo.scope || null }
+      });
+      await enqueueIndexJob({
+        provider,
+        installationId: installationId || null,
+        repoId: repo.id,
+        headSha: refreshed.headSha,
+        patternRepo: { url: patternRepo.url, ref: patternRepo.ref, name: patternRepo.name }
+      });
+    }
+
+    let diffPatch: string;
+    try {
+      diffPatch = await client.fetchDiffPatch();
+    } catch {
+      diffPatch = await buildLocalDiffPatch({
+        repoPath,
+        baseSha: refreshed.baseSha,
+        headSha: refreshed.headSha
+      });
+    }
+    const changedFiles = await client.listChangedFiles();
 
     const prMarkdown = renderPrMarkdown({
-      title: pr.data.title,
+      title: refreshed.title || pullRequest.title || "Untitled",
       number: prNumber,
-      author: pr.data.user?.login || "unknown",
-      body: pr.data.body,
-      baseRef: pr.data.base.ref,
-      headRef: pr.data.head.ref,
-      headSha: head,
-      url: pr.data.html_url
+      author: refreshed.author?.login || "unknown",
+      body: refreshed.body,
+      baseRef: refreshed.baseRef,
+      headRef: refreshed.headRef,
+      headSha: refreshed.headSha,
+      url: refreshed.url
+    });
+
+    const contextPack = await buildContextPack({
+      repoId: repo.id,
+      diffPatch,
+      changedFiles: changedFiles as Array<{ filename?: string; path?: string }>
     });
 
     const { bundleDir, outDir, codexHomeDir } = await createRunDirs(env.projectRoot, run.id);
@@ -503,10 +746,13 @@ export async function processReviewJob(data: ReviewJobData) {
       prMarkdown,
       diffPatch,
       changedFiles,
-      repoConfig
+      repoConfig,
+      resolvedConfig,
+      contextPack,
+      warnings
     });
 
-    const reviewerPrompt = buildReviewerPrompt(repoConfig);
+    const reviewerPrompt = buildReviewerPrompt(resolvedConfig);
     await runCodexStage({
       stage: "reviewer",
       repoPath,
@@ -514,33 +760,36 @@ export async function processReviewJob(data: ReviewJobData) {
       outDir,
       codexHomeDir,
       prompt: reviewerPrompt,
-      headSha: head,
-      repoInstallationId: repoInstallation.id,
+      headSha: refreshed.headSha,
+      repoId: repo.id,
+      reviewRunId: run.id,
       prNumber
     });
 
     const draft = await readAndValidateJson(path.join(outDir, "draft_review.json"), ReviewSchema);
 
-    const editorPrompt = buildEditorPrompt(
-      JSON.stringify(draft, null, 2),
-      diffPatch
-    );
+    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), diffPatch);
     await runCodexStage({
       stage: "editor",
       bundleDir,
       outDir,
       codexHomeDir,
       prompt: editorPrompt,
-      headSha: head,
-      repoInstallationId: repoInstallation.id,
+      headSha: refreshed.headSha,
+      repoId: repo.id,
+      reviewRunId: run.id,
       prNumber
     });
 
-    const finalReview = await readAndValidateJson(
-      path.join(outDir, "final_review.json"),
-      ReviewSchema
-    );
+    const finalReview = await readAndValidateJson(path.join(outDir, "final_review.json"), ReviewSchema);
     const verdicts = await readAndValidateJson(path.join(outDir, "verdicts.json"), VerdictsSchema);
+
+    finalReview.summary = enrichSummary({
+      summary: finalReview.summary,
+      comments: finalReview.comments,
+      changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
+      relatedFiles: contextPack.relatedFiles
+    });
 
     const diffIndex = buildDiffIndex(diffPatch);
     const verdictMap = new Map(verdicts.verdicts.map((v) => [v.comment_id, v]));
@@ -561,13 +810,18 @@ export async function processReviewJob(data: ReviewJobData) {
     const filteredComments = filterAndNormalizeComments(
       { ...finalReview, comments: commentsAfterVerdict },
       diffIndex,
-      repoConfig.limits.max_inline_comments,
-      repoConfig.ignore
+      resolvedConfig.limits.max_inline_comments,
+      resolvedConfig.ignore,
+      resolvedConfig.commentTypes.allow,
+      resolvedConfig.output.summaryOnly,
+      resolvedConfig.strictness
     );
+    const hasBlocking = filteredComments.inline.some((comment) => comment.severity === "blocking");
+
     const inlineContext = {
-      head_sha: head,
+      head_sha: refreshed.headSha,
       summary: finalReview.summary,
-      comments: filteredComments
+      comments: filteredComments.inline
     };
     await fs.writeFile(
       path.join(outDir, "inline_findings.json"),
@@ -575,19 +829,24 @@ export async function processReviewJob(data: ReviewJobData) {
       "utf8"
     );
 
-    const summaryBlock = buildSummaryBlock(finalReview.summary, filteredComments);
-    const originalBody = pr.data.body || "";
+    const patternMatches = contextPack.retrieved
+      .filter((item) => item.isPattern)
+      .map((item) => item.symbol || item.path || "pattern match");
+    const summaryBlock = buildSummaryBlock(
+      finalReview.summary,
+      filteredComments.inline,
+      filteredComments.summary,
+      patternMatches
+    );
+    const originalBody = pullRequest.body || "";
     const updatedBody = upsertSummaryBlock(originalBody, summaryBlock);
-    if (updatedBody !== originalBody) {
-      await octokit.pulls.update({
-        owner,
-        repo,
-        pull_number: prNumber,
-        body: updatedBody
-      });
+    if (resolvedConfig.output.destination === "pr_body" || resolvedConfig.output.destination === "both") {
+      if (updatedBody !== originalBody) {
+        await client.updatePullRequestBody(updatedBody);
+      }
     }
 
-    const checksPrompt = buildVerifierPrompt(head);
+    const checksPrompt = buildVerifierPrompt(refreshed.headSha);
     await runCodexStage({
       stage: "verifier",
       repoPath,
@@ -595,8 +854,9 @@ export async function processReviewJob(data: ReviewJobData) {
       outDir,
       codexHomeDir,
       prompt: checksPrompt,
-      headSha: head,
-      repoInstallationId: repoInstallation.id,
+      headSha: refreshed.headSha,
+      repoId: repo.id,
+      reviewRunId: run.id,
       prNumber
     });
     const checksPath = path.join(outDir, "checks.json");
@@ -612,10 +872,7 @@ export async function processReviewJob(data: ReviewJobData) {
     }
 
     const existingOpen = await prisma.finding.findMany({
-      where: {
-        pullRequestId: pullRequest.id,
-        status: "open"
-      }
+      where: { pullRequestId: pullRequest.id, status: "open" }
     });
 
     const existingByKey = new Map<string, typeof existingOpen[number]>();
@@ -628,7 +885,7 @@ export async function processReviewJob(data: ReviewJobData) {
     const stillOpen: Array<{ title: string; url?: string; commentId: string }> = [];
     const matchedOldIds = new Set<number>();
 
-    const reviewComments = filteredComments;
+    const reviewComments = filteredComments.inline;
     for (const comment of reviewComments) {
       const hunkHash = hunkHashForComment(diffIndex, comment);
       const contextHash = contextHashForComment(diffIndex, comment);
@@ -646,7 +903,9 @@ export async function processReviewJob(data: ReviewJobData) {
             lastSeenRunId: run.id,
             body: comment.body,
             evidence: comment.evidence,
-            suggestedPatch: comment.suggested_patch
+            suggestedPatch: comment.suggested_patch,
+            ruleId: comment.rule_id || null,
+            ruleReason: comment.rule_reason || null
           }
         });
         continue;
@@ -656,7 +915,7 @@ export async function processReviewJob(data: ReviewJobData) {
       await prisma.finding.create({
         data: {
           pullRequestId: pullRequest.id,
-          runId: run.id,
+          reviewRunId: run.id,
           status: "open",
           fingerprint,
           hunkHash,
@@ -672,6 +931,8 @@ export async function processReviewJob(data: ReviewJobData) {
           body: comment.body,
           evidence: comment.evidence,
           suggestedPatch: comment.suggested_patch,
+          ruleId: comment.rule_id || null,
+          ruleReason: comment.rule_reason || null,
           firstSeenRunId: run.id,
           lastSeenRunId: run.id
         }
@@ -687,79 +948,44 @@ export async function processReviewJob(data: ReviewJobData) {
       });
     }
 
-    const newCommentIds = new Set(newFindings.map((f) => f.commentId));
-    const commentsToPost = reviewComments.filter((c) => newCommentIds.has(c.comment_id));
-    let reviewResponse = null as null | { comments: Array<{ id: number; body: string }> };
-    if (commentsToPost.length > 0) {
-      const review = await octokit.pulls.createReview({
-        owner,
-        repo,
-        pull_number: prNumber,
-        commit_id: head,
-        event: "COMMENT",
-        comments: commentsToPost.map((comment) => ({
+    if (!resolvedConfig.output.summaryOnly && resolvedConfig.commentTypes.allow.includes("inline")) {
+      const newCommentIds = new Set(newFindings.map((f) => f.commentId));
+      const commentsToPost = reviewComments.filter((c) => newCommentIds.has(c.comment_id));
+      for (const comment of commentsToPost) {
+        const created = await client.createInlineComment({
           path: comment.path,
           line: comment.line,
-          side: comment.side as "RIGHT" | "LEFT",
+          side: comment.side,
           body: formatInlineComment(comment)
-        }))
-      });
-
-      const reviewComments = ((review.data as unknown as { comments?: Array<{ id: number; body?: string | null }> }).comments || []);
-      reviewResponse = {
-        comments: reviewComments.map((c) => ({ id: c.id, body: c.body || "" }))
-      };
-    }
-
-    if (reviewResponse) {
-      for (const comment of reviewResponse.comments) {
-        const commentId = extractCommentId(comment.body);
-        if (!commentId) continue;
-        await prisma.finding.updateMany({
-          where: {
-            pullRequestId: pullRequest.id,
-            commentId
-          },
+        });
+        await prisma.reviewComment.create({
           data: {
-            githubCommentId: String(comment.id)
+            pullRequestId: pullRequest.id,
+            findingId: (await prisma.finding.findFirst({ where: { pullRequestId: pullRequest.id, commentId: comment.comment_id } }))?.id || undefined,
+            kind: "inline",
+            providerCommentId: created.id,
+            body: created.body,
+            url: created.url || null
           }
         });
       }
-    }
 
-    // Sync existing review comments to ensure formatting stays current
-    const allReviewComments = await octokit.paginate(
-      octokit.pulls.listReviewComments,
-      { owner, repo, pull_number: prNumber, per_page: 100 }
-    );
-    const byMarker = new Map<string, { id: number; body?: string | null }>();
-    for (const rc of allReviewComments) {
-      const marker = extractCommentId(rc.body || "");
-      if (marker) {
-        byMarker.set(marker, { id: rc.id, body: rc.body });
-      }
-    }
-    for (const comment of reviewComments) {
-      const existing = byMarker.get(comment.comment_id);
-      if (!existing) continue;
-      const desiredBody = formatInlineComment(comment);
-      if ((existing.body || "") !== desiredBody) {
-        await octokit.pulls.updateReviewComment({
-          owner,
-          repo,
-          comment_id: existing.id,
-          body: desiredBody
-        });
-      }
-      await prisma.finding.updateMany({
-        where: {
-          pullRequestId: pullRequest.id,
-          commentId: comment.comment_id
-        },
-        data: {
-          githubCommentId: String(existing.id)
+      const existingComments = await client.listInlineComments();
+      const byMarker = new Map<string, ProviderReviewComment>();
+      for (const rc of existingComments) {
+        const marker = extractCommentId(rc.body || "");
+        if (marker) {
+          byMarker.set(marker, rc);
         }
-      });
+      }
+      for (const comment of reviewComments) {
+        const existing = byMarker.get(comment.comment_id);
+        if (!existing) continue;
+        const desiredBody = formatInlineComment(comment);
+        if ((existing.body || "") !== desiredBody) {
+          await client.updateInlineComment(existing.id, desiredBody);
+        }
+      }
     }
 
     const updatedOpen = await prisma.finding.findMany({
@@ -769,23 +995,12 @@ export async function processReviewJob(data: ReviewJobData) {
       }
     });
 
-    const makeCommentUrl = (commentId?: string | null) => {
-      if (!commentId) return undefined;
-      return `https://github.com/${owner}/${repo}/pull/${prNumber}#discussion_r${commentId}`;
-    };
-
     const newFindingLinks = newFindings.map((f) => ({
-      title: f.title,
-      url: makeCommentUrl(
-        updatedOpen.find((o) => o.commentId === f.commentId)?.githubCommentId || null
-      )
+      title: f.title
     }));
 
     const openFindingLinks = stillOpen.map((f) => ({
-      title: f.title,
-      url: makeCommentUrl(
-        updatedOpen.find((o) => o.commentId === f.commentId)?.githubCommentId || null
-      )
+      title: f.title
     }));
 
     const fixedFindingLinks = fixed.map((f) => ({ title: f.title }));
@@ -795,34 +1010,84 @@ export async function processReviewJob(data: ReviewJobData) {
       newFindings: newFindingLinks,
       openFindings: openFindingLinks,
       fixedFindings: fixedFindingLinks,
-      checks: checks.checks
+      checks: checks.checks,
+      warnings
     });
 
-    await upsertStatusComment({
-      octokit,
-      owner,
-      repo,
-      prNumber,
-      pullRequestId: pullRequest.id,
-      body: statusBody
-    });
+    if (resolvedConfig.output.destination === "comment" || resolvedConfig.output.destination === "both") {
+      await upsertStatusComment({
+        client,
+        pullRequestId: pullRequest.id,
+        body: statusBody
+      });
+    }
 
-    await prisma.run.update({
+    await prisma.reviewRun.update({
       where: { id: run.id },
       data: {
         status: "completed",
         completedAt: new Date(),
+        configJson: repoConfig,
         draftJson: draft,
         finalJson: finalReview,
         verdictsJson: verdicts,
-        checksJson: checks
+        checksJson: checks,
+        summaryJson: finalReview.summary,
+        contextPackJson: contextPack,
+        rulesResolvedJson: resolvedConfig,
+        rulesUsedJson: finalReview.comments.map((c) => ({ id: c.rule_id, reason: c.rule_reason }))
       }
     });
+
+    if (statusCheckRecord?.id) {
+      const conclusion = resolvedConfig.statusChecks.required
+        ? hasBlocking
+          ? "failure"
+          : "success"
+        : hasBlocking
+          ? "neutral"
+          : "success";
+      await client.updateStatusCheck(statusCheckRecord.id, {
+        name: statusCheckRecord.name,
+        status: "completed",
+        conclusion,
+        summary: "Review completed"
+      });
+      if (statusCheckRowId) {
+        await prisma.statusCheck.update({
+          where: { id: statusCheckRowId },
+          data: { status: "completed", conclusion }
+        });
+      }
+    }
+
+    await enqueueIndexJob({
+      provider,
+      installationId: installationId || null,
+      repoId: repo.id,
+      headSha: refreshed.headSha
+    });
+    await enqueueGraphJob({ repoId: repo.id });
+    await enqueueAnalyticsJob({ reviewRunId: run.id });
   } catch (err) {
-    await prisma.run.update({
+    await prisma.reviewRun.update({
       where: { id: run.id },
       data: { status: "failed", completedAt: new Date() }
     });
+    if (statusCheckRecord?.id) {
+      await client.updateStatusCheck(statusCheckRecord.id, {
+        name: statusCheckRecord.name,
+        status: "completed",
+        conclusion: "failure",
+        summary: "Review failed"
+      });
+      if (statusCheckRowId) {
+        await prisma.statusCheck.update({
+          where: { id: statusCheckRowId },
+          data: { status: "completed", conclusion: "failure" }
+        });
+      }
+    }
     throw err;
   }
 }

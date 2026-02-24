@@ -11,14 +11,15 @@ const appAuth = createAppAuth({
 
 let appSlugCache: string | null = null;
 
-export function getInstallationOctokit(installationId: number): Octokit {
+export function getInstallationOctokit(installationId: number, baseUrl?: string): Octokit {
   return new Octokit({
     authStrategy: createAppAuth,
     auth: {
       appId: env.githubAppId,
       privateKey: env.githubPrivateKey,
       installationId
-    }
+    },
+    baseUrl: baseUrl || undefined
   });
 }
 
@@ -27,14 +28,15 @@ export async function getInstallationToken(installationId: number): Promise<stri
   return auth.token;
 }
 
-export async function getAppSlug(): Promise<string> {
+export async function getAppSlug(baseUrl?: string): Promise<string> {
   if (appSlugCache) return appSlugCache;
   const octokit = new Octokit({
     authStrategy: createAppAuth,
     auth: {
       appId: env.githubAppId,
       privateKey: env.githubPrivateKey
-    }
+    },
+    baseUrl: baseUrl || undefined
   });
   const { data } = await octokit.apps.getAuthenticated();
   const slug = data?.slug || data?.name || "";

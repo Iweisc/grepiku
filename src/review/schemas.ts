@@ -18,15 +18,30 @@ export const ReviewCommentSchema = z.object({
   title: z.string(),
   body: z.string(),
   evidence: z.string(),
-  suggested_patch: z.string().optional()
+  suggested_patch: z.string().optional(),
+  comment_type: z.enum(["inline", "summary"]).optional(),
+  rule_id: z.string().optional(),
+  rule_reason: z.string().optional(),
+  confidence: z.enum(["high", "medium", "low"]).optional()
 });
 
 export const ReviewSchema = z.object({
   summary: z.object({
     overview: z.string(),
     risk: z.enum(["low", "medium", "high"]),
+    confidence: z.number().min(0).max(1).optional(),
     key_concerns: z.array(z.string()),
-    what_to_test: z.array(z.string())
+    what_to_test: z.array(z.string()),
+    file_breakdown: z
+      .array(
+        z.object({
+          path: z.string(),
+          summary: z.string(),
+          risk: z.enum(["low", "medium", "high"]).optional()
+        })
+      )
+      .default([]),
+    diagram_mermaid: z.string().optional()
   }),
   comments: z.array(ReviewCommentSchema)
 });

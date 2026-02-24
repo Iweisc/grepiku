@@ -8,6 +8,11 @@ const EnvSchema = z.object({
   GITHUB_PRIVATE_KEY: z.string().min(1),
   GITHUB_WEBHOOK_SECRET: z.string().min(1),
   GITHUB_BOT_LOGIN: z.string().default(""),
+  GHES_BASE_URL: z.string().default(""),
+  GITLAB_BASE_URL: z.string().default("https://gitlab.com"),
+  GITLAB_API_TOKEN: z.string().default(""),
+  GITLAB_WEBHOOK_SECRET: z.string().default(""),
+  INTERNAL_API_KEY: z.string().default(""),
   OPENAI_COMPAT_BASE_URL: z.string().min(1),
   OPENAI_COMPAT_API_KEY: z.string().min(1),
   OPENAI_COMPAT_MODEL: z.string().default("gpt-5.2-codex-xhigh"),
@@ -28,6 +33,11 @@ export type Env = {
   githubPrivateKey: string;
   githubWebhookSecret: string;
   githubBotLogin: string;
+  ghesBaseUrl: string;
+  gitlabBaseUrl: string;
+  gitlabApiToken: string;
+  gitlabWebhookSecret: string;
+  internalApiKey: string;
   openaiBaseUrl: string;
   openaiApiKey: string;
   openaiModel: string;
@@ -54,6 +64,11 @@ export function loadEnv(): Env {
     githubPrivateKey: privateKey,
     githubWebhookSecret: parsed.GITHUB_WEBHOOK_SECRET,
     githubBotLogin: parsed.GITHUB_BOT_LOGIN.trim(),
+    ghesBaseUrl: parsed.GHES_BASE_URL.trim(),
+    gitlabBaseUrl: parsed.GITLAB_BASE_URL.trim(),
+    gitlabApiToken: parsed.GITLAB_API_TOKEN.trim(),
+    gitlabWebhookSecret: parsed.GITLAB_WEBHOOK_SECRET.trim(),
+    internalApiKey: parsed.INTERNAL_API_KEY.trim(),
     openaiBaseUrl: parsed.OPENAI_COMPAT_BASE_URL,
     openaiApiKey: parsed.OPENAI_COMPAT_API_KEY,
     openaiModel: parsed.OPENAI_COMPAT_MODEL,

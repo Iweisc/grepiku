@@ -27,8 +27,11 @@ export async function writeBundleFiles(params: {
   diffPatch: string;
   changedFiles: unknown;
   repoConfig: RepoConfig;
+  resolvedConfig?: RepoConfig;
+  contextPack?: unknown;
+  warnings?: string[];
 }) {
-  const { bundleDir, prMarkdown, diffPatch, changedFiles, repoConfig } = params;
+  const { bundleDir, prMarkdown, diffPatch, changedFiles, repoConfig, resolvedConfig, contextPack, warnings } = params;
   await fs.writeFile(path.join(bundleDir, "pr.md"), prMarkdown, "utf8");
   await fs.writeFile(path.join(bundleDir, "diff.patch"), diffPatch, "utf8");
   await fs.writeFile(
@@ -42,11 +45,42 @@ export async function writeBundleFiles(params: {
       {
         ignore: repoConfig.ignore,
         tools: repoConfig.tools,
-        limits: repoConfig.limits
+        limits: repoConfig.limits,
+        strictness: repoConfig.strictness,
+        commentTypes: repoConfig.commentTypes,
+        output: repoConfig.output,
+        statusChecks: repoConfig.statusChecks,
+        triggers: repoConfig.triggers
       },
       null,
       2
     ),
     "utf8"
   );
+  if (resolvedConfig) {
+    await fs.writeFile(
+      path.join(bundleDir, "rules.json"),
+      JSON.stringify(resolvedConfig.rules || [], null, 2),
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(bundleDir, "scopes.json"),
+      JSON.stringify(resolvedConfig.scopes || [], null, 2),
+      "utf8"
+    );
+  }
+  if (contextPack) {
+    await fs.writeFile(
+      path.join(bundleDir, "context_pack.json"),
+      JSON.stringify(contextPack, null, 2),
+      "utf8"
+    );
+  }
+  if (warnings && warnings.length > 0) {
+    await fs.writeFile(
+      path.join(bundleDir, "config_warnings.json"),
+      JSON.stringify(warnings, null, 2),
+      "utf8"
+    );
+  }
 }

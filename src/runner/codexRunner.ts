@@ -13,7 +13,8 @@ export type CodexRunParams = {
   codexHomeDir: string;
   prompt: string;
   headSha: string;
-  repoInstallationId: number;
+  repoId: number;
+  reviewRunId: number;
   prNumber: number;
 };
 
@@ -96,6 +97,26 @@ function configForStage(stage: CodexStage): string {
       `command = "node"\n` +
       `args = ["/opt/grepiku-tools/tools/readonly_mcp.js"]\n` +
       `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n` +
+      `\n[mcp_servers.retrieval]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/retrieval_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n`
+    );
+  }
+  if (stage === "editor") {
+    return (
+      base +
+      `\n[mcp_servers.readonly]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/readonly_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n` +
+      `\n[mcp_servers.retrieval]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/retrieval_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
       `tool_timeout_sec = 10\n`
     );
   }
@@ -134,9 +155,12 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     `CODEX_DISABLE_PROJECT_DOC=1`,
     `CODEX_QUIET_MODE=1`,
     `DATABASE_URL=${env.databaseUrl}`,
-    `TOOLRUN_REPO_INSTALLATION_ID=${params.repoInstallationId}`,
+    `REVIEW_RUN_ID=${params.reviewRunId}`,
+    `REVIEW_REPO_ID=${params.repoId}`,
     `TOOLRUN_PR_NUMBER=${params.prNumber}`,
-    `TOOLRUN_HEAD_SHA=${params.headSha}`
+    `TOOLRUN_HEAD_SHA=${params.headSha}`,
+    `INTERNAL_API_URL=http://web:3000/internal/retrieval`,
+    `INTERNAL_API_KEY=${env.internalApiKey}`
   ].join("\n");
   await fs.writeFile(envFilePath, envFile, { encoding: "utf8", mode: 0o600 });
 
