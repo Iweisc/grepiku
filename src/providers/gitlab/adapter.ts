@@ -79,7 +79,7 @@ function mapComment(payload: any): ProviderReviewComment {
   };
 }
 
-async function gitlabRequest<T>(
+async function gitlabRequest<T = any>(
   path: string,
   options: { method?: string; body?: any } = {}
 ): Promise<T> {

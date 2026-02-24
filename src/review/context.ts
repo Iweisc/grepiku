@@ -9,6 +9,7 @@ export type ContextPack = {
     path?: string;
     symbol?: string;
     text: string;
+    isPattern?: boolean;
   }>;
   relatedFiles: string[];
 };

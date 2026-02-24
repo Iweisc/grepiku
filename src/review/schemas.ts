@@ -40,7 +40,7 @@ export const ReviewSchema = z.object({
           risk: z.enum(["low", "medium", "high"]).optional()
         })
       )
-      .default([]),
+      .optional(),
     diagram_mermaid: z.string().optional()
   }),
   comments: z.array(ReviewCommentSchema)

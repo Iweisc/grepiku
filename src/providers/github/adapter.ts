@@ -103,6 +103,7 @@ function createClient(params: {
   const owner = params.repo.owner;
   const repo = params.repo.name;
   const prNumber = params.pullRequest.number;
+  const headSha = params.pullRequest.headSha;
 
   return {
     provider: params.baseUrl ? "ghes" : "github",
@@ -125,13 +126,21 @@ function createClient(params: {
       });
       return response.data as unknown as string;
     },
-    listChangedFiles: async () =>
-      octokit.paginate(octokit.pulls.listFiles, {
+    listChangedFiles: async () => {
+      const files = await octokit.paginate(octokit.pulls.listFiles, {
         owner,
         repo,
         pull_number: prNumber,
         per_page: 100
-      }),
+      });
+      return files.map((file) => ({
+        path: file.filename,
+        status: file.status,
+        additions: file.additions,
+        deletions: file.deletions,
+        patch: file.patch ?? null
+      }));
+    },
     ensureRepoCheckout: async ({ headSha }) => {
       const token = await getInstallationToken(installationId);
       return ensureGitRepoCheckout({
@@ -176,6 +185,7 @@ function createClient(params: {
         owner,
         repo,
         pull_number: prNumber,
+        commit_id: headSha,
         body,
         path,
         line,
