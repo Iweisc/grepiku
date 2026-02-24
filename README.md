@@ -6,7 +6,7 @@ Internal GitHub App PR review bot powered by Codex.
 
 - Inline review comments on PR diffs plus a summary
 - Tracks findings across pushes and marks them as new, still open, or fixed
-- Re-runs on new commits and on `/ai-review` comments
+- Re-runs on new commits and on `/review` comments
 - 3-stage pipeline: reviewer, editor, execution verifier
 
 ## Architecture

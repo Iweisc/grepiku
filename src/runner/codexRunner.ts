@@ -102,6 +102,11 @@ function configForStage(stage: CodexStage): string {
   if (stage === "verifier") {
     return (
       base +
+      `\n[mcp_servers.readonly]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/readonly_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n` +
       `\n[mcp_servers.verifier]\n` +
       `command = "node"\n` +
       `args = ["/opt/grepiku-tools/tools/verifier_mcp.js"]\n` +
