@@ -316,7 +316,7 @@ export async function processIndexJob(job: IndexJob) {
       throw new Error("Unable to resolve repo path for indexing");
     }
 
-    const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var"]);
+    const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var", "internal_harness"]);
     const files = await walk(repoPath, ignoreDirs);
     for (const filePath of files) {
       const ext = path.extname(filePath);
