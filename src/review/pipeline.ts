@@ -431,21 +431,54 @@ function computeConfidence(summary: ReviewOutput["summary"], comments: ReviewCom
   return Math.max(0.2, Math.min(0.95, base - penalty));
 }
 
+function sanitizeMermaidLabel(label: string): string {
+  return label
+    .replace(/["<>]/g, "'")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function generateMermaidDiagram(changedFiles: Array<{ filename?: string; path?: string }>, relatedFiles: string[]): string {
-  const nodes = new Set<string>();
-  const edges: string[] = [];
   const changed = changedFiles
     .map((file) => file.filename || file.path)
     .filter((value): value is string => Boolean(value));
-  for (const file of changed) nodes.add(file);
-  for (const rel of relatedFiles) nodes.add(rel);
-  for (const file of changed) {
-    for (const rel of relatedFiles.slice(0, 5)) {
-      if (file !== rel) edges.push(`"${file}" --> "${rel}"`);
+  if (changed.length === 0 || relatedFiles.length === 0) return "";
+
+  const maxChanged = 10;
+  const maxRelated = 12;
+  const maxEdges = 30;
+  const changedSlice = changed.slice(0, maxChanged);
+  const relatedSlice = relatedFiles.slice(0, maxRelated);
+
+  const nodeIds = new Map<string, string>();
+  const allNodes = [...new Set([...changedSlice, ...relatedSlice])];
+  allNodes.forEach((path, idx) => {
+    nodeIds.set(path, `n${idx}`);
+  });
+
+  const nodeLines = allNodes.map((path) => {
+    const id = nodeIds.get(path);
+    const label = sanitizeMermaidLabel(path);
+    return `${id}["${label}"]`;
+  });
+
+  const edges: string[] = [];
+  for (const file of changedSlice) {
+    for (const rel of relatedSlice.slice(0, 5)) {
+      if (file === rel) continue;
+      const fromId = nodeIds.get(file);
+      const toId = nodeIds.get(rel);
+      if (!fromId || !toId) continue;
+      edges.push(`${fromId} --> ${toId}`);
+      if (edges.length >= maxEdges) break;
     }
+    if (edges.length >= maxEdges) break;
   }
-  if (nodes.size === 0) return "";
-  return ["graph TD", ...edges].join("\n");
+
+  if (edges.length === 0) return "";
+  return ["graph TD", ...nodeLines, ...edges].join("\n");
 }
 
 function enrichSummary(params: {
