@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
 import { execa } from "execa";
+import { ZodSchema } from "zod";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
 import { loadRepoConfig, saveRepoConfig } from "./config.js";
@@ -609,6 +610,17 @@ ${body || "(no description)"}
 `;
 }
 
+async function readJsonWithFallback<T>(filePath: string, schema: ZodSchema<T>): Promise<T> {
+  try {
+    return await readAndValidateJson(filePath, schema);
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") throw err;
+    const fallbackPath = path.join(path.dirname(filePath), "last_message.txt");
+    const raw = await fs.readFile(fallbackPath, "utf8");
+    return parseAndValidateJson(raw, schema);
+  }
+}
+
 export async function processReviewJob(data: ReviewJobData) {
   const { provider, installationId, repoId, pullRequestId, prNumber, headSha, trigger, rulesOverride } = data;
   const repo = await prisma.repo.findFirst({ where: { id: repoId } });
@@ -829,7 +841,7 @@ export async function processReviewJob(data: ReviewJobData) {
       prNumber
     });
 
-    const draft = await readAndValidateJson(path.join(outDir, "draft_review.json"), ReviewSchema);
+    const draft = await readJsonWithFallback(path.join(outDir, "draft_review.json"), ReviewSchema);
 
     const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), diffPatch);
     await runCodexStage({
@@ -845,8 +857,8 @@ export async function processReviewJob(data: ReviewJobData) {
       prNumber
     });
 
-    const finalReview = await readAndValidateJson(path.join(outDir, "final_review.json"), ReviewSchema);
-    const verdicts = await readAndValidateJson(path.join(outDir, "verdicts.json"), VerdictsSchema);
+    const finalReview = await readJsonWithFallback(path.join(outDir, "final_review.json"), ReviewSchema);
+    const verdicts = await readJsonWithFallback(path.join(outDir, "verdicts.json"), VerdictsSchema);
 
     finalReview.summary = enrichSummary({
       summary: finalReview.summary,
@@ -933,7 +945,7 @@ export async function processReviewJob(data: ReviewJobData) {
     const checksPath = path.join(outDir, "checks.json");
     let checks: ChecksOutput;
     try {
-      checks = await readAndValidateJson(checksPath, ChecksSchema);
+      checks = await readJsonWithFallback(checksPath, ChecksSchema);
     } catch (err: any) {
       if (err?.code !== "ENOENT") throw err;
       const lastMessagePath = path.join(outDir, "last_message.txt");
