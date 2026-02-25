@@ -101,7 +101,15 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   const contextPack = await buildContextPack({
     repoId: repo.id,
     diffPatch,
-    changedFiles: changedFiles as Array<{ filename?: string; path?: string }>
+    changedFiles: changedFiles as Array<{
+      filename?: string;
+      path?: string;
+      status?: string;
+      additions?: number;
+      deletions?: number;
+    }>,
+    prTitle: refreshed.title || pullRequest.title,
+    prBody: refreshed.body || pullRequest.body
   });
 
   const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}

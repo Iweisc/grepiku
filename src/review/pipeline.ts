@@ -33,6 +33,7 @@ import { enqueueAnalyticsJob, enqueueGraphJob, enqueueIndexJob } from "../queue/
 import { resolveRules } from "./triggers.js";
 import { buildContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
+import { refineReviewComments } from "./quality.js";
 
 const env = loadEnv();
 
@@ -62,6 +63,8 @@ function filterAndNormalizeComments(
 ): { inline: ReviewComment[]; summary: ReviewComment[] } {
   const inline: ReviewComment[] = [];
   const summary: ReviewComment[] = [];
+  const seenInline = new Set<string>();
+  const seenSummary = new Set<string>();
   const negativeCategories = feedbackPolicy ? new Set(feedbackPolicy.negativeCategories) : null;
   for (const comment of review.comments) {
     if (ignoreGlobs.some((pattern) => minimatch(comment.path, pattern))) continue;
@@ -69,7 +72,7 @@ function filterAndNormalizeComments(
     if (evidence.length === 0 || evidence === "\"\"" || evidence === "''") continue;
     const requestedType = comment.comment_type || "inline";
     const type = summaryOnly ? "summary" : requestedType;
-    if (comment.severity === "blocking" && !comment.suggested_patch) continue;
+    if (type !== "summary" && comment.severity === "blocking" && !comment.suggested_patch) continue;
     if (type !== "summary" && !isLineInDiff(diffIndex, comment)) continue;
     const confidence = comment.confidence || "medium";
     if (strictness === "high") {
@@ -84,10 +87,16 @@ function filterAndNormalizeComments(
     }
     if (!allowedTypes.includes(type)) continue;
     if (type === "summary") {
+      const key = `${comment.category}|${comment.title.toLowerCase()}|${comment.body.toLowerCase()}`;
+      if (seenSummary.has(key)) continue;
+      seenSummary.add(key);
       summary.push(comment);
       continue;
     }
     if (!summaryOnly) {
+      const key = `${normalizePath(comment.path)}|${comment.side}|${comment.line}|${comment.title.toLowerCase()}`;
+      if (seenInline.has(key)) continue;
+      seenInline.add(key);
       inline.push(comment);
       if (inline.length >= maxInline) break;
     }
@@ -877,7 +886,15 @@ export async function processReviewJob(data: ReviewJobData) {
     const contextPack = await buildContextPack({
       repoId: repo.id,
       diffPatch,
-      changedFiles: changedFiles as Array<{ filename?: string; path?: string }>
+      changedFiles: changedFiles as Array<{
+        filename?: string;
+        path?: string;
+        status?: string;
+        additions?: number;
+        deletions?: number;
+      }>,
+      prTitle: refreshed.title || pullRequest.title,
+      prBody: refreshed.body || pullRequest.body
     });
 
     const { bundleDir, outDir, codexHomeDir } = await createRunDirs(env.projectRoot, run.id);
@@ -966,13 +983,6 @@ export async function processReviewJob(data: ReviewJobData) {
       "editor"
     );
 
-    finalReview.summary = enrichSummary({
-      summary: finalReview.summary,
-      comments: finalReview.comments,
-      changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
-      relatedFiles: contextPack.relatedFiles
-    });
-
     const diffIndex = buildDiffIndex(diffPatch);
     const verdictMap = new Map(verdicts.verdicts.map((v) => [v.comment_id, v]));
     const commentsAfterVerdict: ReviewComment[] = [];
@@ -989,8 +999,24 @@ export async function processReviewJob(data: ReviewJobData) {
       commentsAfterVerdict.push(comment);
     }
 
+    const qualityRefinement = refineReviewComments({
+      comments: commentsAfterVerdict,
+      diffIndex,
+      changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
+      maxInlineComments: resolvedConfig.limits.max_inline_comments,
+      feedbackPolicy
+    });
+    finalReview.comments = qualityRefinement.comments;
+
+    finalReview.summary = enrichSummary({
+      summary: finalReview.summary,
+      comments: finalReview.comments,
+      changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
+      relatedFiles: contextPack.relatedFiles
+    });
+
     const filteredComments = filterAndNormalizeComments(
-      { ...finalReview, comments: commentsAfterVerdict },
+      finalReview,
       diffIndex,
       resolvedConfig.limits.max_inline_comments,
       resolvedConfig.ignore,
@@ -1204,6 +1230,28 @@ export async function processReviewJob(data: ReviewJobData) {
     }
 
     const fixedFindingLinks = fixed.map((f) => ({ title: f.title }));
+    const qualityWarnings: string[] = [];
+    if (qualityRefinement.diagnostics.deduplicated > 0) {
+      qualityWarnings.push(
+        `Quality gate deduplicated ${qualityRefinement.diagnostics.deduplicated} overlapping comment(s).`
+      );
+    }
+    if (qualityRefinement.diagnostics.convertedToSummary > 0) {
+      qualityWarnings.push(
+        `Quality gate converted ${qualityRefinement.diagnostics.convertedToSummary} off-diff comment(s) to summary.`
+      );
+    }
+    if (qualityRefinement.diagnostics.droppedPerFileCap > 0) {
+      qualityWarnings.push(
+        `Quality gate dropped ${qualityRefinement.diagnostics.droppedPerFileCap} low-priority inline comment(s) due to per-file cap.`
+      );
+    }
+    if (qualityRefinement.diagnostics.downgradedBlocking > 0) {
+      qualityWarnings.push(
+        `Quality gate downgraded ${qualityRefinement.diagnostics.downgradedBlocking} blocking comment(s) missing a concrete patch.`
+      );
+    }
+    const statusWarnings = [...warnings, ...qualityWarnings];
 
     const statusBody = renderStatusComment({
       summary: finalReview.summary,
@@ -1211,7 +1259,7 @@ export async function processReviewJob(data: ReviewJobData) {
       openFindings: openFindingLinks,
       fixedFindings: fixedFindingLinks,
       checks: checks.checks,
-      warnings
+      warnings: statusWarnings
     });
 
     if (resolvedConfig.output.destination === "comment" || resolvedConfig.output.destination === "both") {

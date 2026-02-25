@@ -8,6 +8,8 @@ GitHub PR review bot powered by Codex.
 - Tracks findings across pushes and marks them as new, still open, or fixed
 - Re-runs on new commits and on `/review` comments
 - 3-stage pipeline: reviewer, editor, execution verifier
+- Hybrid context retrieval (embeddings + lexical + changed-path boosts) with graph-aware related files
+- Deterministic quality gate to dedupe overlapping findings and prioritize high-signal comments
 
 ## Architecture
 
