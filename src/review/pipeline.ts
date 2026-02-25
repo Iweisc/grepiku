@@ -217,13 +217,13 @@ function renderStatusComment(params: {
     `**Risk:** ${summary.risk}`,
     summary.confidence !== undefined ? `**Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : "",
     "",
-    "### New",
+    "### New Findings",
     renderList(newFindings),
     "",
-    "### Still Open",
+    "### Open Findings",
     renderList(openFindings),
     "",
-    "### Fixed Since Last Run",
+    "### Fixed Findings",
     renderFixed(),
     "",
     warnings && warnings.length > 0 ? "### Config Warnings\n" + warnings.map((w) => `- ${w}`).join("\n") : "",
@@ -909,7 +909,7 @@ export async function processReviewJob(data: ReviewJobData) {
     const feedbackPolicy = await getFeedbackPolicy(repo.id);
     const incrementalHint =
       incrementalReview && incrementalFrom
-        ? `\n\nThis is an incremental review. Only review changes between ${incrementalFrom} and ${refreshed.headSha}. Do not re-review unchanged code.`
+        ? `\n\nReview only code changes between ${incrementalFrom} and ${refreshed.headSha}. Treat this as a full review of the update and do not mention that this run is incremental.`
         : "";
     const reviewerPrompt =
       buildReviewerPrompt(resolvedConfig) + buildFeedbackHint(feedbackPolicy) + incrementalHint;
@@ -1112,6 +1112,7 @@ export async function processReviewJob(data: ReviewJobData) {
       if (!incrementalReview) return true;
       return changedPathSet.has(normalizePath(f.path));
     });
+    const fixedIds = new Set(fixed.map((f) => f.id));
     for (const finding of fixed) {
       const isObsolete = !diffIndex.files.has(normalizePath(finding.path));
       await prisma.finding.update({
@@ -1175,27 +1176,22 @@ export async function processReviewJob(data: ReviewJobData) {
       }
     }
 
-    const updatedOpen = await prisma.finding.findMany({
-      where: {
-        pullRequestId: pullRequest.id,
-        status: "open"
-      }
-    });
-
     const newFindingLinks = newFindings.map((f) => ({
       title: f.title
     }));
 
-    let openFindingLinks: Array<{ title: string; url?: string }>;
+    const openFindingLinks = stillOpen.map((f) => ({
+      title: f.title
+    }));
     if (incrementalReview) {
-      const newCommentIds = new Set(newFindings.map((f) => f.commentId));
-      openFindingLinks = updatedOpen
-        .filter((f) => !newCommentIds.has(f.commentId))
-        .map((f) => ({ title: f.title }));
-    } else {
-      openFindingLinks = stillOpen.map((f) => ({
-        title: f.title
-      }));
+      const carriedOpenCount = existingOpen.filter(
+        (finding) => !matchedOldIds.has(finding.id) && !fixedIds.has(finding.id)
+      ).length;
+      if (carriedOpenCount > 0) {
+        openFindingLinks.push({
+          title: `${carriedOpenCount} existing finding${carriedOpenCount === 1 ? "" : "s"} remain open from prior review state.`
+        });
+      }
     }
 
     const fixedFindingLinks = fixed.map((f) => ({ title: f.title }));
