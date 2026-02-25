@@ -54,6 +54,13 @@ async function buildLocalDiffPatch(params: {
   return stdout;
 }
 
+function normalizeReplyBody(body: string): string {
+  return body
+    .replace(/\r\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .trim();
+}
+
 export async function processCommentReplyJob(data: CommentReplyJobData) {
   const { provider, installationId, repoId, pullRequestId, prNumber, commentId, commentBody, commentAuthor, commentUrl } =
     data;
@@ -161,5 +168,5 @@ ${refreshed.body || pullRequest.body || "(no description)"}
 
   const reply = await readAndValidateJson(path.join(outDir, "reply.json"), ReplySchema);
 
-  await client.createSummaryComment(reply.body);
+  await client.createSummaryComment(normalizeReplyBody(reply.body));
 }
