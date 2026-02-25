@@ -1018,7 +1018,8 @@ export async function processReviewJob(data: ReviewJobData) {
       resolvedConfig.output.destination === "pr_body" ||
       resolvedConfig.output.destination === "both" ||
       originalBody.trim().length === 0;
-    if (shouldUpdateBody && updatedBody !== originalBody) {
+    const allowBodyUpdate = !incrementalReview;
+    if (shouldUpdateBody && allowBodyUpdate && updatedBody !== originalBody) {
       try {
         await client.updatePullRequestBody(updatedBody);
       } catch (err) {
