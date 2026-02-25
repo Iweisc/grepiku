@@ -158,12 +158,14 @@ function configForStage(stage: CodexStage): string {
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
   await ensureRunnerImage();
   const runnerNetwork = await resolveRunnerNetwork();
-  const configDir = await writeAuthFiles(params.codexHomeDir, params.outDir);
+  const stageHomeDir = path.join(params.codexHomeDir, params.stage);
+  await fs.mkdir(stageHomeDir, { recursive: true });
+  const configDir = await writeAuthFiles(stageHomeDir, params.outDir);
   const configToml = configForStage(params.stage);
-  const configPath = path.join(params.codexHomeDir, "config.toml");
+  const configPath = path.join(stageHomeDir, "config.toml");
   await fs.writeFile(configPath, configToml, "utf8");
 
-  const envFilePath = path.join(params.outDir, "runner.env");
+  const envFilePath = path.join(params.outDir, `runner.${params.stage}.env`);
   const envFile = [
     `OPENAI_BASE_URL=${env.openaiBaseUrl}`,
     `OPENAI_TIMEOUT_MS=${env.openaiTimeoutMs}`,
@@ -194,7 +196,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "-v",
     `${params.outDir}:/work/out`,
     "-v",
-    `${params.codexHomeDir}:/work/codex-home`
+    `${stageHomeDir}:/work/codex-home`
   ];
 
   if (params.repoPath) {
@@ -213,7 +215,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "--model",
     env.openaiModel,
     "--output-last-message",
-    "/work/out/last_message.txt"
+    `/work/out/last_message_${params.stage}.txt`
   );
 
   args.push("-");

@@ -8,7 +8,7 @@ import { loadEnv } from "../config/env.js";
 import { loadRepoConfig, saveRepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
 import { buildReviewerPrompt, buildEditorPrompt, buildVerifierPrompt } from "./prompts.js";
-import { runCodexStage } from "../runner/codexRunner.js";
+import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
 import { parseAndValidateJson, readAndValidateJson } from "./json.js";
 import {
   ReviewSchema,
@@ -130,23 +130,30 @@ function formatInlineComment(comment: ReviewComment): string {
         line.startsWith("-")
     );
     if (hasDiffMarkers) {
-      const added = lines
-        .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
-        .map((line) => line.slice(1));
-      if (added.length > 0) {
-        normalized = added.join("\n");
-      } else {
-        const kept = lines.filter(
-          (line) =>
-            !line.startsWith("-") &&
-            !line.startsWith("@@") &&
-            !line.startsWith("diff") &&
-            !line.startsWith("+++ ") &&
-            !line.startsWith("--- ")
-        );
-        if (kept.length > 0) {
-          normalized = kept.join("\n");
+      const kept: string[] = [];
+      for (const line of lines) {
+        if (
+          line.startsWith("diff") ||
+          line.startsWith("@@") ||
+          line.startsWith("+++ ") ||
+          line.startsWith("--- ")
+        ) {
+          continue;
         }
+        if (line.startsWith("+") && !line.startsWith("+++")) {
+          kept.push(line.slice(1));
+          continue;
+        }
+        if (line.startsWith(" ")) {
+          kept.push(line.slice(1));
+          continue;
+        }
+        if (!line.startsWith("-")) {
+          kept.push(line);
+        }
+      }
+      if (kept.length > 0) {
+        normalized = kept.join("\n");
       }
     }
     return normalized.trimEnd();
@@ -610,12 +617,16 @@ ${body || "(no description)"}
 `;
 }
 
-async function readJsonWithFallback<T>(filePath: string, schema: ZodSchema<T>): Promise<T> {
+async function readJsonWithFallback<T>(
+  filePath: string,
+  schema: ZodSchema<T>,
+  stage: CodexStage
+): Promise<T> {
   try {
     return await readAndValidateJson(filePath, schema);
   } catch (err: any) {
     if (err?.code !== "ENOENT") throw err;
-    const fallbackPath = path.join(path.dirname(filePath), "last_message.txt");
+    const fallbackPath = path.join(path.dirname(filePath), `last_message_${stage}.txt`);
     const raw = await fs.readFile(fallbackPath, "utf8");
     return parseAndValidateJson(raw, schema);
   }
@@ -826,6 +837,20 @@ export async function processReviewJob(data: ReviewJobData) {
       warnings
     });
 
+    const checksPrompt = buildVerifierPrompt(refreshed.headSha);
+    const verifierPromise = runCodexStage({
+      stage: "verifier",
+      repoPath,
+      bundleDir,
+      outDir,
+      codexHomeDir,
+      prompt: checksPrompt,
+      headSha: refreshed.headSha,
+      repoId: repo.id,
+      reviewRunId: run.id,
+      prNumber
+    });
+
     const feedbackPolicy = await getFeedbackPolicy(repo.id);
     const reviewerPrompt = buildReviewerPrompt(resolvedConfig) + buildFeedbackHint(feedbackPolicy);
     await runCodexStage({
@@ -841,7 +866,11 @@ export async function processReviewJob(data: ReviewJobData) {
       prNumber
     });
 
-    const draft = await readJsonWithFallback(path.join(outDir, "draft_review.json"), ReviewSchema);
+    const draft = await readJsonWithFallback(
+      path.join(outDir, "draft_review.json"),
+      ReviewSchema,
+      "reviewer"
+    );
 
     const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), diffPatch);
     await runCodexStage({
@@ -857,8 +886,16 @@ export async function processReviewJob(data: ReviewJobData) {
       prNumber
     });
 
-    const finalReview = await readJsonWithFallback(path.join(outDir, "final_review.json"), ReviewSchema);
-    const verdicts = await readJsonWithFallback(path.join(outDir, "verdicts.json"), VerdictsSchema);
+    const finalReview = await readJsonWithFallback(
+      path.join(outDir, "final_review.json"),
+      ReviewSchema,
+      "editor"
+    );
+    const verdicts = await readJsonWithFallback(
+      path.join(outDir, "verdicts.json"),
+      VerdictsSchema,
+      "editor"
+    );
 
     finalReview.summary = enrichSummary({
       summary: finalReview.summary,
@@ -929,30 +966,9 @@ export async function processReviewJob(data: ReviewJobData) {
       }
     }
 
-    const checksPrompt = buildVerifierPrompt(refreshed.headSha);
-    await runCodexStage({
-      stage: "verifier",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: checksPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
-    });
+    await verifierPromise;
     const checksPath = path.join(outDir, "checks.json");
-    let checks: ChecksOutput;
-    try {
-      checks = await readJsonWithFallback(checksPath, ChecksSchema);
-    } catch (err: any) {
-      if (err?.code !== "ENOENT") throw err;
-      const lastMessagePath = path.join(outDir, "last_message.txt");
-      const lastMessage = await fs.readFile(lastMessagePath, "utf8").catch(() => "");
-      if (!lastMessage.trim()) throw err;
-      checks = parseAndValidateJson(lastMessage, ChecksSchema);
-    }
+    const checks: ChecksOutput = await readJsonWithFallback(checksPath, ChecksSchema, "verifier");
 
     const existingOpen = await prisma.finding.findMany({
       where: { pullRequestId: pullRequest.id, status: "open" }
