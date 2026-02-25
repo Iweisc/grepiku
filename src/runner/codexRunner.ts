@@ -237,6 +237,9 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     input: fullPrompt,
     stdio: ["pipe", "ignore", "inherit"],
     cwd: params.outDir,
-    env: stageEnv
+    env: stageEnv,
+    timeout: env.codexStageTimeoutMs,
+    killSignal: "SIGTERM",
+    forceKillAfterDelay: 10_000
   });
 }
