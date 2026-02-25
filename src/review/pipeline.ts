@@ -892,7 +892,13 @@ export async function processReviewJob(data: ReviewJobData) {
       warnings
     });
 
-    const checksPrompt = buildVerifierPrompt(refreshed.headSha);
+    const promptPaths = {
+      repoPath,
+      bundleDir,
+      outDir
+    };
+
+    const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
     const verifierPromise = runCodexStage({
       stage: "verifier",
       repoPath,
@@ -903,7 +909,8 @@ export async function processReviewJob(data: ReviewJobData) {
       headSha: refreshed.headSha,
       repoId: repo.id,
       reviewRunId: run.id,
-      prNumber
+      prNumber,
+      captureLastMessage: false
     });
 
     const feedbackPolicy = await getFeedbackPolicy(repo.id);
@@ -912,7 +919,9 @@ export async function processReviewJob(data: ReviewJobData) {
         ? `\n\nReview only code changes between ${incrementalFrom} and ${refreshed.headSha}. Treat this as a full review of the update and do not mention that this run is incremental.`
         : "";
     const reviewerPrompt =
-      buildReviewerPrompt(resolvedConfig) + buildFeedbackHint(feedbackPolicy) + incrementalHint;
+      buildReviewerPrompt(resolvedConfig, promptPaths) +
+      buildFeedbackHint(feedbackPolicy) +
+      incrementalHint;
     await runCodexStage({
       stage: "reviewer",
       repoPath,
@@ -932,7 +941,7 @@ export async function processReviewJob(data: ReviewJobData) {
       "reviewer"
     );
 
-    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), diffPatch);
+    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths);
     await runCodexStage({
       stage: "editor",
       repoPath,
@@ -1029,7 +1038,7 @@ export async function processReviewJob(data: ReviewJobData) {
 
     await verifierPromise;
     const checksPath = path.join(outDir, "checks.json");
-    const checks: ChecksOutput = await readJsonWithFallback(checksPath, ChecksSchema, "verifier");
+    const checks: ChecksOutput = await readAndValidateJson(checksPath, ChecksSchema);
 
     const existingOpen = await prisma.finding.findMany({
       where: { pullRequestId: pullRequest.id, status: "open" }

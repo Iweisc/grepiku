@@ -1,18 +1,32 @@
 import { RepoConfig } from "./config.js";
 
-export function buildReviewerPrompt(config: RepoConfig): string {
+export type PromptPaths = {
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+};
+
+function bundlePath(paths: PromptPaths, file: string): string {
+  return `${paths.bundleDir}/${file}`;
+}
+
+function outPath(paths: PromptPaths, file: string): string {
+  return `${paths.outDir}/${file}`;
+}
+
+export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths): string {
   return `You are a pull request reviewer. You must produce a structured review.
 
 Context files:
-- /work/bundle/pr.md
-- /work/bundle/diff.patch
-- /work/bundle/changed_files.json
-- /work/bundle/bot_config.json
-- /work/bundle/rules.json
-- /work/bundle/scopes.json
-- /work/bundle/context_pack.json
-- /work/bundle/config_warnings.json
-- Repo checkout: /work/repo (read-only)
+- ${bundlePath(paths, "pr.md")}
+- ${bundlePath(paths, "diff.patch")}
+- ${bundlePath(paths, "changed_files.json")}
+- ${bundlePath(paths, "bot_config.json")}
+- ${bundlePath(paths, "rules.json")}
+- ${bundlePath(paths, "scopes.json")}
+- ${bundlePath(paths, "context_pack.json")}
+- ${bundlePath(paths, "config_warnings.json")}
+- Repo checkout: ${paths.repoPath} (read-only)
 
 Rules:
 - Only comment on lines that exist in diff.patch.
@@ -29,7 +43,7 @@ Rules:
 - Respect commentTypes/output/strictness from bot_config.json (summary-only means no inline comments).
 
 Output requirements:
-- Write JSON to /work/out/draft_review.json with this schema:
+- Write JSON to ${outPath(paths, "draft_review.json")} with this schema:
 {
   "summary": {
     "overview": "string",
@@ -66,16 +80,16 @@ Output requirements:
 Do not print anything else to stdout. Ensure the JSON is valid.`;
 }
 
-export function buildEditorPrompt(draftReviewJson: string, diffPatch: string): string {
+export function buildEditorPrompt(draftReviewJson: string, paths: PromptPaths): string {
   return `You are the editor pass. Your job is to reduce false positives and enforce all constraints.
 
 Inputs:
 - Draft review JSON (inline):
 ${draftReviewJson}
-- Diff patch file: /work/bundle/diff.patch
-- Changed files list: /work/bundle/changed_files.json
-- Rules: /work/bundle/rules.json
-- Context pack: /work/bundle/context_pack.json
+- Diff patch file: ${bundlePath(paths, "diff.patch")}
+- Changed files list: ${bundlePath(paths, "changed_files.json")}
+- Rules: ${bundlePath(paths, "rules.json")}
+- Context pack: ${bundlePath(paths, "context_pack.json")}
 
 Rules to enforce:
 - Only comment on diff lines.
@@ -88,8 +102,8 @@ Rules to enforce:
 - Preserve rule_id and rule_reason when applicable.
 
 Outputs:
-1) /work/out/final_review.json (same schema as draft)
-2) /work/out/verdicts.json with per-comment decisions:
+1) ${outPath(paths, "final_review.json")} (same schema as draft)
+2) ${outPath(paths, "verdicts.json")} with per-comment decisions:
 {
   "verdicts": [
     {
@@ -105,20 +119,20 @@ Outputs:
 Do not print anything else. Ensure valid JSON files.`;
 }
 
-export function buildVerifierPrompt(headSha: string): string {
+export function buildVerifierPrompt(headSha: string, paths: PromptPaths): string {
   return `You are the execution verifier. You can call these tools: read_file, search, lint, build, test.
-read_file/search let you inspect repo and bundle outputs; lint/build/test run commands configured in /work/repo/grepiku.json (or legacy greptile.json / .prreviewer.yml).
+read_file/search let you inspect repo and bundle outputs; lint/build/test run commands configured in ${paths.repoPath}/grepiku.json (or legacy greptile.json / .prreviewer.yml).
 Each lint/build/test tool may be called at most once; repeated calls return cached results.
 
 Context files:
-- /work/out/inline_findings.json (current inline review comments to verify)
-- /work/bundle/diff.patch
-- /work/bundle/changed_files.json
-- Repo checkout: /work/repo (read-only)
+- ${outPath(paths, "inline_findings.json")} (current inline review comments to verify)
+- ${bundlePath(paths, "diff.patch")}
+- ${bundlePath(paths, "changed_files.json")}
+- Repo checkout: ${paths.repoPath} (read-only)
 
 Use the inline findings to decide which tools are relevant. If no tool is applicable, mark it "skipped".
 
-After running the needed tools, write /work/out/checks.json with this schema:
+After running the needed tools, write ${outPath(paths, "checks.json")} with this schema:
 {
   "head_sha": "${headSha}",
   "checks": {
@@ -135,16 +149,19 @@ export function buildMentionPrompt(params: {
   commentBody: string;
   commentAuthor: string;
   commentUrl?: string;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
 }): string {
-  const { commentBody, commentAuthor, commentUrl } = params;
+  const { commentBody, commentAuthor, commentUrl, repoPath, bundleDir, outDir } = params;
   return `You are Grepiku, a PR review assistant.
 
 A user mentioned you in a PR comment. Respond concisely and directly to their question.
 Use only information from:
-- /work/bundle/pr.md
-- /work/bundle/diff.patch
-- /work/bundle/changed_files.json
-- /work/repo (read-only)
+- ${bundleDir}/pr.md
+- ${bundleDir}/diff.patch
+- ${bundleDir}/changed_files.json
+- ${repoPath} (read-only)
 
 If the question is about merge readiness, cite the latest risk from the Grepiku Summary in the PR description.
 If you are unsure, say what you'd need and avoid guessing.
@@ -155,7 +172,7 @@ Comment body:
 ${commentBody}
 
 Output requirements:
-- Write JSON to /work/out/reply.json with this schema:
+- Write JSON to ${outDir}/reply.json with this schema:
 {
   "body": "string"
 }

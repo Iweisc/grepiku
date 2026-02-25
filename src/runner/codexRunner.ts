@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { fileURLToPath } from "url";
 import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
 
@@ -16,10 +17,27 @@ export type CodexRunParams = {
   repoId: number;
   reviewRunId: number;
   prNumber: number;
+  captureLastMessage?: boolean;
 };
 
 const env = loadEnv();
 let resolvedCodexExecPath: string | null = null;
+const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const STAGE_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "USER",
+  "LOGNAME",
+  "TERM",
+  "TZ"
+] as const;
 
 function systemPrompt(stage: CodexStage, roots: string[]): string {
   const toolNote =
@@ -69,21 +87,38 @@ function tomlString(value: string): string {
 }
 
 function mcpScriptPath(scriptName: string): string {
-  return path.join(env.projectRoot, "docker", "codex-runner", "tools", scriptName);
+  return path.join(runtimeRoot, "docker", "codex-runner", "tools", scriptName);
 }
 
-function mcpServerBlock(name: string, scriptName: string): string {
-  return [
+function tomlInlineTable(values: Record<string, string | undefined>): string | null {
+  const entries = Object.entries(values).filter(
+    (entry): entry is [string, string] => Boolean(entry[1] && entry[1].trim().length > 0)
+  );
+  if (entries.length === 0) return null;
+  return `{ ${entries.map(([key, value]) => `${key} = ${tomlString(value)}`).join(", ")} }`;
+}
+
+function mcpServerBlock(
+  name: string,
+  scriptName: string,
+  serverEnv: Record<string, string | undefined>
+): string {
+  const envInline = tomlInlineTable(serverEnv);
+  const lines = [
     `[mcp_servers.${name}]`,
     `command = ${tomlString("node")}`,
     `args = [${tomlString(mcpScriptPath(scriptName))}]`,
     "startup_timeout_sec = 10",
-    "tool_timeout_sec = 10",
-    ""
-  ].join("\n");
+    "tool_timeout_sec = 10"
+  ];
+  if (envInline) {
+    lines.push(`env = ${envInline}`);
+  }
+  lines.push("");
+  return lines.join("\n");
 }
 
-function configForStage(stage: CodexStage): string {
+function configForStage(stage: CodexStage, params: CodexRunParams): string {
   const base = [
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
@@ -97,16 +132,57 @@ function configForStage(stage: CodexStage): string {
     "web_search_cached = false",
     ""
   ].join("\n");
+  const readonlyEnv = {
+    WORK_REPO_ROOT: params.repoPath,
+    WORK_BUNDLE_ROOT: params.bundleDir,
+    WORK_OUT_ROOT: params.outDir
+  };
   if (stage === "reviewer") {
-    return `${base}\n${mcpServerBlock("readonly", "readonly_mcp.js")}${mcpServerBlock("retrieval", "retrieval_mcp.js")}`;
+    return (
+      `${base}\n` +
+      mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
+      mcpServerBlock("retrieval", "retrieval_mcp.js", {
+        INTERNAL_API_URL: env.internalApiUrl,
+        INTERNAL_API_KEY: env.internalApiKey,
+        REVIEW_REPO_ID: String(params.repoId)
+      })
+    );
   }
   if (stage === "editor") {
-    return `${base}\n${mcpServerBlock("readonly", "readonly_mcp.js")}${mcpServerBlock("retrieval", "retrieval_mcp.js")}`;
+    return (
+      `${base}\n` +
+      mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
+      mcpServerBlock("retrieval", "retrieval_mcp.js", {
+        INTERNAL_API_URL: env.internalApiUrl,
+        INTERNAL_API_KEY: env.internalApiKey,
+        REVIEW_REPO_ID: String(params.repoId)
+      })
+    );
   }
   if (stage === "verifier") {
-    return `${base}\n${mcpServerBlock("readonly", "readonly_mcp.js")}${mcpServerBlock("verifier", "verifier_mcp.js")}`;
+    return (
+      `${base}\n` +
+      mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
+      mcpServerBlock("verifier", "verifier_mcp.js", {
+        WORK_REPO_ROOT: params.repoPath,
+        WORK_OUT_ROOT: params.outDir,
+        DATABASE_URL: env.databaseUrl,
+        REVIEW_RUN_ID: String(params.reviewRunId)
+      })
+    );
   }
   return base;
+}
+
+function baseStageEnv(): NodeJS.ProcessEnv {
+  const output: NodeJS.ProcessEnv = {};
+  for (const key of STAGE_ENV_ALLOWLIST) {
+    const value = process.env[key];
+    if (value && value.trim().length > 0) {
+      output[key] = value;
+    }
+  }
+  return output;
 }
 
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
@@ -114,7 +190,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
   await writeAuthFile(stageHomeDir);
-  const configToml = configForStage(params.stage);
+  const configToml = configForStage(params.stage, params);
   const configPath = path.join(stageHomeDir, "config.toml");
   await fs.writeFile(configPath, configToml, "utf8");
   const codexArgs = [
@@ -123,14 +199,15 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "workspace-write",
     "--skip-git-repo-check",
     "--model",
-    env.openaiModel,
-    "--output-last-message",
-    path.join(params.outDir, `last_message_${params.stage}.txt`),
-    "-"
+    env.openaiModel
   ];
+  if (params.captureLastMessage !== false) {
+    codexArgs.push("--output-last-message", path.join(params.outDir, `last_message_${params.stage}.txt`));
+  }
+  codexArgs.push("-");
 
   const stageEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...baseStageEnv(),
     OPENAI_BASE_URL: env.openaiBaseUrl,
     OPENAI_TIMEOUT_MS: String(env.openaiTimeoutMs),
     OPENAI_MAX_RETRIES: String(env.openaiMaxRetries),
@@ -158,7 +235,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
 
   await execa(codexExecPath, codexArgs, {
     input: fullPrompt,
-    stdio: "inherit",
+    stdio: ["pipe", "ignore", "inherit"],
     cwd: env.projectRoot,
     env: stageEnv
   });
