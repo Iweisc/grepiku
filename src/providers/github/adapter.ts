@@ -115,6 +115,18 @@ function createClient(params: {
       });
       return mapPullRequest({ pull_request: response.data });
     },
+    fetchCommit: async (sha: string) => {
+      const response = await octokit.repos.getCommit({
+        owner,
+        repo,
+        ref: sha
+      });
+      return {
+        sha: response.data.sha,
+        message: response.data.commit?.message || "",
+        authorLogin: response.data.author?.login || response.data.commit?.author?.name || null
+      };
+    },
     fetchDiffPatch: async () => {
       const response = await octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
         owner,

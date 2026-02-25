@@ -62,6 +62,12 @@ export type ProviderStatusCheck = {
   text?: string | null;
 };
 
+export type ProviderCommit = {
+  sha: string;
+  message: string;
+  authorLogin?: string | null;
+};
+
 export type ProviderWebhookEvent =
   | {
       provider: ProviderKind;
@@ -97,6 +103,7 @@ export type ProviderClient = {
   repo: ProviderRepo;
   pullRequest: ProviderPullRequest;
   fetchPullRequest: () => Promise<ProviderPullRequest>;
+  fetchCommit: (sha: string) => Promise<ProviderCommit>;
   fetchDiffPatch: () => Promise<string>;
   listChangedFiles: () => Promise<ProviderFileChange[]>;
   ensureRepoCheckout: (params: { headSha: string }) => Promise<string>;

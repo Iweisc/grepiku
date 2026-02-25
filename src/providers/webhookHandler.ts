@@ -6,6 +6,39 @@ import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "..
 import { getProviderAdapter } from "./registry.js";
 import { resolveGithubBotLogin } from "./github/adapter.js";
 
+function isSuggestionCommitMessage(message: string): boolean {
+  const normalized = message.toLowerCase().trim();
+  if (!normalized) return false;
+  return (
+    normalized.startsWith("apply suggestion") ||
+    normalized.startsWith("apply suggestions") ||
+    normalized.includes("apply suggestions from code review") ||
+    normalized.includes("suggestions from code review")
+  );
+}
+
+async function isSuggestionCommit(params: {
+  provider: string;
+  installationId: string | null;
+  repo: ProviderWebhookEvent["repo"];
+  pullRequest: ProviderWebhookEvent["pullRequest"];
+  headSha: string | null | undefined;
+}): Promise<boolean> {
+  if (!params.installationId || !params.headSha) return false;
+  try {
+    const adapter = getProviderAdapter("github");
+    const client = await adapter.createClient({
+      installationId: params.installationId,
+      repo: params.repo,
+      pullRequest: params.pullRequest
+    });
+    const commit = await client.fetchCommit(params.headSha);
+    return isSuggestionCommitMessage(commit.message || "");
+  } catch {
+    return false;
+  }
+}
+
 export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<void> {
   const provider = await ensureProvider({
     kind: event.provider,
@@ -82,6 +115,16 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       pullRequest: event.pullRequest
     });
     if (!shouldTrigger) return;
+    if (event.action === "synchronize") {
+      const skipSuggestion = await isSuggestionCommit({
+        provider: event.provider,
+        installationId: installation.externalId,
+        repo: event.repo,
+        pullRequest: event.pullRequest,
+        headSha: event.pullRequest.headSha
+      });
+      if (skipSuggestion) return;
+    }
 
     await enqueueReviewJob({
       provider: event.provider,
