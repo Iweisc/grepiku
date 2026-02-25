@@ -598,6 +598,31 @@ async function buildLocalDiffPatch(params: {
   return stdout;
 }
 
+async function buildLocalChangedFiles(params: {
+  repoPath: string;
+  baseSha: string;
+  headSha: string;
+}): Promise<Array<{ path: string; status?: string }>> {
+  const { repoPath, baseSha, headSha } = params;
+  const { stdout } = await execa(
+    "git",
+    ["-C", repoPath, "diff", "--name-status", `${baseSha}...${headSha}`],
+    { maxBuffer: 1024 * 1024 * 200 }
+  );
+  if (!stdout.trim()) return [];
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split("\t");
+      const status = parts[0] || "";
+      const path = parts[parts.length - 1] || "";
+      return { path, status };
+    })
+    .filter((item) => item.path);
+}
+
 function renderPrMarkdown(params: {
   title: string;
   number: number;
@@ -741,6 +766,17 @@ export async function processReviewJob(data: ReviewJobData) {
   try {
     const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
 
+    const previousRun = await prisma.reviewRun.findFirst({
+      where: {
+        pullRequestId: pullRequest.id,
+        status: "completed",
+        headSha: { not: refreshed.headSha }
+      },
+      orderBy: { createdAt: "desc" }
+    });
+    const incrementalFrom = previousRun?.headSha || null;
+    const incrementalReview = Boolean(incrementalFrom) && !data.force && trigger !== "manual";
+
     const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
     await saveRepoConfig(repo.id, repoConfig, warnings);
     const resolvedConfig = resolveRules(repoConfig, {
@@ -802,16 +838,30 @@ export async function processReviewJob(data: ReviewJobData) {
     }
 
     let diffPatch: string;
-    try {
-      diffPatch = await client.fetchDiffPatch();
-    } catch {
+    let changedFiles: Array<{ path?: string; status?: string; additions?: number; deletions?: number; patch?: string | null }>;
+    if (incrementalReview && incrementalFrom) {
       diffPatch = await buildLocalDiffPatch({
         repoPath,
-        baseSha: refreshed.baseSha,
+        baseSha: incrementalFrom,
         headSha: refreshed.headSha
       });
+      changedFiles = await buildLocalChangedFiles({
+        repoPath,
+        baseSha: incrementalFrom,
+        headSha: refreshed.headSha
+      });
+    } else {
+      try {
+        diffPatch = await client.fetchDiffPatch();
+      } catch {
+        diffPatch = await buildLocalDiffPatch({
+          repoPath,
+          baseSha: refreshed.baseSha,
+          headSha: refreshed.headSha
+        });
+      }
+      changedFiles = await client.listChangedFiles();
     }
-    const changedFiles = await client.listChangedFiles();
 
     const prMarkdown = renderPrMarkdown({
       title: refreshed.title || pullRequest.title || "Untitled",
@@ -857,7 +907,12 @@ export async function processReviewJob(data: ReviewJobData) {
     });
 
     const feedbackPolicy = await getFeedbackPolicy(repo.id);
-    const reviewerPrompt = buildReviewerPrompt(resolvedConfig) + buildFeedbackHint(feedbackPolicy);
+    const incrementalHint =
+      incrementalReview && incrementalFrom
+        ? `\n\nThis is an incremental review. Only review changes between ${incrementalFrom} and ${refreshed.headSha}. Do not re-review unchanged code.`
+        : "";
+    const reviewerPrompt =
+      buildReviewerPrompt(resolvedConfig) + buildFeedbackHint(feedbackPolicy) + incrementalHint;
     await runCodexStage({
       stage: "reviewer",
       repoPath,
@@ -1045,7 +1100,17 @@ export async function processReviewJob(data: ReviewJobData) {
       newFindingIds.set(comment.comment_id, createdFinding.id);
     }
 
-    const fixed = existingOpen.filter((f) => !matchedOldIds.has(f.id));
+    const changedPathSet = new Set(
+      changedFiles
+        .map((file) => file.path || (file as { filename?: string }).filename || "")
+        .filter(Boolean)
+        .map((filePath) => normalizePath(filePath))
+    );
+    const fixed = existingOpen.filter((f) => {
+      if (matchedOldIds.has(f.id)) return false;
+      if (!incrementalReview) return true;
+      return changedPathSet.has(normalizePath(f.path));
+    });
     for (const finding of fixed) {
       const isObsolete = !diffIndex.files.has(normalizePath(finding.path));
       await prisma.finding.update({
@@ -1120,9 +1185,17 @@ export async function processReviewJob(data: ReviewJobData) {
       title: f.title
     }));
 
-    const openFindingLinks = stillOpen.map((f) => ({
-      title: f.title
-    }));
+    let openFindingLinks: Array<{ title: string; url?: string }>;
+    if (incrementalReview) {
+      const newCommentIds = new Set(newFindings.map((f) => f.commentId));
+      openFindingLinks = updatedOpen
+        .filter((f) => !newCommentIds.has(f.commentId))
+        .map((f) => ({ title: f.title }));
+    } else {
+      openFindingLinks = stillOpen.map((f) => ({
+        title: f.title
+      }));
+    }
 
     const fixedFindingLinks = fixed.map((f) => ({ title: f.title }));
 
