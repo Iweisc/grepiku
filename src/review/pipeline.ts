@@ -283,6 +283,12 @@ function buildFixPrompt(comments: ReviewComment[]): string {
     ].join("\n");
   }
 
+  const normalizeMultiline = (value: string) =>
+    value
+      .replace(/\r\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .trimEnd();
+
   const normalizeSuggestedPatch = (patch: string) => {
     let normalized = patch.replace(/\\n/g, "\n");
     normalized = normalized
@@ -334,11 +340,26 @@ function buildFixPrompt(comments: ReviewComment[]): string {
       `${idx + 1}. [${comment.severity}] ${comment.path}:${comment.line} (${comment.side}) - ${comment.title}`
     );
     lines.push(`Category: ${comment.category}`);
-    lines.push(`Evidence: ${comment.evidence}`);
-    lines.push(`Details: ${comment.body}`);
+    lines.push("Evidence:");
+    const evidence = normalizeMultiline(comment.evidence);
+    if (evidence) {
+      lines.push(...evidence.split("\n"));
+    } else {
+      lines.push("(none)");
+    }
+    const details = normalizeMultiline(comment.body);
+    if (details.includes("\n")) {
+      lines.push("Details:");
+      lines.push(...details.split("\n"));
+    } else {
+      lines.push(`Details: ${details}`);
+    }
     if (comment.suggested_patch) {
       lines.push("Suggested patch:");
-      lines.push(normalizeSuggestedPatch(comment.suggested_patch));
+      const patch = normalizeMultiline(normalizeSuggestedPatch(comment.suggested_patch));
+      if (patch) {
+        lines.push(...patch.split("\n"));
+      }
     }
     lines.push("");
   });
@@ -404,17 +425,22 @@ function buildSummaryBlock(
     "</details>"
   ].join("\n");
 
+  const summaryLines = [
+    summary.overview,
+    `Risk: ${summary.risk}`,
+    summary.confidence !== undefined ? `Confidence: ${(summary.confidence * 100).toFixed(0)}%` : null,
+    notableLine
+  ]
+    .filter((line): line is string => Boolean(line))
+    .map((line) => `${line}  `);
+
   return [
     start,
     "## Grepiku Summary",
     "",
     fixBlock,
     "",
-    summary.overview,
-    "",
-    `Risk: ${summary.risk}`,
-    summary.confidence !== undefined ? `Confidence: ${(summary.confidence * 100).toFixed(0)}%` : "",
-    notableLine,
+    ...summaryLines,
     "",
     "File breakdown:",
     fileBreakdown,

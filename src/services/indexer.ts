@@ -182,7 +182,9 @@ async function indexFile(params: {
       symbols = extracted.symbols;
       references = extracted.references;
     } catch (err) {
-      console.warn(`Indexer parse failed for ${params.relativePath}`, err);
+      if (env.logLevel === "debug") {
+        console.warn(`Indexer parse failed for ${params.relativePath}`, err);
+      }
     }
   }
 
