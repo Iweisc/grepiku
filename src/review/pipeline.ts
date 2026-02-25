@@ -423,12 +423,17 @@ function buildSummaryBlock(
           "There are no review findings to fix.",
           "If you made changes, ensure tests and lint still pass."
         ].join("\n");
+  const escapeHtml = (value: string) =>
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
   const fixBlock = [
     "<details>",
     "<summary>Fix with AI</summary>",
     "",
     "<pre><code>",
-    fixPrompt,
+    escapeHtml(fixPrompt),
     "</code></pre>",
     "</details>"
   ].join("\n");
