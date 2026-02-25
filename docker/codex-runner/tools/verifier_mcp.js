@@ -5,8 +5,8 @@ import path from "path";
 import yaml from "js-yaml";
 import pg from "pg";
 
-const repoRoot = "/work/repo";
-const outRoot = "/work/out";
+const repoRoot = path.resolve(process.env.WORK_REPO_ROOT || "/work/repo");
+const outRoot = path.resolve(process.env.WORK_OUT_ROOT || "/work/out");
 const repoRw = path.join(outRoot, "repo_rw");
 
 const tools = [
