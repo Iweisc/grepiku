@@ -19,7 +19,6 @@ export async function ensureGitRepoCheckout(params: {
   const { owner, repo, headSha, token } = params;
   const baseDir = path.join(env.projectRoot, "var", "repos", owner, repo);
   const worktreesDir = path.join(env.projectRoot, "var", "repos", owner, `${repo}-worktrees`);
-  const worktreePath = path.join(worktreesDir, headSha);
 
   await fs.mkdir(path.dirname(baseDir), { recursive: true });
   await fs.mkdir(worktreesDir, { recursive: true });
@@ -40,20 +39,23 @@ export async function ensureGitRepoCheckout(params: {
     await execa("git", ["-C", baseDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
   }
 
-  const worktreeExists = await fs
-    .stat(worktreePath)
-    .then(() => true)
-    .catch(() => false);
-
-  if (worktreeExists) {
-    await execa("git", ["-C", baseDir, "worktree", "remove", "-f", "-f", worktreePath], {
-      stdio: "inherit"
-    });
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const suffix = `${Date.now()}-${process.pid}-${attempt}`;
+    const worktreePath = path.join(worktreesDir, `${headSha}-${suffix}`);
+    try {
+      await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, headSha], {
+        stdio: "inherit"
+      });
+      return worktreePath;
+    } catch (err: any) {
+      lastError = err;
+      const stderr = String(err?.stderr || err?.shortMessage || err?.message || "");
+      if (!stderr.includes("already exists")) {
+        throw err;
+      }
+    }
   }
 
-  await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, headSha], {
-    stdio: "inherit"
-  });
-
-  return worktreePath;
+  throw lastError instanceof Error ? lastError : new Error("Failed to create git worktree");
 }
