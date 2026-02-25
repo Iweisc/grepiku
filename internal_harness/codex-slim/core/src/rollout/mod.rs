@@ -26,6 +26,3 @@ pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_path_by_name_str;
-
-#[cfg(test)]
-pub mod tests;

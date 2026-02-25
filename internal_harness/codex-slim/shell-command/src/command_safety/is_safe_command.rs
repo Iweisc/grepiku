@@ -3,7 +3,11 @@ use crate::bash::parse_shell_lc_plain_commands;
 // may appear before it (e.g., `-C`, `-c`, `--git-dir`).
 // Implemented in `is_dangerous_command` and shared here.
 use crate::command_safety::is_dangerous_command::find_git_subcommand;
-use crate::command_safety::windows_safe_commands::is_safe_command_windows;
+
+#[inline]
+fn is_safe_command_windows(_command: &[String]) -> bool {
+    false
+}
 
 pub fn is_known_safe_command(command: &[String]) -> bool {
     let command: Vec<String> = command

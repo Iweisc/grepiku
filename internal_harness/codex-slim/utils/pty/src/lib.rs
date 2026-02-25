@@ -2,10 +2,6 @@ pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
-#[cfg(test)]
-mod tests;
-#[cfg(windows)]
-mod win;
 
 /// Spawn a non-interactive process using regular pipes for stdin/stdout/stderr.
 pub use pipe::spawn_process as spawn_pipe_process;

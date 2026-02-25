@@ -80,10 +80,10 @@ pub use model_provider_info::create_oss_provider_with_base_url;
 mod event_mapping;
 pub mod review_format;
 pub mod review_prompts;
+#[cfg(target_os = "macos")]
 mod seatbelt_permissions;
 mod thread_manager;
 pub mod web_search;
-pub mod windows_sandbox_read_grants;
 pub use thread_manager::NewThread;
 pub use thread_manager::ThreadManager;
 #[deprecated(note = "use ThreadManager")]
@@ -99,6 +99,7 @@ pub mod default_client;
 pub mod project_doc;
 mod rollout;
 pub(crate) mod safety;
+#[cfg(target_os = "macos")]
 pub mod seatbelt;
 pub mod shell;
 pub mod shell_snapshot;

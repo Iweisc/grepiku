@@ -4,9 +4,7 @@ members = [
     "apply-patch",
     "arg0",
     "async-utils",
-    "backend-client",
     "codex-api",
-    "codex-backend-openapi-models",
     "codex-client",
     "codex-experimental-api-macros",
     "config",
@@ -37,7 +35,6 @@ members = [
     "utils/rustls-provider",
     "utils/sandbox-summary",
     "utils/string",
-    "windows-sandbox-rs",
 ]
 resolver = "2"
 
@@ -61,7 +58,6 @@ codex-app-server-test-client = { path = "app-server-test-client" }
 codex-apply-patch = { path = "apply-patch" }
 codex-arg0 = { path = "arg0" }
 codex-async-utils = { path = "async-utils" }
-codex-backend-client = { path = "backend-client" }
 codex-chatgpt = { path = "chatgpt" }
 codex-cli = { path = "cli" }
 codex-client = { path = "codex-client" }
@@ -106,7 +102,6 @@ codex-utils-rustls-provider = { path = "utils/rustls-provider" }
 codex-utils-sandbox-summary = { path = "utils/sandbox-summary" }
 codex-utils-sleep-inhibitor = { path = "utils/sleep-inhibitor" }
 codex-utils-string = { path = "utils/string" }
-codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
 mcp_test_support = { path = "mcp-server/tests/common" }
 
