@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16
@@ -38,20 +36,13 @@ services:
       - postgres
       - redis
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - ${PROJECT_ROOT:?err}:${PROJECT_ROOT:?err}
     environment:
       DATABASE_URL: postgresql://grepiku:grepiku@postgres:5432/grepiku
       REDIS_URL: redis://redis:6379
       PROJECT_ROOT: ${PROJECT_ROOT}
-      RUNNER_IMAGE: ${RUNNER_IMAGE:-grepiku-codex-runner}
-      RUNNER_NETWORK: ${RUNNER_NETWORK:-grepiku_default}
-
-  codex-runner:
-    build:
-      context: .
-      dockerfile: docker/codex-runner/Dockerfile
-    profiles: ["runner"]
+      CODEX_EXEC_PATH: /usr/local/bin/codex-exec
+      INTERNAL_API_URL: http://web:3000/internal/retrieval
 
 volumes:
   postgres-data:

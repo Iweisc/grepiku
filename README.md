@@ -15,7 +15,7 @@ GitHub PR review bot powered by Codex.
 - BullMQ workers (review-orchestrator, indexer, graph-builder, analytics-ingest)
 - Postgres for state
 - Redis for queue
-- Codex runner in Docker
+- Direct `codex-exec` integration from `internal_harness/codex-slim`
 
 ## Requirements
 
@@ -39,21 +39,16 @@ GitHub PR review bot powered by Codex.
 Copy `.env.example` to `.env` and set values. `PROJECT_ROOT` must be an absolute path to this repo.
 Additional vars:
 - `INTERNAL_API_KEY` (required for internal APIs and retrieval tool access)
+- `CODEX_EXEC_PATH` (path to `codex-exec`; Docker worker uses `/usr/local/bin/codex-exec`)
 
-3) Build Codex runner image
-
-```bash
-docker compose build codex-runner
-```
-
-4) Start services
+3) Start services
 
 ```bash
 docker compose up -d postgres redis
 npm install
 npm run prisma:generate
 npm run prisma:migrate
-docker compose up -d web worker
+docker compose up -d --build web worker
 ```
 
 ## Repo Configuration
@@ -93,7 +88,7 @@ If missing, defaults are used and tools are marked as skipped.
 ## Runtime Notes
 
 - Each run writes artifacts under `var/runs/<runId>`.
-- The Codex runner mounts `/work/repo` as read-only and writes outputs to `/work/out`.
+- Worker executes `codex-exec` directly and injects MCP roots for repo/bundle/out paths.
 - Tool runs are cached in Postgres per (review run, tool).
 
 ## Endpoints

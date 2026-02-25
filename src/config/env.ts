@@ -1,4 +1,5 @@
 import { z } from "zod";
+import path from "path";
 
 const EnvSchema = z.object({
   PORT: z.string().default("3000"),
@@ -19,9 +20,8 @@ const EnvSchema = z.object({
   OPENAI_TIMEOUT_MS: z.string().default("120000"),
   OPENAI_MAX_RETRIES: z.string().default("3"),
   PROJECT_ROOT: z.string().min(1),
-  RUNNER_IMAGE: z.string().default("grepiku-codex-runner"),
-  RUNNER_NETWORK: z.string().default("auto"),
-  RUNNER_AUTOBUILD: z.string().default("true"),
+  CODEX_EXEC_PATH: z.string().default(""),
+  INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
   LOG_LEVEL: z.string().default("info")
 });
 
@@ -44,9 +44,8 @@ export type Env = {
   openaiTimeoutMs: number;
   openaiMaxRetries: number;
   projectRoot: string;
-  runnerImage: string;
-  runnerNetwork: string;
-  runnerAutobuild: boolean;
+  codexExecPath: string;
+  internalApiUrl: string;
   logLevel: string;
 };
 
@@ -66,6 +65,7 @@ export function loadEnv(): Env {
     Number.isFinite(embeddingsMaxCharsRaw) && embeddingsMaxCharsRaw > 0
       ? Math.floor(embeddingsMaxCharsRaw)
       : 12000;
+  const codexExecPath = parsed.CODEX_EXEC_PATH.trim();
   cached = {
     port: Number(parsed.PORT),
     databaseUrl: parsed.DATABASE_URL,
@@ -87,9 +87,11 @@ export function loadEnv(): Env {
     openaiTimeoutMs: Number(parsed.OPENAI_TIMEOUT_MS),
     openaiMaxRetries: Number(parsed.OPENAI_MAX_RETRIES),
     projectRoot: parsed.PROJECT_ROOT,
-    runnerImage: parsed.RUNNER_IMAGE,
-    runnerNetwork: parsed.RUNNER_NETWORK,
-    runnerAutobuild: parsed.RUNNER_AUTOBUILD !== "false" && parsed.RUNNER_AUTOBUILD !== "0",
+    codexExecPath:
+      codexExecPath.length > 0
+        ? codexExecPath
+        : path.join(parsed.PROJECT_ROOT, "internal_harness", "codex-slim", "target", "release", "codex-exec"),
+    internalApiUrl: parsed.INTERNAL_API_URL.trim(),
     logLevel: parsed.LOG_LEVEL
   };
   return cached;

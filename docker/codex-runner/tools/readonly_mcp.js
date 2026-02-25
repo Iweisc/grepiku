@@ -3,9 +3,9 @@ import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
 
-const repoRoot = "/work/repo";
-const bundleRoot = "/work/bundle";
-const outRoot = "/work/out";
+const repoRoot = path.resolve(process.env.WORK_REPO_ROOT || "/work/repo");
+const bundleRoot = path.resolve(process.env.WORK_BUNDLE_ROOT || "/work/bundle");
+const outRoot = path.resolve(process.env.WORK_OUT_ROOT || "/work/out");
 const searchRoots = [repoRoot, bundleRoot, outRoot];
 const readRoots = [repoRoot, bundleRoot, outRoot];
 

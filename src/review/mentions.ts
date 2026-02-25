@@ -131,7 +131,10 @@ ${refreshed.body || pullRequest.body || "(no description)"}
   const prompt = buildMentionPrompt({
     commentBody,
     commentAuthor,
-    commentUrl
+    commentUrl,
+    repoPath,
+    bundleDir,
+    outDir
   });
 
   await runCodexStage({
@@ -144,7 +147,8 @@ ${refreshed.body || pullRequest.body || "(no description)"}
     headSha: refreshed.headSha,
     repoId: repo.id,
     reviewRunId: 0,
-    prNumber
+    prNumber,
+    captureLastMessage: false
   });
 
   const reply = await readAndValidateJson(path.join(outDir, "reply.json"), ReplySchema);
