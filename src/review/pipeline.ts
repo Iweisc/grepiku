@@ -1004,6 +1004,8 @@ export async function processReviewJob(data: ReviewJobData) {
       diffIndex,
       changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
       maxInlineComments: resolvedConfig.limits.max_inline_comments,
+      summaryOnly: resolvedConfig.output.summaryOnly,
+      allowedTypes: resolvedConfig.commentTypes.allow,
       feedbackPolicy
     });
     finalReview.comments = qualityRefinement.comments;

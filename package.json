@@ -11,6 +11,7 @@
     "dev:graph": "tsx watch src/workers/graph-builder.ts",
     "dev:analytics": "tsx watch src/workers/analytics-ingest.ts",
     "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/**/*.test.ts",
     "start:server": "node dist/server.js",
     "start:worker": "node dist/worker.js",
     "start:review-worker": "node dist/workers/review-orchestrator.js",

@@ -176,6 +176,8 @@ export function refineReviewComments(params: {
   diffIndex: DiffIndex;
   changedFiles: Array<{ filename?: string; path?: string }>;
   maxInlineComments: number;
+  summaryOnly?: boolean;
+  allowedTypes?: Array<"inline" | "summary">;
   feedbackPolicy?: FeedbackPolicy;
 }): {
   comments: ReviewComment[];
@@ -196,6 +198,11 @@ export function refineReviewComments(params: {
   );
 
   const ranked: RankedComment[] = [];
+  const summaryOnly = Boolean(params.summaryOnly);
+  const allowedInline = params.allowedTypes
+    ? params.allowedTypes.includes("inline")
+    : true;
+  const forceSummary = summaryOnly || !allowedInline;
   for (const rawComment of params.comments) {
     const comment = normalizeComment(rawComment);
     if (!isMeaningful(comment.title) || !isMeaningful(comment.body) || !isMeaningful(comment.evidence)) {
@@ -208,6 +215,10 @@ export function refineReviewComments(params: {
     if (comment.severity === "blocking" && !comment.suggested_patch) {
       comment.severity = "important";
       diagnostics.downgradedBlocking += 1;
+    }
+    if (forceSummary && commentTypeFor(comment) !== "summary") {
+      comment.comment_type = "summary";
+      diagnostics.convertedToSummary += 1;
     }
     if (commentTypeFor(comment) !== "summary" && !isLineInDiff(params.diffIndex, comment)) {
       comment.comment_type = "summary";
@@ -233,7 +244,7 @@ export function refineReviewComments(params: {
   const rankedByPriority = deduped.kept.sort((a, b) => b.score - a.score);
   for (const item of rankedByPriority) {
     const type = commentTypeFor(item.comment);
-    if (type === "summary") {
+    if (type === "summary" || forceSummary) {
       afterPerFileCap.push(item);
       continue;
     }
