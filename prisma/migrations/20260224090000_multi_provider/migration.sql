@@ -408,7 +408,7 @@ CREATE TABLE "RuleSuggestion" (
 -- Backfill (best-effort) from legacy schema if present
 DO $$
 BEGIN
-  IF to_regclass('public."RepoInstallation"') IS NOT NULL THEN
+  IF to_regclass('public."Legacy_RepoInstallation"') IS NOT NULL THEN
     INSERT INTO "Provider" ("kind","name","baseUrl","createdAt","updatedAt")
     VALUES ('github','GitHub','https://github.com',NOW(),NOW())
     ON CONFLICT DO NOTHING;
