@@ -42,12 +42,24 @@ function asText(text) {
 }
 
 async function loadRepoConfig() {
-  const configPath = path.join(repoRoot, ".prreviewer.yml");
+  const candidates = ["grepiku.json", "greptile.json"];
+  for (const name of candidates) {
+    try {
+      const raw = await fs.readFile(path.join(repoRoot, name), "utf8");
+      const parsed = JSON.parse(raw);
+      return parsed;
+    } catch (err) {
+      if (err?.code && err.code !== "ENOENT") {
+        return {};
+      }
+    }
+  }
   try {
-    const raw = await fs.readFile(configPath, "utf8");
+    const legacyPath = path.join(repoRoot, ".prreviewer.yml");
+    const raw = await fs.readFile(legacyPath, "utf8");
     const parsed = (yaml.load(raw) || {}) as any;
     return parsed;
-  } catch (err) {
+  } catch {
     return {};
   }
 }
@@ -111,12 +123,10 @@ const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 await client.connect();
 
 async function lookupToolRun(tool) {
-  const repoInstallationId = Number(process.env.TOOLRUN_REPO_INSTALLATION_ID || 0);
-  const prNumber = Number(process.env.TOOLRUN_PR_NUMBER || 0);
-  const headSha = process.env.TOOLRUN_HEAD_SHA || "";
+  const reviewRunId = Number(process.env.REVIEW_RUN_ID || 0);
   const res = await client.query(
-    'SELECT status, summary, "topErrors", "logPath" FROM "ToolRun" WHERE "repoInstallationId"=$1 AND "prNumber"=$2 AND "headSha"=$3 AND tool=$4',
-    [repoInstallationId, prNumber, headSha, tool]
+    'SELECT status, summary, "topErrors", "logPath" FROM "ToolRun" WHERE "reviewRunId"=$1 AND tool=$2',
+    [reviewRunId, tool]
   );
   if (res.rows.length === 0) return null;
   const row = res.rows[0];
@@ -132,21 +142,10 @@ async function lookupToolRun(tool) {
 }
 
 async function upsertToolRun(tool, result) {
-  const repoInstallationId = Number(process.env.TOOLRUN_REPO_INSTALLATION_ID || 0);
-  const prNumber = Number(process.env.TOOLRUN_PR_NUMBER || 0);
-  const headSha = process.env.TOOLRUN_HEAD_SHA || "";
+  const reviewRunId = Number(process.env.REVIEW_RUN_ID || 0);
   await client.query(
-    'INSERT INTO "ToolRun" ("repoInstallationId", "prNumber", "headSha", tool, status, summary, "topErrors", "logPath", "createdAt", "updatedAt") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),now()) ON CONFLICT ("repoInstallationId","prNumber","headSha",tool) DO UPDATE SET status=EXCLUDED.status, summary=EXCLUDED.summary, "topErrors"=EXCLUDED."topErrors", "logPath"=EXCLUDED."logPath", "updatedAt"=now()',
-    [
-      repoInstallationId,
-      prNumber,
-      headSha,
-      tool,
-      result.status,
-      result.summary,
-      JSON.stringify(result.topErrors || []),
-      result.logPath || null
-    ]
+    'INSERT INTO "ToolRun" ("reviewRunId", tool, status, summary, "topErrors", "logPath", "createdAt", "updatedAt") VALUES ($1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT ("reviewRunId",tool) DO UPDATE SET status=EXCLUDED.status, summary=EXCLUDED.summary, "topErrors"=EXCLUDED."topErrors", "logPath"=EXCLUDED."logPath", "updatedAt"=now()',
+    [reviewRunId, tool, result.status, result.summary, JSON.stringify(result.topErrors || []), result.logPath || null]
   );
 }
 

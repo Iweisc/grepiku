@@ -1,37 +1,33 @@
 import fs from "fs/promises";
 import path from "path";
 import { prisma } from "../db/client.js";
-import { getInstallationOctokit, getInstallationToken } from "../github/auth.js";
 import { loadEnv } from "../config/env.js";
-import { loadRepoConfig } from "./config.js";
+import { loadRepoConfig, saveRepoConfig } from "./config.js";
 import { writeBundleFiles } from "./bundle.js";
 import { buildMentionPrompt } from "./prompts.js";
 import { runCodexStage } from "../runner/codexRunner.js";
 import { readAndValidateJson } from "./json.js";
 import { ReplySchema } from "./schemas.js";
-import {
-  buildLocalDiffPatch,
-  ensureRepoCheckout,
-  fetchDiffPatch,
-  isDiffTooLargeError,
-  listChangedFiles,
-  renderPrMarkdown
-} from "./pr-data.js";
+import { getProviderAdapter } from "../providers/registry.js";
+import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
+import { buildContextPack } from "./context.js";
+import { execa } from "execa";
 
 const env = loadEnv();
 
 export type CommentReplyJobData = {
-  installationId: number;
-  owner: string;
-  repo: string;
+  provider: "github";
+  installationId?: string | null;
+  repoId: number;
+  pullRequestId: number;
   prNumber: number;
-  commentId: number;
+  commentId: string;
   commentBody: string;
   commentAuthor: string;
   commentUrl?: string;
 };
 
-async function createReplyDirs(root: string, commentId: number) {
+async function createReplyDirs(root: string, commentId: string) {
   const runDir = path.join(root, "var", "replies", String(commentId));
   const bundleDir = path.join(runDir, "bundle");
   const outDir = path.join(runDir, "out");
@@ -43,62 +39,93 @@ async function createReplyDirs(root: string, commentId: number) {
   return { runDir, bundleDir, outDir, codexHomeDir };
 }
 
+async function buildLocalDiffPatch(params: {
+  repoPath: string;
+  baseSha: string | null | undefined;
+  headSha: string;
+}): Promise<string> {
+  const { repoPath, baseSha, headSha } = params;
+  if (!baseSha) return "";
+  const { stdout } = await execa(
+    "git",
+    ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
+    { maxBuffer: 1024 * 1024 * 200 }
+  );
+  return stdout;
+}
+
 export async function processCommentReplyJob(data: CommentReplyJobData) {
-  const { installationId, owner, repo, prNumber, commentId, commentBody, commentAuthor, commentUrl } =
+  const { provider, installationId, repoId, pullRequestId, prNumber, commentId, commentBody, commentAuthor, commentUrl } =
     data;
-  const octokit = getInstallationOctokit(installationId);
-  const pr = await octokit.pulls.get({ owner, repo, pull_number: prNumber });
-  const head = pr.data.head.sha;
+  const repo = await prisma.repo.findFirst({ where: { id: repoId } });
+  const pullRequest = await prisma.pullRequest.findFirst({ where: { id: pullRequestId } });
+  if (!repo || !pullRequest) return;
 
-  const repoInstallation = await prisma.repoInstallation.upsert({
-    where: { installationId },
-    update: { owner, repo },
-    create: { installationId, owner, repo }
+  const adapter = getProviderAdapter(provider);
+  const providerRepo: ProviderRepo = {
+    externalId: repo.externalId,
+    owner: repo.owner,
+    name: repo.name,
+    fullName: repo.fullName
+  };
+  const providerPull: ProviderPullRequest = {
+    externalId: pullRequest.externalId,
+    number: prNumber,
+    title: pullRequest.title || null,
+    body: pullRequest.body || null,
+    url: pullRequest.url || null,
+    state: pullRequest.state,
+    headSha: pullRequest.headSha || ""
+  };
+  const client = await adapter.createClient({
+    installationId: installationId || null,
+    repo: providerRepo,
+    pullRequest: providerPull
   });
+  const refreshed = await client.fetchPullRequest();
 
-  const installationToken = await getInstallationToken(installationId);
-  const repoPath = await ensureRepoCheckout({
-    installationToken,
-    owner,
-    repo,
-    headSha: head
-  });
-
-  const repoConfig = await loadRepoConfig(repoPath);
-  let diffPatch: string;
+  const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
+  const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
+  await saveRepoConfig(repo.id, repoConfig, warnings);
+  let diffPatch = "";
   try {
-    diffPatch = await fetchDiffPatch(octokit, owner, repo, prNumber);
-  } catch (err) {
-    if (!isDiffTooLargeError(err)) throw err;
+    diffPatch = await client.fetchDiffPatch();
+  } catch {
     diffPatch = await buildLocalDiffPatch({
       repoPath,
-      baseSha: pr.data.base.sha,
-      headSha: head
+      baseSha: refreshed.baseSha,
+      headSha: refreshed.headSha
     });
   }
-  const changedFiles = await listChangedFiles(octokit, owner, repo, prNumber);
-
-  const prMarkdown = renderPrMarkdown({
-    title: pr.data.title,
-    number: prNumber,
-    author: pr.data.user?.login || "unknown",
-    body: pr.data.body,
-    baseRef: pr.data.base.ref,
-    headRef: pr.data.head.ref,
-    headSha: head,
-    url: pr.data.html_url
+  const changedFiles = await client.listChangedFiles();
+  const contextPack = await buildContextPack({
+    repoId: repo.id,
+    diffPatch,
+    changedFiles: changedFiles as Array<{ filename?: string; path?: string }>
   });
 
-  const { bundleDir, outDir, codexHomeDir } = await createReplyDirs(
-    env.projectRoot,
-    commentId
-  );
+  const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}
+
+Author: ${refreshed.author?.login || "unknown"}
+Base: ${refreshed.baseRef || ""}
+Head: ${refreshed.headRef || ""}
+Head SHA: ${refreshed.headSha}
+URL: ${refreshed.url || ""}
+
+## Description
+${refreshed.body || pullRequest.body || "(no description)"}
+`;
+
+  const { bundleDir, outDir, codexHomeDir } = await createReplyDirs(env.projectRoot, commentId);
   await writeBundleFiles({
     bundleDir,
     prMarkdown,
     diffPatch,
     changedFiles,
-    repoConfig
+    repoConfig,
+    resolvedConfig: repoConfig,
+    contextPack,
+    warnings
   });
 
   const prompt = buildMentionPrompt({
@@ -114,17 +141,13 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
     outDir,
     codexHomeDir,
     prompt,
-    headSha: head,
-    repoInstallationId: repoInstallation.id,
+    headSha: refreshed.headSha,
+    repoId: repo.id,
+    reviewRunId: 0,
     prNumber
   });
 
   const reply = await readAndValidateJson(path.join(outDir, "reply.json"), ReplySchema);
 
-  await octokit.issues.createComment({
-    owner,
-    repo,
-    issue_number: prNumber,
-    body: reply.body
-  });
+  await client.createSummaryComment(reply.body);
 }

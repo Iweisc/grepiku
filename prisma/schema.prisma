@@ -7,7 +7,11 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum RunStatus {
+enum ProviderKind {
+  github
+}
+
+enum ReviewRunStatus {
   queued
   running
   completed
@@ -18,6 +22,33 @@ enum FindingStatus {
   open
   fixed
   obsolete
+}
+
+enum ReviewCommentKind {
+  inline
+  summary
+}
+
+enum CheckStatus {
+  queued
+  in_progress
+  completed
+}
+
+enum CheckConclusion {
+  success
+  failure
+  neutral
+  cancelled
+  skipped
+  timed_out
+  action_required
+}
+
+enum FeedbackType {
+  reaction
+  reply
+  resolution
 }
 
 enum ToolKind {
@@ -34,53 +65,138 @@ enum ToolStatus {
   error
 }
 
+model Provider {
+  id         Int          @id @default(autoincrement())
+  kind       ProviderKind
+  name       String
+  baseUrl    String
+  apiUrl     String?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  installations Installation[]
+  repos         Repo[]
+  users         User[]
+}
+
+model Installation {
+  id           Int      @id @default(autoincrement())
+  providerId   Int
+  externalId   String
+  accountLogin String
+  accountType  String?
+  metadata     Json?
+  configJson   Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  provider Provider @relation(fields: [providerId], references: [id])
+  repos    RepoInstallation[]
+  runs     ReviewRun[]
+
+  @@unique([providerId, externalId])
+}
+
+model Repo {
+  id             Int      @id @default(autoincrement())
+  providerId     Int
+  externalId     String
+  owner          String
+  name           String
+  fullName       String
+  defaultBranch  String?
+  archived       Boolean  @default(false)
+  private        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  provider      Provider        @relation(fields: [providerId], references: [id])
+  installations RepoInstallation[]
+  pullRequests  PullRequest[]
+  configs       RepoConfig?
+  triggers      TriggerSetting?
+  indexRuns     IndexRun[]
+  files         FileIndex[]
+  symbols       Symbol[]
+  symbolRefs    SymbolReference[]
+  graphNodes    GraphNode[]
+  graphEdges    GraphEdge[]
+  embeddings    Embedding[]
+  analytics     AnalyticsEvent[]
+  patternLinks  PatternRepositoryLink[]
+  ruleSuggestions RuleSuggestion[]
+
+  @@unique([providerId, externalId])
+}
+
 model RepoInstallation {
-  id              Int      @id @default(autoincrement())
-  installationId  Int      @unique
-  owner           String
-  repo            String
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  pullRequests    PullRequest[]
-  toolRuns        ToolRun[]
+  id             Int      @id @default(autoincrement())
+  repoId         Int
+  installationId Int
+  permissions    Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  repo         Repo         @relation(fields: [repoId], references: [id])
+  installation Installation @relation(fields: [installationId], references: [id])
+
+  @@unique([repoId, installationId])
 }
 
 model PullRequest {
-  id                  Int      @id @default(autoincrement())
-  repoInstallationId  Int
-  number              Int
-  title               String?
-  url                 String?
-  headSha             String
-  baseSha             String
-  state               String
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  id         Int      @id @default(autoincrement())
+  repoId     Int
+  externalId String
+  number     Int
+  title      String?
+  body       String?
+  url        String?
+  state      String
+  baseRef    String?
+  headRef    String?
+  baseSha    String?
+  headSha    String
+  draft      Boolean  @default(false)
+  authorId   Int?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
-  repoInstallation RepoInstallation @relation(fields: [repoInstallationId], references: [id])
-  runs            Run[]
-  findings        Finding[]
-  statusComment   StatusComment?
+  repo   Repo   @relation(fields: [repoId], references: [id])
+  author User?  @relation(fields: [authorId], references: [id])
+  runs   ReviewRun[]
+  findings Finding[]
+  comments ReviewComment[]
 
-  @@unique([repoInstallationId, number])
+  @@unique([repoId, number])
 }
 
-model Run {
-  id            Int       @id @default(autoincrement())
-  pullRequestId Int
-  headSha       String
-  status        RunStatus
-  startedAt     DateTime?
-  completedAt   DateTime?
-  draftJson     Json?
-  finalJson     Json?
-  verdictsJson  Json?
-  checksJson    Json?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+model ReviewRun {
+  id              Int            @id @default(autoincrement())
+  pullRequestId   Int
+  installationId  Int?
+  headSha         String
+  status          ReviewRunStatus
+  trigger         String
+  startedAt       DateTime?
+  completedAt     DateTime?
+  configJson      Json?
+  rulesResolvedJson Json?
+  rulesUsedJson   Json?
+  contextPackJson Json?
+  draftJson       Json?
+  finalJson       Json?
+  verdictsJson    Json?
+  checksJson      Json?
+  summaryJson     Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  pullRequest PullRequest @relation(fields: [pullRequestId], references: [id])
+  pullRequest PullRequest  @relation(fields: [pullRequestId], references: [id])
+  installation Installation? @relation(fields: [installationId], references: [id])
   findings    Finding[]
+  checks      StatusCheck[]
+  feedback    Feedback[]
+  toolRuns    ToolRun[]
 
   @@unique([pullRequestId, headSha])
 }
@@ -88,7 +204,7 @@ model Run {
 model Finding {
   id             Int           @id @default(autoincrement())
   pullRequestId  Int
-  runId          Int
+  reviewRunId    Int
   status         FindingStatus
   fingerprint    String
   hunkHash       String
@@ -104,41 +220,281 @@ model Finding {
   body           String
   evidence       String
   suggestedPatch String?
-  githubCommentId String?
-  githubReviewId  String?
-  firstSeenRunId Int
+  ruleId         String?
+  ruleReason     String?
+  firstSeenRunId Int?
   lastSeenRunId  Int?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
   pullRequest PullRequest @relation(fields: [pullRequestId], references: [id])
-  run         Run         @relation(fields: [runId], references: [id])
+  run         ReviewRun  @relation(fields: [reviewRunId], references: [id])
+  comment     ReviewComment?
 }
 
-model ToolRun {
-  id                 Int        @id @default(autoincrement())
-  repoInstallationId Int
-  prNumber           Int
-  headSha            String
-  tool               ToolKind
-  status             ToolStatus
-  summary            String
-  topErrors          Json
-  logPath            String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+model ReviewComment {
+  id               Int              @id @default(autoincrement())
+  pullRequestId    Int?
+  findingId        Int?             @unique
+  kind             ReviewCommentKind
+  providerCommentId String
+  providerReviewId  String?
+  body             String
+  url              String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
-  repoInstallation RepoInstallation @relation(fields: [repoInstallationId], references: [id])
-
-  @@unique([repoInstallationId, prNumber, headSha, tool])
+  pullRequest PullRequest? @relation(fields: [pullRequestId], references: [id])
+  finding     Finding?     @relation(fields: [findingId], references: [id])
 }
 
-model StatusComment {
+model StatusCheck {
+  id             Int            @id @default(autoincrement())
+  reviewRunId    Int
+  name           String
+  status         CheckStatus
+  conclusion     CheckConclusion?
+  detailsUrl     String?
+  providerCheckId String?
+  outputJson     Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  reviewRun ReviewRun @relation(fields: [reviewRunId], references: [id])
+}
+
+model User {
+  id         Int      @id @default(autoincrement())
+  providerId Int
+  externalId String
+  login      String
+  name       String?
+  avatarUrl  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  provider Provider @relation(fields: [providerId], references: [id])
+  authoredPullRequests PullRequest[]
+  feedback Feedback[]
+
+  @@unique([providerId, externalId])
+}
+
+model Feedback {
+  id          Int          @id @default(autoincrement())
+  reviewRunId Int
+  userId      Int?
+  type        FeedbackType
+  sentiment   String?
+  action      String?
+  commentId   String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  reviewRun ReviewRun @relation(fields: [reviewRunId], references: [id])
+  user      User?     @relation(fields: [userId], references: [id])
+}
+
+model RepoConfig {
+  id         Int      @id @default(autoincrement())
+  repoId     Int      @unique
+  configJson Json
+  warnings   Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model TriggerSetting {
+  id         Int      @id @default(autoincrement())
+  repoId     Int      @unique
+  configJson Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model PatternRepository {
+  id        Int      @id @default(autoincrement())
+  name      String
+  url       String
+  ref       String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  links PatternRepositoryLink[]
+
+  @@unique([url])
+}
+
+model PatternRepositoryLink {
   id              Int      @id @default(autoincrement())
-  pullRequestId   Int      @unique
-  githubCommentId String
+  repoId          Int
+  patternRepoId   Int
+  scope           String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  pullRequest PullRequest @relation(fields: [pullRequestId], references: [id])
+  repo        Repo               @relation(fields: [repoId], references: [id])
+  patternRepo PatternRepository  @relation(fields: [patternRepoId], references: [id])
+
+  @@unique([repoId, patternRepoId])
+}
+
+model IndexRun {
+  id          Int      @id @default(autoincrement())
+  repoId      Int
+  headSha     String?
+  status      String
+  startedAt   DateTime?
+  completedAt DateTime?
+  lastCommitSha String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model FileIndex {
+  id            Int      @id @default(autoincrement())
+  repoId        Int
+  path          String
+  language      String?
+  blobSha       String?
+  size          Int?
+  contentHash   String
+  lastIndexedAt DateTime
+  isPattern     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  repo      Repo      @relation(fields: [repoId], references: [id])
+  symbols   Symbol[]
+  embeddings Embedding[]
+  refs      SymbolReference[]
+
+  @@unique([repoId, path, isPattern])
+}
+
+model Symbol {
+  id         Int      @id @default(autoincrement())
+  repoId     Int
+  fileId     Int
+  name       String
+  kind       String
+  signature  String?
+  startLine  Int
+  endLine    Int
+  doc        String?
+  hash       String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+  file FileIndex @relation(fields: [fileId], references: [id])
+  embeddings Embedding[]
+  references SymbolReference[]
+
+  @@unique([repoId, fileId, hash])
+}
+
+model SymbolReference {
+  id        Int      @id @default(autoincrement())
+  repoId    Int
+  fileId    Int
+  symbolId  Int?
+  refName   String
+  line      Int
+  kind      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+  file FileIndex @relation(fields: [fileId], references: [id])
+  symbol Symbol? @relation(fields: [symbolId], references: [id])
+}
+
+model GraphNode {
+  id        Int      @id @default(autoincrement())
+  repoId    Int
+  type      String
+  key       String
+  fileId    Int?
+  symbolId  Int?
+  data      Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model GraphEdge {
+  id         Int      @id @default(autoincrement())
+  repoId     Int
+  fromNodeId Int
+  toNodeId   Int
+  type       String
+  data       Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model Embedding {
+  id        Int      @id @default(autoincrement())
+  repoId    Int
+  fileId    Int?
+  symbolId  Int?
+  kind      String
+  vector    Float[]
+  text      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  repo   Repo      @relation(fields: [repoId], references: [id])
+  file   FileIndex? @relation(fields: [fileId], references: [id])
+  symbol Symbol?   @relation(fields: [symbolId], references: [id])
+}
+
+model AnalyticsEvent {
+  id        Int      @id @default(autoincrement())
+  repoId    Int
+  runId     Int?
+  kind      String
+  payload   Json?
+  createdAt DateTime @default(now())
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model RuleSuggestion {
+  id        Int      @id @default(autoincrement())
+  repoId    Int
+  ruleJson  Json
+  reason    String
+  status    String   @default("pending")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model ToolRun {
+  id          Int        @id @default(autoincrement())
+  reviewRunId Int
+  tool        ToolKind
+  status      ToolStatus
+  summary     String
+  topErrors   Json
+  logPath     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  reviewRun ReviewRun @relation(fields: [reviewRunId], references: [id])
+
+  @@unique([reviewRunId, tool])
 }

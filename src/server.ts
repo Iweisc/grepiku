@@ -1,7 +1,10 @@
 import "dotenv/config";
 import Fastify from "fastify";
 import { loadEnv } from "./config/env.js";
-import { webhooks } from "./github/webhooks.js";
+import { resolveWebhookEvent } from "./providers/webhookRouter.js";
+import { handleWebhookEvent } from "./providers/webhookHandler.js";
+import { registerInternalApi } from "./server/internal.js";
+import { registerDashboard } from "./server/dashboard.js";
 
 const env = loadEnv();
 
@@ -16,29 +19,26 @@ app.addContentTypeParser("application/json", { parseAs: "buffer" }, (req, body, 
 });
 
 app.post("/webhooks", async (request, reply) => {
-  const signature = request.headers["x-hub-signature-256"] as string | undefined;
-  const id = request.headers["x-github-delivery"] as string | undefined;
-  const name = request.headers["x-github-event"] as string | undefined;
   const payload = (request.body as Buffer).toString("utf8");
-
-  if (!signature || !id || !name) {
-    reply.code(400).send({ error: "Missing GitHub headers" });
-    return;
-  }
-
   try {
-    await webhooks.verifyAndReceive({
-      id,
-      name: name as any,
-      signature,
-      payload
+    const event = await resolveWebhookEvent({
+      headers: request.headers as Record<string, string | string[] | undefined>,
+      body: payload
     });
+    if (!event) {
+      reply.code(400).send({ error: "Unsupported webhook event" });
+      return;
+    }
+    await handleWebhookEvent(event);
     reply.code(200).send({ ok: true });
   } catch (err) {
-    request.log.error({ err }, "Webhook verification failed");
-    reply.code(401).send({ error: "Invalid signature" });
+    request.log.error({ err }, "Webhook handling failed");
+    reply.code(401).send({ error: "Invalid webhook signature" });
   }
 });
+
+registerInternalApi(app);
+registerDashboard(app);
 
 app.get("/healthz", async () => ({ ok: true }));
 

@@ -13,13 +13,31 @@ export type CodexRunParams = {
   codexHomeDir: string;
   prompt: string;
   headSha: string;
-  repoInstallationId: number;
+  repoId: number;
+  reviewRunId: number;
   prNumber: number;
 };
 
 const env = loadEnv();
 let runnerImageReady = false;
 let resolvedNetwork: string | null = null;
+
+function systemPrompt(stage: CodexStage): string {
+  const toolNote =
+    stage === "verifier"
+      ? "Tools available: readonly, verifier."
+      : "Tools available: readonly, retrieval.";
+  return [
+    "SYSTEM: You are a code-review agent running inside a sandboxed repo checkout.",
+    "You must use tools and files correctly.",
+    toolNote,
+    "Allowed file roots: /work/repo, /work/bundle, /work/out.",
+    "Never access /work/src or other paths outside allowed roots.",
+    "If a tool call fails due to ENOENT or bad path, correct the path and retry.",
+    "Never fabricate file contents. Use tools to read files.",
+    "Only write outputs to /work/out as instructed by the prompt."
+  ].join("\n");
+}
 
 async function writeAuthFiles(codexHomeDir: string, outDir: string): Promise<string> {
   const authPayload = JSON.stringify({ OPENAI_API_KEY: env.openaiApiKey }, null, 2);
@@ -80,7 +98,7 @@ function configForStage(stage: CodexStage): string {
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
-    `model_reasoning_effort = "xhigh"`,
+    `model_reasoning_effort = "high"`,
     "",
     "[features]",
     "shell_tool = false",
@@ -95,6 +113,26 @@ function configForStage(stage: CodexStage): string {
       `\n[mcp_servers.readonly]\n` +
       `command = "node"\n` +
       `args = ["/opt/grepiku-tools/tools/readonly_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n` +
+      `\n[mcp_servers.retrieval]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/retrieval_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n`
+    );
+  }
+  if (stage === "editor") {
+    return (
+      base +
+      `\n[mcp_servers.readonly]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/readonly_mcp.js"]\n` +
+      `startup_timeout_sec = 10\n` +
+      `tool_timeout_sec = 10\n` +
+      `\n[mcp_servers.retrieval]\n` +
+      `command = "node"\n` +
+      `args = ["/opt/grepiku-tools/tools/retrieval_mcp.js"]\n` +
       `startup_timeout_sec = 10\n` +
       `tool_timeout_sec = 10\n`
     );
@@ -120,12 +158,14 @@ function configForStage(stage: CodexStage): string {
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
   await ensureRunnerImage();
   const runnerNetwork = await resolveRunnerNetwork();
-  const configDir = await writeAuthFiles(params.codexHomeDir, params.outDir);
+  const stageHomeDir = path.join(params.codexHomeDir, params.stage);
+  await fs.mkdir(stageHomeDir, { recursive: true });
+  const configDir = await writeAuthFiles(stageHomeDir, params.outDir);
   const configToml = configForStage(params.stage);
-  const configPath = path.join(params.codexHomeDir, "config.toml");
+  const configPath = path.join(stageHomeDir, "config.toml");
   await fs.writeFile(configPath, configToml, "utf8");
 
-  const envFilePath = path.join(params.outDir, "runner.env");
+  const envFilePath = path.join(params.outDir, `runner.${params.stage}.env`);
   const envFile = [
     `OPENAI_BASE_URL=${env.openaiBaseUrl}`,
     `OPENAI_TIMEOUT_MS=${env.openaiTimeoutMs}`,
@@ -134,9 +174,12 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     `CODEX_DISABLE_PROJECT_DOC=1`,
     `CODEX_QUIET_MODE=1`,
     `DATABASE_URL=${env.databaseUrl}`,
-    `TOOLRUN_REPO_INSTALLATION_ID=${params.repoInstallationId}`,
+    `REVIEW_RUN_ID=${params.reviewRunId}`,
+    `REVIEW_REPO_ID=${params.repoId}`,
     `TOOLRUN_PR_NUMBER=${params.prNumber}`,
-    `TOOLRUN_HEAD_SHA=${params.headSha}`
+    `TOOLRUN_HEAD_SHA=${params.headSha}`,
+    `INTERNAL_API_URL=http://web:3000/internal/retrieval`,
+    `INTERNAL_API_KEY=${env.internalApiKey}`
   ].join("\n");
   await fs.writeFile(envFilePath, envFile, { encoding: "utf8", mode: 0o600 });
 
@@ -153,7 +196,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "-v",
     `${params.outDir}:/work/out`,
     "-v",
-    `${params.codexHomeDir}:/work/codex-home`
+    `${stageHomeDir}:/work/codex-home`
   ];
 
   if (params.repoPath) {
@@ -172,13 +215,15 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "--model",
     env.openaiModel,
     "--output-last-message",
-    "/work/out/last_message.txt"
+    `/work/out/last_message_${params.stage}.txt`
   );
 
   args.push("-");
 
+  const fullPrompt = `${systemPrompt(params.stage)}\n\n${params.prompt}`;
+
   await execa("docker", args, {
-    input: params.prompt,
+    input: fullPrompt,
     stdio: "inherit"
   });
 }

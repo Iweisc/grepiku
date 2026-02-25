@@ -6,7 +6,7 @@ import { spawn } from "child_process";
 const repoRoot = "/work/repo";
 const bundleRoot = "/work/bundle";
 const outRoot = "/work/out";
-const searchRoots = [repoRoot, bundleRoot];
+const searchRoots = [repoRoot, bundleRoot, outRoot];
 const readRoots = [repoRoot, bundleRoot, outRoot];
 
 const tools = [
@@ -24,7 +24,7 @@ const tools = [
   },
   {
     name: "search",
-    description: "Search text in the repo.",
+    description: "Search text in the repo, bundle, or output files.",
     inputSchema: {
       type: "object",
       properties: {
