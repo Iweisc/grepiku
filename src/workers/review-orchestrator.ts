@@ -18,7 +18,7 @@ const worker = new Worker(
   },
   {
     connection: redisConnection,
-    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 2)
+    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 1)
   }
 );
 

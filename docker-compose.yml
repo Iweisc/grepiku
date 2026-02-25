@@ -31,6 +31,7 @@ services:
   worker:
     build: .
     command: ["node", "dist/worker.js"]
+    stop_grace_period: 10m
     env_file: .env
     depends_on:
       - postgres
@@ -43,6 +44,7 @@ services:
       PROJECT_ROOT: ${PROJECT_ROOT}
       CODEX_EXEC_PATH: /usr/local/bin/codex-exec
       INTERNAL_API_URL: http://web:3000/internal/retrieval
+      REVIEW_WORKER_CONCURRENCY: 1
 
 volumes:
   postgres-data:
