@@ -236,7 +236,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
   await execa(codexExecPath, codexArgs, {
     input: fullPrompt,
     stdio: ["pipe", "ignore", "inherit"],
-    cwd: env.projectRoot,
+    cwd: params.outDir,
     env: stageEnv
   });
 }

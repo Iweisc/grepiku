@@ -46,7 +46,7 @@ export async function ensureGitRepoCheckout(params: {
     .catch(() => false);
 
   if (worktreeExists) {
-    await execa("git", ["-C", baseDir, "worktree", "remove", "--force", worktreePath], {
+    await execa("git", ["-C", baseDir, "worktree", "remove", "-f", "-f", worktreePath], {
       stdio: "inherit"
     });
   }
