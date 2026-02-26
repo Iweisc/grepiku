@@ -97,6 +97,155 @@ function normalizePostedBody(body: string): string {
     .trim();
 }
 
+type ReviewThreadLookup = { threadId: string; isResolved: boolean };
+
+type ThreadCommentsConnection = {
+  nodes?: Array<{ databaseId?: number | null } | null> | null;
+  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null } | null;
+};
+
+type GraphqlThreadPage = {
+  repository?: {
+    pullRequest?: {
+      reviewThreads?: {
+        nodes?: Array<{
+          id?: string | null;
+          isResolved?: boolean | null;
+          comments?: ThreadCommentsConnection | null;
+        } | null> | null;
+        pageInfo?: {
+          hasNextPage?: boolean;
+          endCursor?: string | null;
+        } | null;
+      } | null;
+    } | null;
+  } | null;
+};
+
+type ThreadCommentsPage = {
+  node?: {
+    comments?: ThreadCommentsConnection | null;
+  } | null;
+};
+
+type GraphqlRequest = (query: string, variables: Record<string, unknown>) => Promise<unknown>;
+
+function appendCommentIds(
+  comments: ThreadCommentsConnection | null | undefined,
+  threadId: string,
+  isResolved: boolean,
+  result: Map<string, ReviewThreadLookup>
+) {
+  for (const comment of comments?.nodes || []) {
+    const databaseId = comment?.databaseId;
+    if (databaseId) {
+      result.set(String(databaseId), { threadId, isResolved });
+    }
+  }
+}
+
+async function appendThreadComments(params: {
+  graphql: GraphqlRequest;
+  threadId: string;
+  isResolved: boolean;
+  commentsAfter: string;
+  result: Map<string, ReviewThreadLookup>;
+}) {
+  const commentsQuery = `
+    query($threadId: ID!, $commentsAfter: String) {
+      node(id: $threadId) {
+        ... on PullRequestReviewThread {
+          comments(first: 100, after: $commentsAfter) {
+            nodes { databaseId }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }
+  `;
+
+  let commentsAfter: string | null = params.commentsAfter;
+  while (commentsAfter) {
+    const page = (await params.graphql(commentsQuery, {
+      threadId: params.threadId,
+      commentsAfter
+    })) as ThreadCommentsPage;
+    const comments = page.node?.comments;
+    appendCommentIds(comments, params.threadId, params.isResolved, params.result);
+    if (!comments?.pageInfo?.hasNextPage || !comments.pageInfo.endCursor) break;
+    commentsAfter = comments.pageInfo.endCursor;
+  }
+}
+
+export async function loadGithubReviewThreadMap(params: {
+  graphql: GraphqlRequest;
+  owner: string;
+  repo: string;
+  pullNumber: number;
+}): Promise<Map<string, ReviewThreadLookup>> {
+  const result = new Map<string, ReviewThreadLookup>();
+  let after: string | null = null;
+
+  const query = `
+    query($owner: String!, $repo: String!, $pullNumber: Int!, $after: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pullNumber) {
+          reviewThreads(first: 100, after: $after) {
+            nodes {
+              id
+              isResolved
+              comments(first: 100) {
+                nodes {
+                  databaseId
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  while (true) {
+    const page = (await params.graphql(query, {
+      owner: params.owner,
+      repo: params.repo,
+      pullNumber: params.pullNumber,
+      after
+    })) as GraphqlThreadPage;
+    const threads = page.repository?.pullRequest?.reviewThreads;
+    for (const thread of threads?.nodes || []) {
+      const threadId = thread?.id;
+      if (!threadId) continue;
+      const isResolved = Boolean(thread.isResolved);
+      const comments = thread.comments;
+      appendCommentIds(comments, threadId, isResolved, result);
+      if (comments?.pageInfo?.hasNextPage && comments.pageInfo.endCursor) {
+        await appendThreadComments({
+          graphql: params.graphql,
+          threadId,
+          isResolved,
+          commentsAfter: comments.pageInfo.endCursor,
+          result
+        });
+      }
+    }
+
+    if (!threads?.pageInfo?.hasNextPage || !threads.pageInfo.endCursor) break;
+    after = threads.pageInfo.endCursor;
+  }
+
+  return result;
+}
+
 function createClient(params: {
   installationId: string | null;
   repo: ProviderRepo;
@@ -115,82 +264,13 @@ function createClient(params: {
 
   async function loadReviewThreadMap(): Promise<Map<string, { threadId: string; isResolved: boolean }>> {
     if (reviewThreadMapCache) return reviewThreadMapCache;
-    const result = new Map<string, { threadId: string; isResolved: boolean }>();
-    let after: string | null = null;
-
-    type GraphqlThreadPage = {
-      repository?: {
-        pullRequest?: {
-          reviewThreads?: {
-            nodes?: Array<{
-              id: string;
-              isResolved: boolean;
-              comments?: {
-                nodes?: Array<{
-                  databaseId?: number | null;
-                } | null> | null;
-              } | null;
-            } | null> | null;
-            pageInfo?: {
-              hasNextPage?: boolean;
-              endCursor?: string | null;
-            } | null;
-          } | null;
-        } | null;
-      } | null;
-    };
-
-    const query = `
-      query($owner: String!, $repo: String!, $pullNumber: Int!, $after: String) {
-        repository(owner: $owner, name: $repo) {
-          pullRequest(number: $pullNumber) {
-            reviewThreads(first: 100, after: $after) {
-              nodes {
-                id
-                isResolved
-                comments(first: 100) {
-                  nodes {
-                    databaseId
-                  }
-                }
-              }
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-            }
-          }
-        }
-      }
-    `;
-
-    while (true) {
-      const page = (await (octokit as any).graphql(query, {
-        owner,
-        repo,
-        pullNumber: prNumber,
-        after
-      })) as GraphqlThreadPage;
-      const threads = page.repository?.pullRequest?.reviewThreads;
-      for (const thread of threads?.nodes || []) {
-        if (!thread?.id) continue;
-        for (const comment of thread.comments?.nodes || []) {
-          const databaseId = comment?.databaseId;
-          if (!databaseId) continue;
-          result.set(String(databaseId), {
-            threadId: thread.id,
-            isResolved: Boolean(thread.isResolved)
-          });
-        }
-      }
-      const hasNext = Boolean(threads?.pageInfo?.hasNextPage);
-      if (!hasNext) break;
-      after = threads?.pageInfo?.endCursor || null;
-      if (!after) break;
-    }
-
-    reviewThreadMapCache = result;
-    return result;
+    reviewThreadMapCache = await loadGithubReviewThreadMap({
+      graphql: (query, variables) => (octokit as any).graphql(query, variables),
+      owner,
+      repo,
+      pullNumber: prNumber
+    });
+    return reviewThreadMapCache;
   }
 
   async function resolveInlineThread(commentId: string): Promise<boolean> {

@@ -201,7 +201,7 @@ function sanitizeWeight(input: number | undefined, fallback: number): number {
   return Math.min(input, 1);
 }
 
-async function loadRepoEmbeddings(repoId: number) {
+export async function loadRepoEmbeddings(repoId: number) {
   const rows: EmbeddingRow[] = [];
   let cursor: number | null = null;
 
@@ -211,7 +211,7 @@ async function loadRepoEmbeddings(repoId: number) {
         repoId,
         kind: { in: ["file", "symbol", "chunk"] }
       },
-      orderBy: { id: "asc" },
+      orderBy: { id: "desc" },
       cursor: cursor ? { id: cursor } : undefined,
       skip: cursor ? 1 : 0,
       take: EMBEDDING_FETCH_BATCH,
@@ -231,7 +231,7 @@ async function loadRepoEmbeddings(repoId: number) {
     cursor = batch[batch.length - 1].id;
   }
 
-  return rows;
+  return rows.slice(0, EMBEDDING_FETCH_MAX);
 }
 
 function mapEmbeddingKind(kind: string): RetrievalResult["kind"] {
