@@ -1,7 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
-import { execa } from "execa";
 import { ZodSchema } from "zod";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
@@ -35,6 +34,7 @@ import { resolveRules } from "./triggers.js";
 import { buildContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 import { refineReviewComments } from "./quality.js";
+import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
 
 const env = loadEnv();
 
@@ -610,46 +610,6 @@ function upsertSummaryBlock(body: string, block: string): string {
   return `${trimmed}\n\n${block}`;
 }
 
-async function buildLocalDiffPatch(params: {
-  repoPath: string;
-  baseSha: string | null | undefined;
-  headSha: string;
-}): Promise<string> {
-  const { repoPath, baseSha, headSha } = params;
-  if (!baseSha) return "";
-  const { stdout } = await execa(
-    "git",
-    ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
-    { maxBuffer: 1024 * 1024 * 200 }
-  );
-  return stdout;
-}
-
-async function buildLocalChangedFiles(params: {
-  repoPath: string;
-  baseSha: string;
-  headSha: string;
-}): Promise<Array<{ path: string; status?: string }>> {
-  const { repoPath, baseSha, headSha } = params;
-  const { stdout } = await execa(
-    "git",
-    ["-C", repoPath, "diff", "--name-status", `${baseSha}...${headSha}`],
-    { maxBuffer: 1024 * 1024 * 200 }
-  );
-  if (!stdout.trim()) return [];
-  return stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const parts = line.split("\t");
-      const status = parts[0] || "";
-      const path = parts[parts.length - 1] || "";
-      return { path, status };
-    })
-    .filter((item) => item.path);
-}
-
 function renderPrMarkdown(params: {
   title: string;
   number: number;
@@ -782,6 +742,13 @@ export async function processReviewJob(data: ReviewJobData) {
   try {
     const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
 
+    const latestCompletedRun = await prisma.reviewRun.findFirst({
+      where: {
+        pullRequestId: pullRequest.id,
+        status: "completed"
+      },
+      orderBy: { createdAt: "desc" }
+    });
     const previousRun = await prisma.reviewRun.findFirst({
       where: {
         pullRequestId: pullRequest.id,
@@ -792,6 +759,7 @@ export async function processReviewJob(data: ReviewJobData) {
     });
     const incrementalFrom = previousRun?.headSha || null;
     const incrementalReview = Boolean(incrementalFrom) && !data.force && trigger !== "manual";
+    const fullRepoStaticAudit = !latestCompletedRun;
 
     const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
     await saveRepoConfig(repo.id, repoConfig, warnings);
@@ -859,20 +827,36 @@ export async function processReviewJob(data: ReviewJobData) {
       });
     }
 
-    let diffPatch: string;
+    let diffPatch = "";
     let changedFiles: Array<{ path?: string; status?: string; additions?: number; deletions?: number; patch?: string | null }>;
-    if (incrementalReview && incrementalFrom) {
-      diffPatch = await buildLocalDiffPatch({
-        repoPath,
-        baseSha: incrementalFrom,
-        headSha: refreshed.headSha
-      });
-      changedFiles = await buildLocalChangedFiles({
-        repoPath,
-        baseSha: incrementalFrom,
-        headSha: refreshed.headSha
-      });
-    } else {
+    changedFiles = [];
+    const comparisonBaseSha = incrementalReview && incrementalFrom ? incrementalFrom : refreshed.baseSha;
+    let localCompareSucceeded = false;
+
+    if (comparisonBaseSha) {
+      try {
+        diffPatch = await buildLocalDiffPatch({
+          repoPath,
+          baseSha: comparisonBaseSha,
+          headSha: refreshed.headSha
+        });
+        changedFiles = await buildLocalChangedFiles({
+          repoPath,
+          baseSha: comparisonBaseSha,
+          headSha: refreshed.headSha
+        });
+        localCompareSucceeded = true;
+        console.log(
+          `[run ${run.id} pr#${prNumber}] using local git compare (${changedFiles.length} changed file${changedFiles.length === 1 ? "" : "s"})`
+        );
+      } catch (err) {
+        console.warn(`[run ${run.id} pr#${prNumber}] local git compare failed; falling back to provider API`, {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
+
+    if (!localCompareSucceeded) {
       try {
         diffPatch = await client.fetchDiffPatch();
       } catch {
@@ -952,7 +936,7 @@ export async function processReviewJob(data: ReviewJobData) {
         ? `\n\nReview only code changes between ${incrementalFrom} and ${refreshed.headSha}. Treat this as a full review of the update and do not mention that this run is incremental.`
         : "";
     const reviewerPrompt =
-      buildReviewerPrompt(resolvedConfig, promptPaths) +
+      buildReviewerPrompt(resolvedConfig, promptPaths, { fullRepoStaticAudit }) +
       buildFeedbackHint(feedbackPolicy) +
       incrementalHint;
     await runCodexStage({
@@ -974,7 +958,7 @@ export async function processReviewJob(data: ReviewJobData) {
       "reviewer"
     );
 
-    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths);
+    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, { fullRepoStaticAudit });
     await runCodexStage({
       stage: "editor",
       repoPath,
@@ -1381,6 +1365,9 @@ export async function processReviewJob(data: ReviewJobData) {
       qualityWarnings.push(
         `Quality gate downgraded ${qualityRefinement.diagnostics.downgradedBlocking} blocking comment(s) missing a concrete patch.`
       );
+    }
+    if (fullRepoStaticAudit) {
+      qualityWarnings.push("Initial review mode: one-time full-repo static audit with off-diff findings reported as summary comments.");
     }
     if (overlapSuppressed > 0) {
       qualityWarnings.push(

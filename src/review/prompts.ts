@@ -6,6 +6,10 @@ export type PromptPaths = {
   outDir: string;
 };
 
+export type ReviewPromptOptions = {
+  fullRepoStaticAudit?: boolean;
+};
+
 function bundlePath(paths: PromptPaths, file: string): string {
   return `${paths.bundleDir}/${file}`;
 }
@@ -14,7 +18,14 @@ function outPath(paths: PromptPaths, file: string): string {
   return `${paths.outDir}/${file}`;
 }
 
-export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths): string {
+export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths, options: ReviewPromptOptions = {}): string {
+  const scopeRules = options.fullRepoStaticAudit
+    ? [
+        "- This is the first completed review for this PR. Perform a one-time full repository static audit against the current checkout.",
+        "- Inline comments must still target lines that exist in diff.patch.",
+        '- You may include findings outside diff.patch only as `comment_type: "summary"`.'
+      ]
+    : ["- Only comment on lines that exist in diff.patch."];
   return `You are a pull request reviewer. You must produce a structured review.
 
 Context files:
@@ -29,7 +40,7 @@ Context files:
 - Repo checkout: ${paths.repoPath} (read-only)
 
 Rules:
-- Only comment on lines that exist in diff.patch.
+${scopeRules.join("\n")}
 - Default to RIGHT side unless the issue is on removed code.
 - Evidence is required for every comment (quote from diff/context).
 - Do not include evidence quotes in body; put them only in evidence.
@@ -85,7 +96,17 @@ Output requirements:
 Do not print anything else to stdout. Ensure the JSON is valid.`;
 }
 
-export function buildEditorPrompt(draftReviewJson: string, paths: PromptPaths): string {
+export function buildEditorPrompt(
+  draftReviewJson: string,
+  paths: PromptPaths,
+  options: ReviewPromptOptions = {}
+): string {
+  const placementRules = options.fullRepoStaticAudit
+    ? [
+        "- Inline comments must be on diff lines.",
+        '- Summary comments may cover issues outside diff.patch when they are high-confidence and actionable.'
+      ]
+    : ["- Only comment on diff lines."];
   return `You are the editor pass. Your job is to reduce false positives and enforce all constraints.
 
 Inputs:
@@ -97,7 +118,7 @@ ${draftReviewJson}
 - Context pack: ${bundlePath(paths, "context_pack.json")}
 
 Rules to enforce:
-- Only comment on diff lines.
+${placementRules.join("\n")}
 - Evidence required.
 - Do not include evidence quotes in body; keep quotes only in evidence.
 - Blocking requires clear fix/suggested patch.
