@@ -68,7 +68,14 @@ export function mergeLocalChangedFiles(nameStatus: string, numStat: string): Loc
     if (parts.length < 3) continue;
     const additionsRaw = parts[0] || "";
     const deletionsRaw = parts[1] || "";
-    const path = (parts[parts.length - 1] || "").trim();
+
+const rawPath = (parts[parts.length - 1] || "").trim();
+const path = rawPath
+  .replace(/^(.*)\{.* => (.*)\}(.*)$/, "$1$2$3")
+  .replace(/^.* => /, "")
+  .trim();
+if (!path) continue;
+
     if (!path) continue;
 
     const additions = additionsRaw === "-" ? undefined : Number(additionsRaw);
