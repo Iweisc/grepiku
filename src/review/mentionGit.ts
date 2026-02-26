@@ -1,5 +1,18 @@
 import { execa } from "execa";
 
+export function resolveFollowUpPrBaseBranch(params: {
+  pullRequestBaseRef?: string | null;
+  refreshedBaseRef?: string | null;
+  repoDefaultBranch?: string | null;
+}): string {
+  return (
+    params.pullRequestBaseRef ||
+    params.refreshedBaseRef ||
+    params.repoDefaultBranch ||
+    "main"
+  );
+}
+
 function sanitizeBranchSegment(value: string): string {
   return value
     .toLowerCase()

@@ -19,7 +19,8 @@ import {
   hasWorkingTreeChanges,
   mentionBranchName,
   prepareMentionBranch,
-  pushBranch
+  pushBranch,
+  resolveFollowUpPrBaseBranch
 } from "./mentionGit.js";
 import { resolveGithubBotLogin } from "../providers/github/adapter.js";
 
@@ -448,13 +449,11 @@ async function runImplementPath(params: {
   });
   await pushBranch({ repoPath: params.repoPath, branchName });
 
-  const baseBranch =
-    params.pullRequestHeadRef ||
-    params.refreshed.headRef ||
-    params.pullRequestBaseRef ||
-    params.refreshed.baseRef ||
-    params.repoDefaultBranch ||
-    "main";
+  const baseBranch = resolveFollowUpPrBaseBranch({
+    pullRequestBaseRef: params.pullRequestBaseRef,
+    refreshedBaseRef: params.refreshed.baseRef,
+    repoDefaultBranch: params.repoDefaultBranch
+  });
 
   const prTitle = action.pr_title?.trim() || defaultPrTitle(params.mentionTask);
   const prBody = renderPrBody({
