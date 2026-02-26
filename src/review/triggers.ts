@@ -8,6 +8,7 @@ export type RulesOverride = {
   strictness?: RepoConfig["strictness"];
   commentTypes?: RepoConfig["commentTypes"];
   output?: RepoConfig["output"];
+  retrieval?: RepoConfig["retrieval"];
   triggers?: RepoConfig["triggers"];
 };
 
@@ -29,6 +30,7 @@ export function resolveRules(config: RepoConfig, overrides?: RulesOverride | nul
     strictness: overrides?.strictness || config.strictness,
     commentTypes: overrides?.commentTypes || config.commentTypes,
     output: overrides?.output || config.output,
+    retrieval: overrides?.retrieval || config.retrieval,
     triggers: overrides?.triggers || config.triggers
   };
   return merged;

@@ -26,8 +26,22 @@ export function registerInternalApi(app: FastifyInstance) {
       return;
     }
     const body = request.body as any;
+    const provider = body.provider || "github";
+    if (provider !== "github") {
+      reply.code(400).send({ error: `Unsupported provider ${String(provider)}` });
+      return;
+    }
+    const missing: string[] = [];
+    if (!body.repoId) missing.push("repoId");
+    if (!body.pullRequestId) missing.push("pullRequestId");
+    if (!body.prNumber) missing.push("prNumber");
+    if (!body.headSha) missing.push("headSha");
+    if (missing.length > 0) {
+      reply.code(400).send({ error: `Missing required fields: ${missing.join(", ")}` });
+      return;
+    }
     await enqueueReviewJob({
-      provider: body.provider,
+      provider,
       installationId: body.installationId || null,
       repoId: body.repoId,
       pullRequestId: body.pullRequestId,
@@ -46,7 +60,17 @@ export function registerInternalApi(app: FastifyInstance) {
       return;
     }
     const body = request.body as any;
+    const provider = body.provider || "github";
+    if (provider !== "github") {
+      reply.code(400).send({ error: `Unsupported provider ${String(provider)}` });
+      return;
+    }
+    if (!body.repoId) {
+      reply.code(400).send({ error: "Missing required field: repoId" });
+      return;
+    }
     await enqueueIndexJob({
+      provider,
       repoId: body.repoId,
       headSha: body.headSha || null,
       patternRepo: body.patternRepo || null,
@@ -75,7 +99,10 @@ export function registerInternalApi(app: FastifyInstance) {
     const results = await retrieveContext({
       repoId: body.repoId,
       query: body.query || "",
-      topK: body.topK
+      topK: body.topK,
+      maxPerPath: body.maxPerPath,
+      changedPaths: body.changedPaths,
+      weights: body.weights
     });
     reply.send({ ok: true, results });
   });

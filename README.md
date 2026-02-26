@@ -8,6 +8,9 @@ GitHub PR review bot powered by Codex.
 - Tracks findings across pushes and marks them as new, still open, or fixed
 - Re-runs on new commits and on `/review` comments
 - 3-stage pipeline: reviewer, editor, execution verifier
+- Hybrid context retrieval (semantic + lexical + RRF + changed-path boosts) with graph-aware related files
+- Full-repo embeddings with file, symbol, and chunk vectors for deeper codebase context
+- Deterministic quality gate to dedupe overlapping findings and prioritize high-signal comments
 
 ## Architecture
 
@@ -70,6 +73,18 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
   "strictness": "medium",
   "commentTypes": { "allow": ["inline", "summary"] },
   "output": { "summaryOnly": false, "destination": "comment" },
+  "retrieval": {
+    "topK": 18,
+    "maxPerPath": 4,
+    "semanticWeight": 0.62,
+    "lexicalWeight": 0.22,
+    "rrfWeight": 0.08,
+    "changedPathBoost": 0.16,
+    "sameDirectoryBoost": 0.08,
+    "patternBoost": 0.03,
+    "symbolBoost": 0.02,
+    "chunkBoost": 0.03
+  },
   "statusChecks": { "name": "Grepiku Review", "required": false },
   "triggers": {
     "manualOnly": false,
@@ -109,3 +124,16 @@ npm run prisma:migrate
 npm run dev:server
 npm run dev:worker
 ```
+
+## Overnight Loop
+
+Run repeated manual review cycles with automatic retrieval tuning:
+
+```bash
+REVIEW_LOOP_REPO_FULL_NAME=owner/repo \
+REVIEW_LOOP_PR_NUMBER=123 \
+REVIEW_LOOP_MAX_CYCLES=40 \
+npm run start:review-loop
+```
+
+Cycle logs are written to `var/loop/*.jsonl`.

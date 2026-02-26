@@ -13,10 +13,59 @@ import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { embedText, embedTexts } from "./embeddings.js";
 import { loadEnv } from "../config/env.js";
+import { chunkTextForEmbedding } from "./chunking.js";
 
 const env = loadEnv();
 const MAX_INDEX_BYTES = 1_000_000;
 const MAX_PARSE_CHARS = 200_000;
+const CHUNK_MAX_CHARS = 1800;
+const CHUNK_OVERLAP_CHARS = 220;
+const CHUNK_MAX_PER_FILE = 20;
+
+const EXTRA_TEXT_EXTENSIONS = new Set([
+  ".json",
+  ".md",
+  ".markdown",
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".ini",
+  ".txt",
+  ".sql",
+  ".graphql",
+  ".gql",
+  ".proto",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".c",
+  ".h",
+  ".cpp",
+  ".hpp",
+  ".cc",
+  ".java",
+  ".kt",
+  ".kts",
+  ".swift",
+  ".rb",
+  ".php",
+  ".cs",
+  ".scala",
+  ".conf"
+]);
+
+const EXTRA_TEXT_BASENAMES = new Set([
+  "dockerfile",
+  "makefile",
+  "readme",
+  "readme.md",
+  "license",
+  "changelog",
+  ".env",
+  ".env.example",
+  "compose.yml",
+  "compose.yaml"
+]);
 
 type IndexJob = {
   provider?: "github";
@@ -48,6 +97,33 @@ function initParsers() {
 
 function hashContent(text: string): string {
   return crypto.createHash("sha1").update(text).digest("hex");
+}
+
+function shouldIndexAsText(params: { relativePath: string; raw: Buffer; languageKnown: boolean }): boolean {
+  const { relativePath, raw, languageKnown } = params;
+  if (languageKnown) return true;
+  const ext = path.extname(relativePath).toLowerCase();
+  const base = path.basename(relativePath).toLowerCase();
+  if (EXTRA_TEXT_EXTENSIONS.has(ext)) return true;
+  if (EXTRA_TEXT_BASENAMES.has(base)) return true;
+  if (relativePath.toLowerCase().endsWith(".d.ts")) return true;
+
+  const sample = raw.subarray(0, Math.min(raw.length, 4096));
+  if (sample.length === 0) return false;
+  let printable = 0;
+  for (const byte of sample) {
+    if (byte === 9 || byte === 10 || byte === 13 || (byte >= 32 && byte <= 126)) {
+      printable += 1;
+    }
+  }
+  return printable / sample.length >= 0.92;
+}
+
+function inferredLanguageName(relativePath: string, knownLanguage?: string): string {
+  if (knownLanguage) return knownLanguage;
+  const ext = path.extname(relativePath).toLowerCase();
+  if (!ext) return "text";
+  return ext.replace(/^\./, "") || "text";
 }
 
 
@@ -159,7 +235,7 @@ async function indexFile(params: {
   await prisma.symbol.deleteMany({ where: { fileId: fileRecord.id } });
   await prisma.embedding.deleteMany({ where: { fileId: fileRecord.id } });
 
-  const languageConfig = languageMap[path.extname(params.relativePath)];
+  const languageConfig = languageMap[path.extname(params.relativePath).toLowerCase()];
   let symbols: Array<{
     name: string;
     kind: string;
@@ -231,14 +307,42 @@ async function indexFile(params: {
     });
   }
 
-  const fileVector = await embedText(params.content);
+  const chunks = chunkTextForEmbedding({
+    content: params.content,
+    maxChars: CHUNK_MAX_CHARS,
+    overlapChars: CHUNK_OVERLAP_CHARS,
+    maxChunks: CHUNK_MAX_PER_FILE
+  });
+  if (chunks.length > 0) {
+    const chunkTexts = chunks.map((chunk) =>
+      `${params.relativePath}\nL${chunk.startLine}-${chunk.endLine}\n${chunk.text}`
+    );
+    const chunkVectors = await embedTexts(chunkTexts);
+    for (const [idx, chunk] of chunks.entries()) {
+      const text = chunkTexts[idx];
+      const vector = chunkVectors[idx];
+      if (!vector) continue;
+      await prisma.embedding.create({
+        data: {
+          repoId: params.repoId,
+          fileId: fileRecord.id,
+          kind: "chunk",
+          vector,
+          text: text.slice(0, 6000)
+        }
+      });
+    }
+  }
+
+  const fileEmbeddingText = `${params.relativePath}\n${params.content}`;
+  const fileVector = await embedText(fileEmbeddingText);
   await prisma.embedding.create({
     data: {
       repoId: params.repoId,
       fileId: fileRecord.id,
       kind: "file",
       vector: fileVector,
-      text: params.content.slice(0, 4000)
+      text: `${params.relativePath}\n${params.content.slice(0, 5000)}`
     }
   });
 }
@@ -323,20 +427,20 @@ export async function processIndexJob(job: IndexJob) {
     const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var", "internal_harness"]);
     const files = await walk(repoPath, ignoreDirs);
     for (const filePath of files) {
-      const ext = path.extname(filePath);
+      const relativePath = path.relative(repoPath, filePath);
+      const ext = path.extname(filePath).toLowerCase();
       const languageConfig = languageMap[ext];
-      if (!languageConfig) continue;
       const raw = await fs.readFile(filePath);
       if (raw.length > MAX_INDEX_BYTES) continue;
       if (raw.includes(0)) continue;
+      if (!shouldIndexAsText({ relativePath, raw, languageKnown: Boolean(languageConfig) })) continue;
       const content = raw.toString("utf8");
-      const relativePath = path.relative(repoPath, filePath);
       await indexFile({
         repoId: repo.id,
         filePath,
         relativePath,
         content,
-        language: languageConfig.name,
+        language: inferredLanguageName(relativePath, languageConfig?.name),
         force: Boolean(job.force),
         isPattern: Boolean(job.patternRepo)
       });

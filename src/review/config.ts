@@ -54,6 +54,18 @@ export type RepoConfig = {
     summaryOnly: boolean;
     destination: "comment" | "pr_body" | "both";
   };
+  retrieval: {
+    topK: number;
+    maxPerPath: number;
+    semanticWeight: number;
+    lexicalWeight: number;
+    rrfWeight: number;
+    changedPathBoost: number;
+    sameDirectoryBoost: number;
+    patternBoost: number;
+    symbolBoost: number;
+    chunkBoost: number;
+  };
   statusChecks: {
     name: string;
     required: boolean;
@@ -132,6 +144,31 @@ const GrepikuSchema = z.object({
       destination: z.enum(["comment", "pr_body", "both"]).default("both")
     })
     .default({ summaryOnly: false, destination: "both" }),
+  retrieval: z
+    .object({
+      topK: z.number().int().min(4).max(60).default(18),
+      maxPerPath: z.number().int().min(1).max(12).default(4),
+      semanticWeight: z.number().min(0).max(1).default(0.62),
+      lexicalWeight: z.number().min(0).max(1).default(0.22),
+      rrfWeight: z.number().min(0).max(1).default(0.08),
+      changedPathBoost: z.number().min(0).max(1).default(0.16),
+      sameDirectoryBoost: z.number().min(0).max(1).default(0.08),
+      patternBoost: z.number().min(0).max(1).default(0.03),
+      symbolBoost: z.number().min(0).max(1).default(0.02),
+      chunkBoost: z.number().min(0).max(1).default(0.03)
+    })
+    .default({
+      topK: 18,
+      maxPerPath: 4,
+      semanticWeight: 0.62,
+      lexicalWeight: 0.22,
+      rrfWeight: 0.08,
+      changedPathBoost: 0.16,
+      sameDirectoryBoost: 0.08,
+      patternBoost: 0.03,
+      symbolBoost: 0.02,
+      chunkBoost: 0.03
+    }),
   statusChecks: z
     .object({
       name: z.string().default("Grepiku Review"),
@@ -218,7 +255,8 @@ export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoCo
 
 export async function resolveRepoConfig(repoId: number, providerKind?: string): Promise<RepoConfig> {
   const existing = await prisma.repoConfig.findFirst({ where: { repoId } });
-  let config = existing?.configJson ? (existing.configJson as RepoConfig) : defaultConfig;
+  const parsed = GrepikuSchema.safeParse(existing?.configJson ?? {});
+  let config = parsed.success ? parsed.data : defaultConfig;
   const triggerSetting = await prisma.triggerSetting.findFirst({ where: { repoId } });
   if (triggerSetting?.configJson) {
     config = { ...config, triggers: triggerSetting.configJson as RepoConfig["triggers"] };

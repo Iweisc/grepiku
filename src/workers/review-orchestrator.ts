@@ -7,6 +7,10 @@ import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
 
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection in review worker", reason);
+});
+
 const worker = new Worker(
   reviewQueue.name,
   async (job) => {
@@ -18,7 +22,7 @@ const worker = new Worker(
   },
   {
     connection: redisConnection,
-    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 2)
+    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 1)
   }
 );
 

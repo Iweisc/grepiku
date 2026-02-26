@@ -54,6 +54,15 @@ async function buildLocalDiffPatch(params: {
   return stdout;
 }
 
+function normalizeReplyBody(body: string): string {
+  return body
+    .replace(/\r\n/g, "\n")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\+n/g, "\n")
+    .replace(/(^|[\s:;,.!?])\/n(?=\s*(?:\d+\.|[-*]|$))/gm, "$1\n")
+    .trim();
+}
+
 export async function processCommentReplyJob(data: CommentReplyJobData) {
   const { provider, installationId, repoId, pullRequestId, prNumber, commentId, commentBody, commentAuthor, commentUrl } =
     data;
@@ -101,7 +110,16 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   const contextPack = await buildContextPack({
     repoId: repo.id,
     diffPatch,
-    changedFiles: changedFiles as Array<{ filename?: string; path?: string }>
+    changedFiles: changedFiles as Array<{
+      filename?: string;
+      path?: string;
+      status?: string;
+      additions?: number;
+      deletions?: number;
+    }>,
+    prTitle: refreshed.title || pullRequest.title,
+    prBody: refreshed.body || pullRequest.body,
+    retrieval: repoConfig.retrieval
   });
 
   const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}
@@ -153,5 +171,5 @@ ${refreshed.body || pullRequest.body || "(no description)"}
 
   const reply = await readAndValidateJson(path.join(outDir, "reply.json"), ReplySchema);
 
-  await client.createSummaryComment(reply.body);
+  await client.createSummaryComment(normalizeReplyBody(reply.body));
 }

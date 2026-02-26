@@ -118,6 +118,7 @@ export type ProviderClient = {
   }) => Promise<ProviderReviewComment>;
   listInlineComments: () => Promise<ProviderReviewComment[]>;
   updateInlineComment: (commentId: string, body: string) => Promise<ProviderReviewComment>;
+  resolveInlineThread?: (commentId: string) => Promise<boolean>;
   createStatusCheck: (check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   updateStatusCheck: (checkId: string, check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   addReaction?: (commentId: string, reaction: string) => Promise<void>;

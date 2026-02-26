@@ -34,6 +34,10 @@ Rules:
 - Evidence is required for every comment (quote from diff/context).
 - Do not include evidence quotes in body; put them only in evidence.
 - Avoid formatting/style nits.
+- Prioritize correctness, security, performance regressions, API contract breaks, and missing tests.
+- Use context_pack.json (reviewFocus, hotspots, graphLinks, retrieved) to reason about cross-file impact.
+- Avoid duplicate findings: one comment per root cause.
+- Keep inline comments concentrated on highest-impact issues; avoid flooding a single file.
 - Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.
 - Blocking requires concrete evidence and a clear fix/suggested patch.
 - Cap inline comments at ${config.limits.max_inline_comments}.
@@ -41,6 +45,7 @@ Rules:
 - Use rules.json and scopes.json to scope findings and include rule_id + rule_reason where applicable.
 - Use context_pack.json to reason about cross-file changes.
 - Respect commentTypes/output/strictness from bot_config.json (summary-only means no inline comments).
+- Set confidence explicitly for every comment; low-confidence issues should usually be summary or omitted.
 
 Output requirements:
 - Write JSON to ${outPath(paths, "draft_review.json")} with this schema:
@@ -98,6 +103,8 @@ Rules to enforce:
 - Blocking requires clear fix/suggested patch.
 - Inline comments must include a suggested_patch or be converted to summary comments.
 - Drop weak, speculative, or style-only comments.
+- Remove duplicate or overlapping comments that point to the same root cause.
+- Keep strongest findings first and trim lower-value repeats in the same file.
 - Ensure comment_type matches rules and config.
 - Preserve rule_id and rule_reason when applicable.
 
