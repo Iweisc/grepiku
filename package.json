@@ -10,6 +10,7 @@
     "dev:indexer": "tsx watch src/workers/indexer.ts",
     "dev:graph": "tsx watch src/workers/graph-builder.ts",
     "dev:analytics": "tsx watch src/workers/analytics-ingest.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json",
     "test": "node --import tsx --test test/**/*.test.ts",
     "start:server": "node dist/server.js",

@@ -1,0 +1,16 @@
+{
+  "tools": {
+    "lint": {
+      "cmd": "npm run lint",
+      "timeout_sec": 900
+    },
+    "build": {
+      "cmd": "npm run build",
+      "timeout_sec": 1200
+    },
+    "test": {
+      "cmd": "npm test",
+      "timeout_sec": 1800
+    }
+  }
+}
