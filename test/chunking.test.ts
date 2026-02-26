@@ -33,3 +33,18 @@ test("chunkTextForEmbedding returns one chunk for short content", () => {
   assert.equal(chunks[0].endLine, 3);
   assert.equal(chunks[0].text, content);
 });
+
+test("chunkTextForEmbedding preserves all content for long single-line input", () => {
+  const content = "x".repeat(1200);
+  const chunks = chunkTextForEmbedding({
+    content,
+    maxChars: 240,
+    overlapChars: 40,
+    maxChunks: 20
+  });
+
+  assert.ok(chunks.length > 1);
+  const merged = chunks.map((chunk) => chunk.text).join("");
+  assert.ok(merged.includes(content.slice(0, 600)));
+  assert.ok(merged.includes(content.slice(600)));
+});

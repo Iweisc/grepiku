@@ -7,6 +7,7 @@ GitHub PR review bot powered by Codex.
 - Inline review comments on PR diffs plus a summary
 - Tracks findings across pushes and marks them as new, still open, or fixed
 - Re-runs on new commits and on `/review` comments
+- Mention workflow: `@grepiku` answers questions, and `@grepiku do: ...` applies code changes and opens a follow-up PR
 - 3-stage pipeline: reviewer, editor, execution verifier
 - Hybrid context retrieval (semantic + lexical + RRF + changed-path boosts) with graph-aware related files
 - Full-repo embeddings with file, symbol, and chunk vectors for deeper codebase context
@@ -104,6 +105,7 @@ If missing, defaults are used and tools are marked as skipped.
 
 - Each run writes artifacts under `var/runs/<runId>`.
 - Worker executes `codex-exec` directly and injects MCP roots for repo/bundle/out paths.
+- Review and mention pipelines are local-first: diff/changed-file context is computed from local git checkout by default, with GitHub API as fallback.
 - Tool runs are cached in Postgres per (review run, tool).
 
 ## Endpoints

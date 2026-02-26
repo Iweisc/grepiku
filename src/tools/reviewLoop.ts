@@ -144,6 +144,7 @@ async function resolveTarget(params: {
 async function waitForRunCompletion(params: {
   pullRequestId: number;
   headSha: string;
+  trigger: string;
   cycleStartedAt: Date;
   pollMs: number;
   timeoutMs: number;
@@ -155,12 +156,14 @@ async function waitForRunCompletion(params: {
     const run = await prisma.reviewRun.findFirst({
       where: {
         pullRequestId: params.pullRequestId,
-        headSha: params.headSha
+        headSha: params.headSha,
+        trigger: params.trigger,
+        startedAt: { gte: threshold }
       },
       orderBy: { createdAt: "desc" }
     });
 
-    if (run && run.startedAt && run.startedAt >= threshold && (run.status === "completed" || run.status === "failed")) {
+    if (run && (run.status === "completed" || run.status === "failed")) {
       return run;
     }
     await sleep(params.pollMs);
@@ -300,6 +303,7 @@ async function main() {
       throw new Error("review-loop: no installation id available for enqueueing review jobs");
     }
 
+    const triggerTag = `manual-loop:${cycleStartedAt.getTime()}`;
     console.log(`[review-loop] cycle=${cycle} enqueue /review for sha=${pr.headSha}`);
     await enqueueReviewJob({
       provider: "github",
@@ -308,13 +312,14 @@ async function main() {
       pullRequestId: pr.id,
       prNumber: pr.number,
       headSha: pr.headSha,
-      trigger: "manual-loop",
+      trigger: triggerTag,
       force: true
     });
 
     const run = await waitForRunCompletion({
       pullRequestId: pr.id,
       headSha: pr.headSha,
+      trigger: triggerTag,
       cycleStartedAt,
       pollMs,
       timeoutMs
