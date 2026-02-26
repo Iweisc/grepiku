@@ -74,6 +74,7 @@ function mapComment(payload: any): ProviderReviewComment {
     path: comment.path || null,
     line: comment.line ?? null,
     side: comment.side || null,
+    inReplyToId: comment.in_reply_to_id ? String(comment.in_reply_to_id) : null,
     createdAt: comment.created_at || null
   };
 }
@@ -466,12 +467,45 @@ function createClient(params: {
       return { ...check, id: String(updated.data.id) };
     },
     addReaction: async (commentId: string, reaction: string) => {
-      await octokit.reactions.createForIssueComment({
-        owner,
-        repo,
-        comment_id: Number(commentId),
-        content: reaction as any
-      });
+      const normalizedCommentId = Number(commentId);
+      try {
+        await octokit.reactions.createForIssueComment({
+          owner,
+          repo,
+          comment_id: normalizedCommentId,
+          content: reaction as any
+        });
+        return;
+      } catch {
+        await octokit.reactions.createForPullRequestReviewComment({
+          owner,
+          repo,
+          comment_id: normalizedCommentId,
+          content: reaction as any
+        });
+      }
+    },
+    replyToComment: async ({ commentId, body }: { commentId: string; body: string }) => {
+      const normalizedBody = normalizePostedBody(body);
+      const created = await octokit.request(
+        "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies",
+        {
+          owner,
+          repo,
+          pull_number: params.pullRequest.number,
+          comment_id: Number(commentId),
+          body: normalizedBody
+        }
+      );
+      return {
+        id: String(created.data.id),
+        body: created.data.body || normalizedBody,
+        url: created.data.html_url || null,
+        path: created.data.path || null,
+        line: created.data.line || null,
+        side: created.data.side || null,
+        inReplyToId: created.data.in_reply_to_id ? String(created.data.in_reply_to_id) : null
+      };
     },
     createPullRequest: async ({ title, body, head, base, draft }) => {
       const created = await octokit.pulls.create({

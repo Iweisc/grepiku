@@ -5,6 +5,7 @@ import { ProviderWebhookEvent } from "./types.js";
 import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "../review/triggers.js";
 import { getProviderAdapter } from "./registry.js";
 import { resolveGithubBotLogin } from "./github/adapter.js";
+import { rememberRepoInstruction } from "../services/repoMemory.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -15,6 +16,11 @@ function isSuggestionCommitMessage(message: string): boolean {
     normalized.includes("apply suggestions from code review") ||
     normalized.includes("suggestions from code review")
   );
+}
+
+function isResolutionReply(body: string): boolean {
+  const normalized = body.toLowerCase();
+  return normalized.includes("fixed") || normalized.includes("resolved") || normalized.includes("done");
 }
 
 async function isSuggestionCommit(params: {
@@ -37,6 +43,23 @@ async function isSuggestionCommit(params: {
   } catch {
     return false;
   }
+}
+
+async function resolveTargetReviewComment(params: {
+  pullRequestId: number;
+  providerCommentId: string;
+  inReplyToId?: string | null;
+}) {
+  const direct = await prisma.reviewComment.findFirst({
+    where: { pullRequestId: params.pullRequestId, providerCommentId: params.providerCommentId },
+    include: { finding: true }
+  });
+  if (direct) return direct;
+  if (!params.inReplyToId) return null;
+  return prisma.reviewComment.findFirst({
+    where: { pullRequestId: params.pullRequestId, providerCommentId: params.inReplyToId },
+    include: { finding: true }
+  });
 }
 
 export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<void> {
@@ -150,17 +173,17 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       where: { pullRequestId: pullRequest.id },
       orderBy: { createdAt: "desc" }
     });
+    const providerCommentId = event.comment.id;
+    const targetComment = await resolveTargetReviewComment({
+      pullRequestId: pullRequest.id,
+      providerCommentId,
+      inReplyToId: event.comment.inReplyToId
+    });
+
     if (latestRun) {
-      const providerCommentId = event.comment.id;
-      const reviewComment = await prisma.reviewComment.findFirst({
-        where: { pullRequestId: pullRequest.id, providerCommentId },
-        include: { finding: true }
-      });
-      const canonicalCommentId = reviewComment?.finding?.commentId || providerCommentId;
-      const normalized = commentBody.toLowerCase();
-      const action = normalized.includes("fixed") || normalized.includes("resolved") || normalized.includes("done")
-        ? "resolved"
-        : null;
+      const canonicalCommentId =
+        targetComment?.finding?.commentId || event.comment.inReplyToId || providerCommentId;
+      const action = isResolutionReply(commentBody) ? "resolved" : null;
       await prisma.feedback.create({
         data: {
           reviewRunId: latestRun.id,
@@ -175,9 +198,20 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         }
       });
     }
-    if (!commentTrigger) return;
 
-    if (installation.externalId) {
+    const shouldAttemptMemory = Boolean(targetComment) || commentTrigger === "mention";
+    if (shouldAttemptMemory) {
+      await rememberRepoInstruction({
+        repoId: repo.id,
+        commentBody,
+        author: event.author.login,
+        commentId: providerCommentId,
+        commentUrl: event.comment.url || null
+      }).catch(() => undefined);
+    }
+
+    const shouldAcknowledge = Boolean(commentTrigger) || Boolean(targetComment);
+    if (installation.externalId && shouldAcknowledge) {
       try {
         const adapter = getProviderAdapter(event.provider);
         const client = await adapter.createClient({
@@ -193,7 +227,17 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       }
     }
 
-    if (commentTrigger === "mention") {
+    const shouldReply =
+      commentTrigger === "mention" ||
+      (Boolean(targetComment) && !isResolutionReply(commentBody) && commentBody.trim().length > 0);
+    if (shouldReply) {
+      const replyInThread =
+        Boolean(event.comment.path) ||
+        Boolean(event.comment.inReplyToId) ||
+        targetComment?.kind === "inline";
+      console.log(
+        `[comment ${providerCommentId}] enqueue mention reply (trigger=${commentTrigger || "thread-reply"} target=${targetComment?.providerCommentId || "none"} thread=${replyInThread ? "yes" : "no"})`
+      );
       await enqueueCommentReplyJob({
         provider: event.provider,
         installationId: installation.externalId,
@@ -203,9 +247,12 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         commentId: event.comment.id,
         commentBody,
         commentAuthor: event.author.login,
-        commentUrl: event.comment.url
+        commentUrl: event.comment.url,
+        replyInThread
       });
     }
+
+    if (!commentTrigger) return;
 
     if (commentTrigger === "review") {
       await enqueueReviewJob({
@@ -230,11 +277,13 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
     });
     if (latestRun) {
       const providerCommentId = event.comment.id;
-      const reviewComment = await prisma.reviewComment.findFirst({
-        where: { pullRequestId: pullRequest.id, providerCommentId },
-        include: { finding: true }
+      const reviewComment = await resolveTargetReviewComment({
+        pullRequestId: pullRequest.id,
+        providerCommentId,
+        inReplyToId: event.comment.inReplyToId
       });
-      const canonicalCommentId = reviewComment?.finding?.commentId || providerCommentId;
+      const canonicalCommentId =
+        reviewComment?.finding?.commentId || event.comment.inReplyToId || providerCommentId;
       await prisma.feedback.create({
         data: {
           reviewRunId: latestRun.id,

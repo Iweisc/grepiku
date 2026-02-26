@@ -35,6 +35,7 @@ import { buildContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 import { refineReviewComments } from "./quality.js";
 import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
+import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
 
 const env = loadEnv();
 
@@ -761,8 +762,13 @@ export async function processReviewJob(data: ReviewJobData) {
     const incrementalReview = Boolean(incrementalFrom) && !data.force && trigger !== "manual";
     const fullRepoStaticAudit = !latestCompletedRun;
 
-    const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
-    await saveRepoConfig(repo.id, repoConfig, warnings);
+    const { config: fileRepoConfig, warnings } = await loadRepoConfig(repoPath);
+    await saveRepoConfig(repo.id, fileRepoConfig, warnings);
+    const memoryRules = await loadAcceptedRepoMemoryRules(repo.id);
+    const repoConfig =
+      memoryRules.length > 0
+        ? { ...fileRepoConfig, rules: mergeRulesWithRepoMemory(fileRepoConfig.rules, memoryRules) }
+        : fileRepoConfig;
     const resolvedConfig = resolveRules(repoConfig, {
       orgDefaults: (installation?.configJson as any) || undefined,
       uiRules: rulesOverride?.rules || [],

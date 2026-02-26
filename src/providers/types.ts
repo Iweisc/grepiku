@@ -49,6 +49,7 @@ export type ProviderReviewComment = {
   path?: string | null;
   line?: number | null;
   side?: string | null;
+  inReplyToId?: string | null;
   createdAt?: string | null;
 };
 
@@ -122,6 +123,7 @@ export type ProviderClient = {
   createStatusCheck: (check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   updateStatusCheck: (checkId: string, check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   addReaction?: (commentId: string, reaction: string) => Promise<void>;
+  replyToComment?: (params: { commentId: string; body: string }) => Promise<ProviderReviewComment>;
   createPullRequest?: (params: {
     title: string;
     body: string;

@@ -30,13 +30,17 @@ GitHub PR review bot powered by Codex.
 
 1) Create a GitHub App
 - Permissions (minimum):
-  - Pull requests: read
+  - Pull requests: read & write
   - Issues: read & write
   - Reactions: write
   - Contents: read
   - Checks: read
 - Subscribe to webhook events:
   - `pull_request`, `issue_comment`, `pull_request_review_comment`, `reaction`
+
+Important:
+- `pull_request_review_comment` is required for replies on inline review threads.
+- After changing webhook subscriptions or permissions, re-install/update the GitHub App on the target repo/org so changes take effect.
 
 2) Configure environment
 

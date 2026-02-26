@@ -3,6 +3,7 @@ import path from "path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { prisma } from "../db/client.js";
+import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
 
 export type ToolConfig = {
   cmd: string;
@@ -260,6 +261,13 @@ export async function resolveRepoConfig(repoId: number, providerKind?: string): 
   const triggerSetting = await prisma.triggerSetting.findFirst({ where: { repoId } });
   if (triggerSetting?.configJson) {
     config = { ...config, triggers: triggerSetting.configJson as RepoConfig["triggers"] };
+  }
+  const memoryRules = await loadAcceptedRepoMemoryRules(repoId);
+  if (memoryRules.length > 0) {
+    config = {
+      ...config,
+      rules: mergeRulesWithRepoMemory(config.rules, memoryRules)
+    };
   }
   return config;
 }
