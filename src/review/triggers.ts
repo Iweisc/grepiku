@@ -8,6 +8,7 @@ export type RulesOverride = {
   strictness?: RepoConfig["strictness"];
   commentTypes?: RepoConfig["commentTypes"];
   output?: RepoConfig["output"];
+  retrieval?: RepoConfig["retrieval"];
   triggers?: RepoConfig["triggers"];
 };
 
@@ -29,6 +30,7 @@ export function resolveRules(config: RepoConfig, overrides?: RulesOverride | nul
     strictness: overrides?.strictness || config.strictness,
     commentTypes: overrides?.commentTypes || config.commentTypes,
     output: overrides?.output || config.output,
+    retrieval: overrides?.retrieval || config.retrieval,
     triggers: overrides?.triggers || config.triggers
   };
   return merged;
@@ -51,6 +53,10 @@ function containsAny(text: string, keywords: string[]): boolean {
 
 export type CommentTrigger = "review" | "mention";
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function detectCommentTrigger(text: string, config: RepoConfig): CommentTrigger | null {
   if (!text) return null;
   const lower = text.toLowerCase();
@@ -63,6 +69,22 @@ export function detectCommentTrigger(text: string, config: RepoConfig): CommentT
   }
   if (mentionTokens.some((token) => lower.includes(token.toLowerCase()))) {
     return "mention";
+  }
+  return null;
+}
+
+export function extractMentionDoTask(text: string, config: RepoConfig): string | null {
+  if (!text) return null;
+  const tokens = config.triggers.commentTriggers || [];
+  const mentionTokens = tokens.filter((token) => !token.trim().startsWith("/"));
+  for (const rawToken of mentionTokens) {
+    const token = rawToken.trim();
+    if (!token) continue;
+    const pattern = new RegExp(`${escapeRegExp(token)}\\s*[,:-]?\\s*do\\s*:\\s*([\\s\\S]+)$`, "i");
+    const match = text.match(pattern);
+    if (!match) continue;
+    const task = (match[1] || "").trim();
+    if (task.length > 0) return task;
   }
   return null;
 }

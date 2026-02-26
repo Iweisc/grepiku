@@ -58,7 +58,7 @@ export const VerdictsSchema = z.object({
   )
 });
 
-const ToolResultSchema = z.object({
+export const ToolResultSchema = z.object({
   status: z.enum(["pass", "fail", "timeout", "skipped", "error"]),
   summary: z.string(),
   top_errors: z.array(z.string())
@@ -77,8 +77,27 @@ export const ReplySchema = z.object({
   body: z.string().min(1)
 });
 
+export const MentionActionSchema = z.object({
+  action: z.enum(["changed", "no_changes", "cannot_complete"]),
+  summary: z.string().min(1),
+  reply: z.string().min(1),
+  commit_message: z.string().optional(),
+  pr_title: z.string().optional(),
+  pr_body: z.string().optional()
+});
+
+export const MentionChecksSchema = z.object({
+  checks: z.object({
+    lint: ToolResultSchema,
+    build: ToolResultSchema,
+    test: ToolResultSchema
+  })
+});
+
 export type ReviewOutput = z.infer<typeof ReviewSchema>;
 export type ReviewComment = z.infer<typeof ReviewCommentSchema>;
 export type VerdictsOutput = z.infer<typeof VerdictsSchema>;
 export type ChecksOutput = z.infer<typeof ChecksSchema>;
 export type ReplyOutput = z.infer<typeof ReplySchema>;
+export type MentionActionOutput = z.infer<typeof MentionActionSchema>;
+export type MentionChecksOutput = z.infer<typeof MentionChecksSchema>;

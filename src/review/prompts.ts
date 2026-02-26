@@ -34,6 +34,10 @@ Rules:
 - Evidence is required for every comment (quote from diff/context).
 - Do not include evidence quotes in body; put them only in evidence.
 - Avoid formatting/style nits.
+- Prioritize correctness, security, performance regressions, API contract breaks, and missing tests.
+- Use context_pack.json (reviewFocus, hotspots, graphLinks, retrieved) to reason about cross-file impact.
+- Avoid duplicate findings: one comment per root cause.
+- Keep inline comments concentrated on highest-impact issues; avoid flooding a single file.
 - Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.
 - Blocking requires concrete evidence and a clear fix/suggested patch.
 - Cap inline comments at ${config.limits.max_inline_comments}.
@@ -41,6 +45,7 @@ Rules:
 - Use rules.json and scopes.json to scope findings and include rule_id + rule_reason where applicable.
 - Use context_pack.json to reason about cross-file changes.
 - Respect commentTypes/output/strictness from bot_config.json (summary-only means no inline comments).
+- Set confidence explicitly for every comment; low-confidence issues should usually be summary or omitted.
 
 Output requirements:
 - Write JSON to ${outPath(paths, "draft_review.json")} with this schema:
@@ -98,6 +103,8 @@ Rules to enforce:
 - Blocking requires clear fix/suggested patch.
 - Inline comments must include a suggested_patch or be converted to summary comments.
 - Drop weak, speculative, or style-only comments.
+- Remove duplicate or overlapping comments that point to the same root cause.
+- Keep strongest findings first and trim lower-value repeats in the same file.
 - Ensure comment_type matches rules and config.
 - Preserve rule_id and rule_reason when applicable.
 
@@ -179,4 +186,79 @@ Output requirements:
 - The body should mention @${commentAuthor} once at the start and be under 10 lines.
 
 Do not print anything else. Ensure the JSON is valid.`;
+}
+
+export function buildMentionImplementPrompt(params: {
+  commentBody: string;
+  commentAuthor: string;
+  commentUrl?: string;
+  task: string;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+}): string {
+  const { commentBody, commentAuthor, commentUrl, task, repoPath, bundleDir, outDir } = params;
+  return `You are Grepiku, a coding agent working on a pull-request follow-up task.
+
+Implement the requested change directly in the repository checkout.
+Requested task:
+${task}
+
+Source context:
+- ${bundleDir}/pr.md
+- ${bundleDir}/diff.patch
+- ${bundleDir}/changed_files.json
+- ${bundleDir}/context_pack.json
+- Repo checkout: ${repoPath} (writable)
+
+Rules:
+- Make the smallest correct set of code changes needed for the request.
+- If the request is unclear, unsafe, or not feasible, do not guess.
+- Do not run git commit, git push, or open PRs yourself.
+- Keep edits in the repository checkout only.
+
+Comment author: ${commentAuthor}
+Comment URL: ${commentUrl || "unknown"}
+Original comment body:
+${commentBody}
+
+Output requirements:
+- Write JSON to ${outDir}/mention_action.json with this schema:
+{
+  "action": "changed|no_changes|cannot_complete",
+  "summary": "string",
+  "reply": "string",
+  "commit_message": "string (optional)",
+  "pr_title": "string (optional)",
+  "pr_body": "string (optional)"
+}
+- reply must start with @${commentAuthor}.
+- If no code changes were needed, set action=no_changes.
+- If blocked or unclear, set action=cannot_complete and explain briefly in reply.
+
+Do not print anything else. Ensure the JSON is valid.`;
+}
+
+export function buildMentionVerifyPrompt(params: {
+  repoPath: string;
+  outDir: string;
+}): string {
+  const { repoPath, outDir } = params;
+  return `You are the verifier for mention-requested code changes.
+You can call these tools: lint, build, test.
+Each tool can be called at most once; repeated calls return cached results.
+
+Run only relevant tools. If a tool is not configured in repo config, it will be marked skipped.
+Repo checkout: ${repoPath}
+
+Write ${outDir}/mention_checks.json with this schema:
+{
+  "checks": {
+    "lint": { "status": "pass|fail|timeout|skipped|error", "summary": "string", "top_errors": ["string"] },
+    "build": { "status": "pass|fail|timeout|skipped|error", "summary": "string", "top_errors": ["string"] },
+    "test": { "status": "pass|fail|timeout|skipped|error", "summary": "string", "top_errors": ["string"] }
+  }
+}
+
+Do not print anything else. Ensure valid JSON.`;
 }

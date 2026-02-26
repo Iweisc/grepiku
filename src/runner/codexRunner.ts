@@ -4,7 +4,7 @@ import { fileURLToPath } from "url";
 import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
 
-export type CodexStage = "reviewer" | "editor" | "verifier";
+export type CodexStage = "reviewer" | "editor" | "verifier" | "mention";
 
 export type CodexRunParams = {
   stage: CodexStage;
@@ -40,10 +40,15 @@ const STAGE_ENV_ALLOWLIST = [
 ] as const;
 
 function systemPrompt(stage: CodexStage, roots: string[]): string {
-  const toolNote =
-    stage === "verifier"
-      ? "Tools available: readonly, verifier."
-      : "Tools available: readonly, retrieval.";
+  const toolNote = (() => {
+    if (stage === "verifier") return "Tools available: readonly, verifier.";
+    if (stage === "mention") return "Tools available: readonly, retrieval, shell, apply_patch.";
+    return "Tools available: readonly, retrieval.";
+  })();
+  const writeInstruction =
+    stage === "mention"
+      ? "You may modify files under the repo root and write required outputs to the output root."
+      : `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt.`;
   const allowedRoots = roots.join(", ");
   return [
     "SYSTEM: You are a code-review agent running inside a sandboxed repo checkout.",
@@ -53,7 +58,7 @@ function systemPrompt(stage: CodexStage, roots: string[]): string {
     "Never access paths outside allowed roots.",
     "If a tool call fails due to ENOENT or bad path, correct the path and retry.",
     "Never fabricate file contents. Use tools to read files.",
-    `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt.`
+    writeInstruction
   ].join("\n");
 }
 
@@ -118,26 +123,32 @@ function mcpServerBlock(
   return lines.join("\n");
 }
 
-function configForStage(stage: CodexStage, params: CodexRunParams): string {
-  const base = [
+function baseConfig(params?: { shellTool?: boolean; applyPatchFreeform?: boolean }): string {
+  const shellTool = params?.shellTool === true;
+  const applyPatchFreeform = params?.applyPatchFreeform === true;
+  return [
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
     `model_reasoning_effort = "high"`,
     "",
     "[features]",
-    "shell_tool = false",
-    "apply_patch_freeform = false",
+    `shell_tool = ${shellTool ? "true" : "false"}`,
+    `apply_patch_freeform = ${applyPatchFreeform ? "true" : "false"}`,
     "web_search_request = false",
     "web_search_cached = false",
     ""
   ].join("\n");
+}
+
+function configForStage(stage: CodexStage, params: CodexRunParams): string {
   const readonlyEnv = {
     WORK_REPO_ROOT: params.repoPath,
     WORK_BUNDLE_ROOT: params.bundleDir,
     WORK_OUT_ROOT: params.outDir
   };
   if (stage === "reviewer") {
+    const base = baseConfig();
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -149,6 +160,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "editor") {
+    const base = baseConfig();
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -160,6 +172,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "verifier") {
+    const base = baseConfig();
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -171,7 +184,19 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
       })
     );
   }
-  return base;
+  if (stage === "mention") {
+    const base = baseConfig({ shellTool: true, applyPatchFreeform: true });
+    return (
+      `${base}\n` +
+      mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
+      mcpServerBlock("retrieval", "retrieval_mcp.js", {
+        INTERNAL_API_URL: env.internalApiUrl,
+        INTERNAL_API_KEY: env.internalApiKey,
+        REVIEW_REPO_ID: String(params.repoId)
+      })
+    );
+  }
+  return baseConfig();
 }
 
 function baseStageEnv(): NodeJS.ProcessEnv {
@@ -186,6 +211,7 @@ function baseStageEnv(): NodeJS.ProcessEnv {
 }
 
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
+  const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}]`;
   const codexExecPath = await resolveCodexExecPath();
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
@@ -232,11 +258,21 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     (value): value is string => Boolean(value)
   );
   const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
-
-  await execa(codexExecPath, codexArgs, {
-    input: fullPrompt,
-    stdio: ["pipe", "ignore", "inherit"],
-    cwd: params.outDir,
-    env: stageEnv
-  });
+  const startedAt = Date.now();
+  console.log(`${stageTag} starting`);
+  try {
+    await execa(codexExecPath, codexArgs, {
+      input: fullPrompt,
+      stdio: ["pipe", "ignore", "inherit"],
+      cwd: params.outDir,
+      env: stageEnv,
+      timeout: env.codexStageTimeoutMs,
+      killSignal: "SIGTERM",
+      forceKillAfterDelay: 10_000
+    });
+    console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
+  } catch (err) {
+    console.error(`${stageTag} failed in ${Date.now() - startedAt}ms`, err);
+    throw err;
+  }
 }

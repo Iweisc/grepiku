@@ -193,17 +193,19 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       }
     }
 
-    await enqueueCommentReplyJob({
-      provider: event.provider,
-      installationId: installation.externalId,
-      repoId: repo.id,
-      pullRequestId: pullRequest.id,
-      prNumber: event.pullRequest.number,
-      commentId: event.comment.id,
-      commentBody,
-      commentAuthor: event.author.login,
-      commentUrl: event.comment.url
-    });
+    if (commentTrigger === "mention") {
+      await enqueueCommentReplyJob({
+        provider: event.provider,
+        installationId: installation.externalId,
+        repoId: repo.id,
+        pullRequestId: pullRequest.id,
+        prNumber: event.pullRequest.number,
+        commentId: event.comment.id,
+        commentBody,
+        commentAuthor: event.author.login,
+        commentUrl: event.comment.url
+      });
+    }
 
     if (commentTrigger === "review") {
       await enqueueReviewJob({

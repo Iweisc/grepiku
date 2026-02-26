@@ -19,6 +19,7 @@ const EnvSchema = z.object({
   OPENAI_EMBEDDINGS_BATCH_SIZE: z.string().default("16"),
   OPENAI_TIMEOUT_MS: z.string().default("120000"),
   OPENAI_MAX_RETRIES: z.string().default("3"),
+  CODEX_STAGE_TIMEOUT_MS: z.string().default("900000"),
   PROJECT_ROOT: z.string().min(1),
   CODEX_EXEC_PATH: z.string().default(""),
   INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
@@ -43,6 +44,7 @@ export type Env = {
   openaiEmbeddingsBatchSize: number;
   openaiTimeoutMs: number;
   openaiMaxRetries: number;
+  codexStageTimeoutMs: number;
   projectRoot: string;
   codexExecPath: string;
   internalApiUrl: string;
@@ -65,6 +67,11 @@ export function loadEnv(): Env {
     Number.isFinite(embeddingsMaxCharsRaw) && embeddingsMaxCharsRaw > 0
       ? Math.floor(embeddingsMaxCharsRaw)
       : 12000;
+  const codexStageTimeoutRaw = Number(parsed.CODEX_STAGE_TIMEOUT_MS);
+  const codexStageTimeoutMs =
+    Number.isFinite(codexStageTimeoutRaw) && codexStageTimeoutRaw > 0
+      ? Math.floor(codexStageTimeoutRaw)
+      : 900000;
   const codexExecPath = parsed.CODEX_EXEC_PATH.trim();
   cached = {
     port: Number(parsed.PORT),
@@ -86,6 +93,7 @@ export function loadEnv(): Env {
     openaiEmbeddingsBatchSize: embeddingsBatchSize,
     openaiTimeoutMs: Number(parsed.OPENAI_TIMEOUT_MS),
     openaiMaxRetries: Number(parsed.OPENAI_MAX_RETRIES),
+    codexStageTimeoutMs,
     projectRoot: parsed.PROJECT_ROOT,
     codexExecPath:
       codexExecPath.length > 0
