@@ -187,3 +187,78 @@ Output requirements:
 
 Do not print anything else. Ensure the JSON is valid.`;
 }
+
+export function buildMentionImplementPrompt(params: {
+  commentBody: string;
+  commentAuthor: string;
+  commentUrl?: string;
+  task: string;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+}): string {
+  const { commentBody, commentAuthor, commentUrl, task, repoPath, bundleDir, outDir } = params;
+  return `You are Grepiku, a coding agent working on a pull-request follow-up task.
+
+Implement the requested change directly in the repository checkout.
+Requested task:
+${task}
+
+Source context:
+- ${bundleDir}/pr.md
+- ${bundleDir}/diff.patch
+- ${bundleDir}/changed_files.json
+- ${bundleDir}/context_pack.json
+- Repo checkout: ${repoPath} (writable)
+
+Rules:
+- Make the smallest correct set of code changes needed for the request.
+- If the request is unclear, unsafe, or not feasible, do not guess.
+- Do not run git commit, git push, or open PRs yourself.
+- Keep edits in the repository checkout only.
+
+Comment author: ${commentAuthor}
+Comment URL: ${commentUrl || "unknown"}
+Original comment body:
+${commentBody}
+
+Output requirements:
+- Write JSON to ${outDir}/mention_action.json with this schema:
+{
+  "action": "changed|no_changes|cannot_complete",
+  "summary": "string",
+  "reply": "string",
+  "commit_message": "string (optional)",
+  "pr_title": "string (optional)",
+  "pr_body": "string (optional)"
+}
+- reply must start with @${commentAuthor}.
+- If no code changes were needed, set action=no_changes.
+- If blocked or unclear, set action=cannot_complete and explain briefly in reply.
+
+Do not print anything else. Ensure the JSON is valid.`;
+}
+
+export function buildMentionVerifyPrompt(params: {
+  repoPath: string;
+  outDir: string;
+}): string {
+  const { repoPath, outDir } = params;
+  return `You are the verifier for mention-requested code changes.
+You can call these tools: lint, build, test.
+Each tool can be called at most once; repeated calls return cached results.
+
+Run only relevant tools. If a tool is not configured in repo config, it will be marked skipped.
+Repo checkout: ${repoPath}
+
+Write ${outDir}/mention_checks.json with this schema:
+{
+  "checks": {
+    "lint": { "status": "pass|fail|timeout|skipped|error", "summary": "string", "top_errors": ["string"] },
+    "build": { "status": "pass|fail|timeout|skipped|error", "summary": "string", "top_errors": ["string"] },
+    "test": { "status": "pass|fail|timeout|skipped|error", "summary": "string", "top_errors": ["string"] }
+  }
+}
+
+Do not print anything else. Ensure valid JSON.`;
+}

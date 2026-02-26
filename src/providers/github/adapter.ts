@@ -472,6 +472,31 @@ function createClient(params: {
         comment_id: Number(commentId),
         content: reaction as any
       });
+    },
+    createPullRequest: async ({ title, body, head, base, draft }) => {
+      const created = await octokit.pulls.create({
+        owner,
+        repo,
+        title,
+        body,
+        head,
+        base,
+        draft: Boolean(draft)
+      });
+      return mapPullRequest({ pull_request: created.data });
+    },
+    findOpenPullRequestByHead: async ({ head, base }) => {
+      const listed = await octokit.pulls.list({
+        owner,
+        repo,
+        state: "open",
+        head: `${owner}:${head}`,
+        base: base || undefined,
+        per_page: 100
+      });
+      const first = listed.data[0];
+      if (!first) return null;
+      return mapPullRequest({ pull_request: first });
     }
   };
 }

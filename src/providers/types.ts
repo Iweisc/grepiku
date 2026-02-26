@@ -122,6 +122,14 @@ export type ProviderClient = {
   createStatusCheck: (check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   updateStatusCheck: (checkId: string, check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   addReaction?: (commentId: string, reaction: string) => Promise<void>;
+  createPullRequest?: (params: {
+    title: string;
+    body: string;
+    head: string;
+    base: string;
+    draft?: boolean;
+  }) => Promise<ProviderPullRequest>;
+  findOpenPullRequestByHead?: (params: { head: string; base?: string }) => Promise<ProviderPullRequest | null>;
 };
 
 export type ProviderAdapter = {
