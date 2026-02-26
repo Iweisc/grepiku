@@ -26,6 +26,7 @@ import {
   normalizePath
 } from "./diff.js";
 import { fingerprintForComment, matchKeyForComment } from "./findings.js";
+import { selectSemanticFindingCandidate } from "./findingMatch.js";
 import { ReviewOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
@@ -102,6 +103,17 @@ function filterAndNormalizeComments(
     }
   }
   return { inline, summary };
+}
+
+function normalizeFindingTitle(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function semanticFindingKey(pathValue: string, category: string, title: string): string {
+  return `${normalizePath(pathValue)}|${category}|${normalizeFindingTitle(title)}`;
 }
 
 function buildFeedbackHint(policy: FeedbackPolicy): string {
@@ -196,6 +208,10 @@ function renderStatusComment(params: {
   newFindings: Array<{ title: string; url?: string }>;
   openFindings: Array<{ title: string; url?: string }>;
   fixedFindings: Array<{ title: string }>;
+  run?: {
+    id: number;
+    headSha: string;
+  };
   checks: {
     lint: { status: string; summary: string; top_errors: string[] };
     build: { status: string; summary: string; top_errors: string[] };
@@ -225,6 +241,7 @@ function renderStatusComment(params: {
     `**Overview:** ${summary.overview}`,
     `**Risk:** ${summary.risk}`,
     summary.confidence !== undefined ? `**Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : "",
+    params.run ? `**Run:** #${params.run.id} (\`${params.run.headSha.slice(0, 12)}\`)` : "",
     "",
     "### New Findings",
     renderList(newFindings),
@@ -261,7 +278,7 @@ async function upsertStatusComment(params: {
   };
   pullRequestId: number;
   body: string;
-}) {
+}): Promise<{ action: "created" | "updated"; commentId: string; url?: string | null }> {
   const { client, pullRequestId, body } = params;
   const statusComment = await prisma.reviewComment.findFirst({
     where: { pullRequestId, kind: "summary" }
@@ -269,12 +286,12 @@ async function upsertStatusComment(params: {
 
   if (statusComment) {
     try {
-      await client.updateSummaryComment(statusComment.providerCommentId, body);
+      const updated = await client.updateSummaryComment(statusComment.providerCommentId, body);
       await prisma.reviewComment.update({
         where: { id: statusComment.id },
-        data: { body }
+        data: { body, url: updated.url || statusComment.url || null }
       });
-      return;
+      return { action: "updated", commentId: updated.id, url: updated.url || null };
     } catch (err: unknown) {
       await prisma.reviewComment.delete({ where: { id: statusComment.id } }).catch(() => undefined);
     }
@@ -290,6 +307,7 @@ async function upsertStatusComment(params: {
       url: created.url || null
     }
   });
+  return { action: "created", commentId: created.id, url: created.url || null };
 }
 
 function buildFixPrompt(comments: ReviewComment[]): string {
@@ -747,19 +765,8 @@ export async function processReviewJob(data: ReviewJobData) {
     }
   });
 
-  const run = await prisma.reviewRun.upsert({
-    where: {
-      pullRequestId_headSha: {
-        pullRequestId: pullRequest.id,
-        headSha: refreshed.headSha
-      }
-    },
-    update: {
-      status: "running",
-      startedAt: new Date(),
-      trigger
-    },
-    create: {
+  const run = await prisma.reviewRun.create({
+    data: {
       pullRequestId: pullRequest.id,
       installationId: installation?.id || null,
       headSha: refreshed.headSha,
@@ -815,15 +822,21 @@ export async function processReviewJob(data: ReviewJobData) {
         }
       });
       statusCheckRowId = row.id;
-    } catch {
+    } catch (err) {
+      console.warn(`[run ${run.id} pr#${prNumber}] unable to create check-run; continuing without status checks`, {
+        error: err instanceof Error ? err.message : String(err)
+      });
       statusCheckRecord = null;
     }
     if (resolvedConfig.output.destination === "comment" || resolvedConfig.output.destination === "both") {
-      await upsertStatusComment({
+      const initialStatus = await upsertStatusComment({
         client,
         pullRequestId: pullRequest.id,
         body: renderReviewingComment()
       });
+      console.log(
+        `[run ${run.id} pr#${prNumber}] status comment ${initialStatus.action}: ${initialStatus.url || initialStatus.commentId}`
+      );
     }
 
     for (const patternRepo of resolvedConfig.patternRepositories) {
@@ -894,7 +907,8 @@ export async function processReviewJob(data: ReviewJobData) {
         deletions?: number;
       }>,
       prTitle: refreshed.title || pullRequest.title,
-      prBody: refreshed.body || pullRequest.body
+      prBody: refreshed.body || pullRequest.body,
+      retrieval: resolvedConfig.retrieval
     });
 
     const { bundleDir, outDir, codexHomeDir } = await createRunDirs(env.projectRoot, run.id);
@@ -928,7 +942,9 @@ export async function processReviewJob(data: ReviewJobData) {
       reviewRunId: run.id,
       prNumber,
       captureLastMessage: false
-    });
+    })
+      .then(() => ({ ok: true as const }))
+      .catch((error: unknown) => ({ ok: false as const, error }));
 
     const feedbackPolicy = await getFeedbackPolicy(repo.id);
     const incrementalHint =
@@ -1064,7 +1080,10 @@ export async function processReviewJob(data: ReviewJobData) {
       }
     }
 
-    await verifierPromise;
+    const verifierResult = await verifierPromise;
+    if (!verifierResult.ok) {
+      throw verifierResult.error;
+    }
     const checksPath = path.join(outDir, "checks.json");
     const checks: ChecksOutput = await readAndValidateJson(checksPath, ChecksSchema);
 
@@ -1073,15 +1092,40 @@ export async function processReviewJob(data: ReviewJobData) {
     });
 
     const existingByKey = new Map<string, typeof existingOpen[number]>();
+    const existingByHunkCategory = new Map<string, Array<typeof existingOpen[number]>>();
+    const existingByPathCategory = new Map<string, Array<typeof existingOpen[number]>>();
+    const existingBySemanticTitle = new Map<string, Array<typeof existingOpen[number]>>();
     for (const finding of existingOpen) {
       const key = `${finding.fingerprint}|${finding.path}|${finding.hunkHash}|${finding.title}`;
       existingByKey.set(key, finding);
+      const fallbackKey = `${normalizePath(finding.path)}|${finding.hunkHash}|${finding.category}`;
+      const bucket = existingByHunkCategory.get(fallbackKey) || [];
+      bucket.push(finding);
+      existingByHunkCategory.set(fallbackKey, bucket);
+      const semanticKey = `${normalizePath(finding.path)}|${finding.category}`;
+      const semanticBucket = existingByPathCategory.get(semanticKey) || [];
+      semanticBucket.push(finding);
+      existingByPathCategory.set(semanticKey, semanticBucket);
+      const semanticTitleKey = semanticFindingKey(finding.path, finding.category, finding.title);
+      const semanticTitleBucket = existingBySemanticTitle.get(semanticTitleKey) || [];
+      semanticTitleBucket.push(finding);
+      existingBySemanticTitle.set(semanticTitleKey, semanticTitleBucket);
     }
 
-    const newFindings: Array<{ title: string; url?: string; commentId: string }> = [];
+    const newFindings: Array<{ title: string; url?: string; commentId: string; path: string; category: string }> = [];
     const newFindingIds = new Map<string, number>();
-    const stillOpen: Array<{ title: string; url?: string; commentId: string }> = [];
+    const stillOpen: Array<{ title: string; url?: string; commentId: string; path: string; category: string }> = [];
     const matchedOldIds = new Set<number>();
+
+    const selectSemanticMatch = (comment: ReviewComment): (typeof existingOpen)[number] | undefined => {
+      const semanticKey = `${normalizePath(comment.path)}|${comment.category}`;
+      const candidates = existingByPathCategory.get(semanticKey) || [];
+      return selectSemanticFindingCandidate({
+        comment,
+        candidates,
+        matchedIds: matchedOldIds
+      });
+    };
 
     const reviewComments = filteredComments.inline;
     for (const comment of reviewComments) {
@@ -1089,16 +1133,53 @@ export async function processReviewJob(data: ReviewJobData) {
       const contextHash = contextHashForComment(diffIndex, comment);
       const fingerprint = fingerprintForComment(comment);
       const matchKey = matchKeyForComment(comment, hunkHash);
-      const existing = existingByKey.get(matchKey);
+      let existing = existingByKey.get(matchKey);
+      if (!existing) {
+        const fallbackKey = `${normalizePath(comment.path)}|${hunkHash}|${comment.category}`;
+        const candidates = (existingByHunkCategory.get(fallbackKey) || []).filter(
+          (candidate) => !matchedOldIds.has(candidate.id)
+        );
+        if (candidates.length > 0) {
+          existing = candidates.sort((a, b) => Math.abs(a.line - comment.line) - Math.abs(b.line - comment.line))[0];
+        }
+      }
+      if (!existing) {
+        existing = selectSemanticMatch(comment);
+      }
+      if (!existing) {
+        const semanticTitleKey = semanticFindingKey(comment.path, comment.category, comment.title);
+        const candidates = (existingBySemanticTitle.get(semanticTitleKey) || []).filter(
+          (candidate) => !matchedOldIds.has(candidate.id)
+        );
+        if (candidates.length > 0) {
+          existing = candidates.sort((a, b) => Math.abs(a.line - comment.line) - Math.abs(b.line - comment.line))[0];
+        }
+      }
 
       if (existing) {
         matchedOldIds.add(existing.id);
-        stillOpen.push({ title: comment.title, commentId: comment.comment_id });
+        stillOpen.push({
+          title: comment.title,
+          commentId: comment.comment_id,
+          path: comment.path,
+          category: comment.category
+        });
         await prisma.finding.update({
           where: { id: existing.id },
           data: {
             status: "open",
             lastSeenRunId: run.id,
+            fingerprint,
+            hunkHash,
+            contextHash,
+            commentId: comment.comment_id,
+            commentKey: comment.comment_key,
+            path: comment.path,
+            line: comment.line,
+            side: comment.side,
+            severity: comment.severity,
+            category: comment.category,
+            title: comment.title,
             body: comment.body,
             evidence: comment.evidence,
             suggestedPatch: comment.suggested_patch,
@@ -1109,7 +1190,12 @@ export async function processReviewJob(data: ReviewJobData) {
         continue;
       }
 
-      newFindings.push({ title: comment.title, commentId: comment.comment_id });
+      newFindings.push({
+        title: comment.title,
+        commentId: comment.comment_id,
+        path: comment.path,
+        category: comment.category
+      });
       const createdFinding = await prisma.finding.create({
         data: {
           pullRequestId: pullRequest.id,
@@ -1144,8 +1230,12 @@ export async function processReviewJob(data: ReviewJobData) {
         .filter(Boolean)
         .map((filePath) => normalizePath(filePath))
     );
+    const incomingSemanticKeys = new Set(
+      reviewComments.map((comment) => semanticFindingKey(comment.path, comment.category, comment.title))
+    );
     const fixed = existingOpen.filter((f) => {
       if (matchedOldIds.has(f.id)) return false;
+      if (incomingSemanticKeys.has(semanticFindingKey(f.path, f.category, f.title))) return false;
       if (!incrementalReview) return true;
       return changedPathSet.has(normalizePath(f.path));
     });
@@ -1158,9 +1248,41 @@ export async function processReviewJob(data: ReviewJobData) {
       });
     }
 
+    if (fixedIds.size > 0 && client.resolveInlineThread) {
+      const fixedReviewComments = await prisma.reviewComment.findMany({
+        where: {
+          kind: "inline",
+          findingId: { in: Array.from(fixedIds) }
+        },
+        select: {
+          providerCommentId: true
+        }
+      });
+      let resolvedThreads = 0;
+      let unresolvedThreads = 0;
+      let resolveFailures = 0;
+      for (const reviewComment of fixedReviewComments) {
+        try {
+          const resolved = await client.resolveInlineThread(reviewComment.providerCommentId);
+          if (resolved) resolvedThreads += 1;
+          else unresolvedThreads += 1;
+        } catch (err) {
+          resolveFailures += 1;
+          console.warn("Failed to resolve inline review thread", {
+            providerCommentId: reviewComment.providerCommentId,
+            error: err
+          });
+        }
+      }
+      console.log(
+        `[run ${run.id} pr#${prNumber}] inline thread resolution: resolved=${resolvedThreads} unresolved=${unresolvedThreads} failed=${resolveFailures}`
+      );
+    }
+
     if (!resolvedConfig.output.summaryOnly && resolvedConfig.commentTypes.allow.includes("inline")) {
       const newCommentIds = new Set(newFindings.map((f) => f.commentId));
       const commentsToPost = reviewComments.filter((c) => newCommentIds.has(c.comment_id));
+      let createdInline = 0;
       for (const comment of commentsToPost) {
         const created = await client.createInlineComment({
           path: comment.path,
@@ -1169,6 +1291,7 @@ export async function processReviewJob(data: ReviewJobData) {
           body: formatInlineComment(comment)
         });
         const findingId = newFindingIds.get(comment.comment_id);
+        createdInline += 1;
         if (findingId) {
           const existingReviewComment = await prisma.reviewComment.findFirst({ where: { findingId } });
           if (existingReviewComment) {
@@ -1203,14 +1326,17 @@ export async function processReviewJob(data: ReviewJobData) {
           byMarker.set(marker, rc);
         }
       }
+      let updatedInline = 0;
       for (const comment of reviewComments) {
         const existing = byMarker.get(comment.comment_id);
         if (!existing) continue;
         const desiredBody = formatInlineComment(comment);
         if ((existing.body || "") !== desiredBody) {
           await client.updateInlineComment(existing.id, desiredBody);
+          updatedInline += 1;
         }
       }
+      console.log(`[run ${run.id} pr#${prNumber}] inline comments: created=${createdInline} updated=${updatedInline}`);
     }
 
     const newFindingLinks = newFindings.map((f) => ({
@@ -1231,7 +1357,10 @@ export async function processReviewJob(data: ReviewJobData) {
       }
     }
 
-    const fixedFindingLinks = fixed.map((f) => ({ title: f.title }));
+    const newSemanticKeys = new Set(newFindings.map((f) => semanticFindingKey(f.path, f.category, f.title)));
+    const fixedForStatus = fixed.filter((f) => !newSemanticKeys.has(semanticFindingKey(f.path, f.category, f.title)));
+    const overlapSuppressed = fixed.length - fixedForStatus.length;
+    const fixedFindingLinks = fixedForStatus.map((f) => ({ title: f.title }));
     const qualityWarnings: string[] = [];
     if (qualityRefinement.diagnostics.deduplicated > 0) {
       qualityWarnings.push(
@@ -1253,6 +1382,11 @@ export async function processReviewJob(data: ReviewJobData) {
         `Quality gate downgraded ${qualityRefinement.diagnostics.downgradedBlocking} blocking comment(s) missing a concrete patch.`
       );
     }
+    if (overlapSuppressed > 0) {
+      qualityWarnings.push(
+        `Suppressed ${overlapSuppressed} ambiguous finding(s) that appeared in both new and fixed buckets.`
+      );
+    }
     const statusWarnings = [...warnings, ...qualityWarnings];
 
     const statusBody = renderStatusComment({
@@ -1260,16 +1394,21 @@ export async function processReviewJob(data: ReviewJobData) {
       newFindings: newFindingLinks,
       openFindings: openFindingLinks,
       fixedFindings: fixedFindingLinks,
+      run: {
+        id: run.id,
+        headSha: refreshed.headSha
+      },
       checks: checks.checks,
       warnings: statusWarnings
     });
 
     if (resolvedConfig.output.destination === "comment" || resolvedConfig.output.destination === "both") {
-      await upsertStatusComment({
+      const finalStatus = await upsertStatusComment({
         client,
         pullRequestId: pullRequest.id,
         body: statusBody
       });
+      console.log(`[run ${run.id} pr#${prNumber}] status comment ${finalStatus.action}: ${finalStatus.url || finalStatus.commentId}`);
     }
 
     await prisma.reviewRun.update({

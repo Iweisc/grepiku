@@ -7,6 +7,10 @@ import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
 
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection in review worker", reason);
+});
+
 const worker = new Worker(
   reviewQueue.name,
   async (job) => {

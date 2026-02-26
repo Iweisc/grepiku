@@ -88,6 +88,15 @@ function mapAuthor(payload: any) {
   };
 }
 
+function normalizePostedBody(body: string): string {
+  return body
+    .replace(/\r\n/g, "\n")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\+n/g, "\n")
+    .replace(/(^|[\s:;,.!?])\/n(?=\s*(?:\d+\.|[-*]|$))/gm, "$1\n")
+    .trim();
+}
+
 function createClient(params: {
   installationId: string | null;
   repo: ProviderRepo;
@@ -102,6 +111,107 @@ function createClient(params: {
   const repo = params.repo.name;
   const prNumber = params.pullRequest.number;
   const headSha = params.pullRequest.headSha;
+  let reviewThreadMapCache: Map<string, { threadId: string; isResolved: boolean }> | null = null;
+
+  async function loadReviewThreadMap(): Promise<Map<string, { threadId: string; isResolved: boolean }>> {
+    if (reviewThreadMapCache) return reviewThreadMapCache;
+    const result = new Map<string, { threadId: string; isResolved: boolean }>();
+    let after: string | null = null;
+
+    type GraphqlThreadPage = {
+      repository?: {
+        pullRequest?: {
+          reviewThreads?: {
+            nodes?: Array<{
+              id: string;
+              isResolved: boolean;
+              comments?: {
+                nodes?: Array<{
+                  databaseId?: number | null;
+                } | null> | null;
+              } | null;
+            } | null> | null;
+            pageInfo?: {
+              hasNextPage?: boolean;
+              endCursor?: string | null;
+            } | null;
+          } | null;
+        } | null;
+      } | null;
+    };
+
+    const query = `
+      query($owner: String!, $repo: String!, $pullNumber: Int!, $after: String) {
+        repository(owner: $owner, name: $repo) {
+          pullRequest(number: $pullNumber) {
+            reviewThreads(first: 100, after: $after) {
+              nodes {
+                id
+                isResolved
+                comments(first: 100) {
+                  nodes {
+                    databaseId
+                  }
+                }
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    while (true) {
+      const page = (await (octokit as any).graphql(query, {
+        owner,
+        repo,
+        pullNumber: prNumber,
+        after
+      })) as GraphqlThreadPage;
+      const threads = page.repository?.pullRequest?.reviewThreads;
+      for (const thread of threads?.nodes || []) {
+        if (!thread?.id) continue;
+        for (const comment of thread.comments?.nodes || []) {
+          const databaseId = comment?.databaseId;
+          if (!databaseId) continue;
+          result.set(String(databaseId), {
+            threadId: thread.id,
+            isResolved: Boolean(thread.isResolved)
+          });
+        }
+      }
+      const hasNext = Boolean(threads?.pageInfo?.hasNextPage);
+      if (!hasNext) break;
+      after = threads?.pageInfo?.endCursor || null;
+      if (!after) break;
+    }
+
+    reviewThreadMapCache = result;
+    return result;
+  }
+
+  async function resolveInlineThread(commentId: string): Promise<boolean> {
+    const lookup = await loadReviewThreadMap();
+    const entry = lookup.get(String(commentId));
+    if (!entry) return false;
+    if (entry.isResolved) return true;
+    const mutation = `
+      mutation($threadId: ID!) {
+        resolveReviewThread(input: { threadId: $threadId }) {
+          thread {
+            id
+            isResolved
+          }
+        }
+      }
+    `;
+    await (octokit as any).graphql(mutation, { threadId: entry.threadId });
+    entry.isResolved = true;
+    return true;
+  }
 
   return {
     provider: "github",
@@ -164,45 +274,48 @@ function createClient(params: {
       await octokit.pulls.update({ owner, repo, pull_number: prNumber, body });
     },
     createSummaryComment: async (body: string) => {
+      const normalizedBody = normalizePostedBody(body);
       const created = await octokit.issues.createComment({
         owner,
         repo,
         issue_number: prNumber,
-        body
+        body: normalizedBody
       });
       return {
         id: String(created.data.id),
-        body: created.data.body || body,
+        body: created.data.body || normalizedBody,
         url: created.data.html_url || null
       };
     },
     updateSummaryComment: async (commentId: string, body: string) => {
+      const normalizedBody = normalizePostedBody(body);
       const updated = await octokit.issues.updateComment({
         owner,
         repo,
         comment_id: Number(commentId),
-        body
+        body: normalizedBody
       });
       return {
         id: String(updated.data.id),
-        body: updated.data.body || body,
+        body: updated.data.body || normalizedBody,
         url: updated.data.html_url || null
       };
     },
     createInlineComment: async ({ path, line, side, body }) => {
+      const normalizedBody = normalizePostedBody(body);
       const created = await octokit.pulls.createReviewComment({
         owner,
         repo,
         pull_number: prNumber,
         commit_id: headSha,
-        body,
+        body: normalizedBody,
         path,
         line,
         side: side === "LEFT" ? "LEFT" : "RIGHT"
       });
       return {
         id: String(created.data.id),
-        body: created.data.body || body,
+        body: created.data.body || normalizedBody,
         url: created.data.html_url || null,
         path: created.data.path || path,
         line: created.data.line || line,
@@ -227,21 +340,23 @@ function createClient(params: {
       }));
     },
     updateInlineComment: async (commentId: string, body: string) => {
+      const normalizedBody = normalizePostedBody(body);
       const updated = await octokit.pulls.updateReviewComment({
         owner,
         repo,
         comment_id: Number(commentId),
-        body
+        body: normalizedBody
       });
       return {
         id: String(updated.data.id),
-        body: updated.data.body || body,
+        body: updated.data.body || normalizedBody,
         url: updated.data.html_url || null,
         path: updated.data.path || null,
         line: updated.data.line || null,
         side: updated.data.side || null
       };
     },
+    resolveInlineThread,
     createStatusCheck: async (check: ProviderStatusCheck) => {
       const created = await octokit.checks.create({
         owner,

@@ -186,6 +186,7 @@ function baseStageEnv(): NodeJS.ProcessEnv {
 }
 
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
+  const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}]`;
   const codexExecPath = await resolveCodexExecPath();
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
@@ -232,14 +233,21 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     (value): value is string => Boolean(value)
   );
   const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
-
-  await execa(codexExecPath, codexArgs, {
-    input: fullPrompt,
-    stdio: ["pipe", "ignore", "inherit"],
-    cwd: params.outDir,
-    env: stageEnv,
-    timeout: env.codexStageTimeoutMs,
-    killSignal: "SIGTERM",
-    forceKillAfterDelay: 10_000
-  });
+  const startedAt = Date.now();
+  console.log(`${stageTag} starting`);
+  try {
+    await execa(codexExecPath, codexArgs, {
+      input: fullPrompt,
+      stdio: ["pipe", "ignore", "inherit"],
+      cwd: params.outDir,
+      env: stageEnv,
+      timeout: env.codexStageTimeoutMs,
+      killSignal: "SIGTERM",
+      forceKillAfterDelay: 10_000
+    });
+    console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
+  } catch (err) {
+    console.error(`${stageTag} failed in ${Date.now() - startedAt}ms`, err);
+    throw err;
+  }
 }

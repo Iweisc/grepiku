@@ -57,7 +57,9 @@ async function buildLocalDiffPatch(params: {
 function normalizeReplyBody(body: string): string {
   return body
     .replace(/\r\n/g, "\n")
-    .replace(/\\n/g, "\n")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\+n/g, "\n")
+    .replace(/(^|[\s:;,.!?])\/n(?=\s*(?:\d+\.|[-*]|$))/gm, "$1\n")
     .trim();
 }
 
@@ -116,7 +118,8 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
       deletions?: number;
     }>,
     prTitle: refreshed.title || pullRequest.title,
-    prBody: refreshed.body || pullRequest.body
+    prBody: refreshed.body || pullRequest.body,
+    retrieval: repoConfig.retrieval
   });
 
   const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}

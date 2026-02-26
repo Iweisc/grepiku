@@ -198,7 +198,7 @@ model ReviewRun {
   feedback    Feedback[]
   toolRuns    ToolRun[]
 
-  @@unique([pullRequestId, headSha])
+  @@index([pullRequestId, headSha, createdAt])
 }
 
 model Finding {

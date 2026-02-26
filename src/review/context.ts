@@ -1,11 +1,12 @@
 import { prisma } from "../db/client.js";
 import { retrieveContext } from "../services/retrieval.js";
 import { normalizePath } from "./diff.js";
+import type { RepoConfig } from "./config.js";
 
 export type ContextPack = {
   query: string;
   retrieved: Array<{
-    kind: "file" | "symbol";
+    kind: "file" | "symbol" | "chunk";
     score: number;
     path?: string;
     symbol?: string;
@@ -45,6 +46,7 @@ export async function buildContextPack(params: {
     deletions?: number;
   }>;
   topK?: number;
+  retrieval?: RepoConfig["retrieval"];
   prTitle?: string | null;
   prBody?: string | null;
 }): Promise<ContextPack> {
@@ -81,8 +83,10 @@ export async function buildContextPack(params: {
   const retrieved = await retrieveContext({
     repoId: params.repoId,
     query,
-    topK: params.topK ?? 12,
-    changedPaths
+    topK: params.retrieval?.topK ?? params.topK ?? 18,
+    maxPerPath: params.retrieval?.maxPerPath,
+    changedPaths,
+    weights: params.retrieval
   });
 
   const changedNodes =

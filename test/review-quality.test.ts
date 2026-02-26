@@ -112,3 +112,36 @@ test("blocking finding without patch is downgraded", () => {
   assert.equal(refined.comments[0].severity, "important");
   assert.equal(refined.diagnostics.downgradedBlocking, 1);
 });
+
+test("escaped newline sequences are normalized in review text fields", () => {
+  const refined = refineReviewComments({
+    comments: [
+      {
+        comment_id: "esc-1",
+        comment_key: "esc-1",
+        path: "src/foo.ts",
+        side: "RIGHT",
+        line: 2,
+        severity: "important",
+        category: "bug",
+        title: "Issue\\nTitle",
+        body: "Line 1\\nLine 2",
+        evidence: "Evidence\\nQuote",
+        suggested_patch: "const x = 1;",
+        comment_type: "inline",
+        confidence: "high"
+      }
+    ],
+    diffIndex,
+    changedFiles: [{ path: "src/foo.ts" }],
+    maxInlineComments: 5,
+    summaryOnly: false,
+    allowedTypes: ["inline", "summary"]
+  });
+
+  assert.equal(refined.comments.length, 1);
+  assert.equal(refined.comments[0].title, "Issue Title");
+  assert.equal(refined.comments[0].body, "Line 1\nLine 2");
+  assert.equal(refined.comments[0].evidence, "Evidence\nQuote");
+  assert.equal(refined.comments[0].suggested_patch, "const x = 1;");
+});

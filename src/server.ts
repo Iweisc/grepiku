@@ -15,7 +15,16 @@ const app = Fastify({
 });
 
 app.addContentTypeParser("application/json", { parseAs: "buffer" }, (req, body, done) => {
-  done(null, body);
+  if (req.url === "/webhooks") {
+    done(null, body);
+    return;
+  }
+  try {
+    const parsed = JSON.parse(body.toString("utf8"));
+    done(null, parsed);
+  } catch (err) {
+    done(err as Error, undefined);
+  }
 });
 
 app.post("/webhooks", async (request, reply) => {
