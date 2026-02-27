@@ -89,7 +89,12 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
   "patternRepositories": [],
   "strictness": "medium",
   "commentTypes": { "allow": ["inline", "summary"] },
-  "output": { "summaryOnly": false, "destination": "comment" },
+  "output": {
+    "summaryOnly": false,
+    "destination": "comment",
+    "syncSummaryWithStatus": true,
+    "allowIncrementalPrBodyUpdates": true
+  },
   "retrieval": {
     "topK": 28,
     "maxPerPath": 6,
@@ -117,6 +122,8 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
 
 `graph.exclude_dirs` is a list of repo-relative directory prefixes excluded from graph generation and graph traversal seeding (indexing and retrieval remain unchanged).  
 `graph.traversal` tunes how aggressively graph traversal expands context during review.
+`output.syncSummaryWithStatus` keeps the PR body "Grepiku Summary" synchronized with each AI review status run (default: `true`).  
+`output.allowIncrementalPrBodyUpdates` allows PR body summary updates on incremental/synchronize runs (default: `true`).
 
 If missing, defaults are used and tools are marked as skipped.
 

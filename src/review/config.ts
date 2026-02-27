@@ -65,6 +65,8 @@ export type RepoConfig = {
   output: {
     summaryOnly: boolean;
     destination: "comment" | "pr_body" | "both";
+    syncSummaryWithStatus: boolean;
+    allowIncrementalPrBodyUpdates: boolean;
   };
   retrieval: {
     topK: number;
@@ -185,9 +187,16 @@ const GrepikuSchema = z.object({
   output: z
     .object({
       summaryOnly: z.boolean().default(false),
-      destination: z.enum(["comment", "pr_body", "both"]).default("both")
+      destination: z.enum(["comment", "pr_body", "both"]).default("both"),
+      syncSummaryWithStatus: z.boolean().default(true),
+      allowIncrementalPrBodyUpdates: z.boolean().default(true)
     })
-    .default({ summaryOnly: false, destination: "both" }),
+    .default({
+      summaryOnly: false,
+      destination: "both",
+      syncSummaryWithStatus: true,
+      allowIncrementalPrBodyUpdates: true
+    }),
   retrieval: z
     .object({
       topK: z.number().int().min(4).max(60).default(28),

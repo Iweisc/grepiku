@@ -70,7 +70,12 @@ const DEFAULT_REPO_CONFIG: RepoConfig = {
   patternRepositories: [],
   strictness: "medium",
   commentTypes: { allow: ["inline", "summary"] },
-  output: { summaryOnly: false, destination: "both" },
+  output: {
+    summaryOnly: false,
+    destination: "both",
+    syncSummaryWithStatus: true,
+    allowIncrementalPrBodyUpdates: true
+  },
   retrieval: DEFAULT_RETRIEVAL,
   statusChecks: { name: "Grepiku Review", required: false },
   triggers: {

@@ -1236,10 +1236,12 @@ export async function processReviewJob(data: ReviewJobData) {
     const originalBody = pullRequest.body || "";
     const updatedBody = upsertSummaryBlock(originalBody, summaryBlock);
     const shouldUpdateBody =
+      resolvedConfig.output.syncSummaryWithStatus ||
       resolvedConfig.output.destination === "pr_body" ||
       resolvedConfig.output.destination === "both" ||
       originalBody.trim().length === 0;
-    const allowBodyUpdate = !incrementalReview;
+    const allowBodyUpdate =
+      resolvedConfig.output.allowIncrementalPrBodyUpdates || !incrementalReview;
     if (shouldUpdateBody && allowBodyUpdate && updatedBody !== originalBody) {
       try {
         await client.updatePullRequestBody(updatedBody);

@@ -23,7 +23,12 @@ const baseConfig: RepoConfig = {
   patternRepositories: [],
   strictness: "medium",
   commentTypes: { allow: ["inline", "summary"] },
-  output: { summaryOnly: false, destination: "comment" },
+  output: {
+    summaryOnly: false,
+    destination: "comment",
+    syncSummaryWithStatus: true,
+    allowIncrementalPrBodyUpdates: true
+  },
   retrieval: {
     topK: 18,
     maxPerPath: 4,
