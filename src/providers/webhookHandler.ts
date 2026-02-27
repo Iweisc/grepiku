@@ -6,6 +6,7 @@ import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "..
 import { getProviderAdapter } from "./registry.js";
 import { resolveGithubBotLogin } from "./github/adapter.js";
 import { rememberRepoInstruction } from "../services/repoMemory.js";
+import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -201,11 +202,14 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   }
 
   if (event.type === "comment") {
+    const commentBody = event.comment.body || "";
     const botLogin = await resolveGithubBotLogin().catch(() => "");
-    if (botLogin && event.author.login.toLowerCase() === botLogin.toLowerCase()) {
+    if (isSelfBotComment({ authorLogin: event.author.login || "", botLogin })) {
       return;
     }
-    const commentBody = event.comment.body || "";
+    if (isGeneratedMentionReply(commentBody) && /\[bot\]$/i.test((event.author.login || "").trim())) {
+      return;
+    }
     const commentTrigger = detectCommentTrigger(commentBody, config);
 
     const latestRun = await prisma.reviewRun.findFirst({
