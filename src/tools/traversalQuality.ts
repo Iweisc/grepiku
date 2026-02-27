@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { pathToFileURL } from "url";
 import { prisma } from "../db/client.js";
 import { buildContextPack } from "../review/context.js";
 import { resolveRepoConfig } from "../review/config.js";
@@ -32,6 +33,11 @@ type ReplayBundle = {
     deletions?: number;
   }>;
 };
+
+function parseFinite(value: string): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 function parseArgs(argv: string[]): Options {
   const thresholds: TraversalThresholds = { ...DEFAULT_TRAVERSAL_THRESHOLDS };
@@ -67,19 +73,31 @@ function parseArgs(argv: string[]): Options {
       continue;
     }
     if (arg.startsWith("--repo-id=")) {
-      options.repoId = Number(arg.slice("--repo-id=".length));
+      const parsed = parseFinite(arg.slice("--repo-id=".length));
+      if (parsed !== null) {
+        options.repoId = parsed;
+      }
       continue;
     }
     if (arg.startsWith("--limit=")) {
-      options.limit = Math.max(20, Math.min(5000, Number(arg.slice("--limit=".length))));
+      const parsed = parseFinite(arg.slice("--limit=".length));
+      if (parsed !== null) {
+        options.limit = Math.max(20, Math.min(5000, parsed));
+      }
       continue;
     }
     if (arg.startsWith("--since-days=")) {
-      options.sinceDays = Math.max(1, Math.min(365, Number(arg.slice("--since-days=".length))));
+      const parsed = parseFinite(arg.slice("--since-days=".length));
+      if (parsed !== null) {
+        options.sinceDays = Math.max(1, Math.min(365, parsed));
+      }
       continue;
     }
     if (arg.startsWith("--concurrency=")) {
-      options.concurrency = Math.max(1, Math.min(16, Number(arg.slice("--concurrency=".length))));
+      const parsed = parseFinite(arg.slice("--concurrency=".length));
+      if (parsed !== null) {
+        options.concurrency = Math.max(1, Math.min(16, parsed));
+      }
       continue;
     }
     for (const key of numericThresholdKeys) {
@@ -250,11 +268,19 @@ async function main() {
   }
 }
 
-main()
-  .catch((error) => {
-    console.error("Traversal evaluator failed", error);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+export const __traversalQualityInternals = {
+  parseArgs,
+  parseFinite
+};
+
+const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";
+if (invokedPath && import.meta.url === invokedPath) {
+  main()
+    .catch((error) => {
+      console.error("Traversal evaluator failed", error);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

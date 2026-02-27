@@ -109,7 +109,7 @@ export async function rememberRepoInstruction(params: {
   await prisma.ruleSuggestion.create({
     data: {
       repoId: params.repoId,
-      status: "accepted",
+      status: "pending",
       reason,
       ruleJson: {
         ...rule,

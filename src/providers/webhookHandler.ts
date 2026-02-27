@@ -7,6 +7,7 @@ import { getProviderAdapter } from "./registry.js";
 import { resolveGithubBotLogin } from "./github/adapter.js";
 import { rememberRepoInstruction } from "../services/repoMemory.js";
 import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
+import { isResolutionReply } from "./commentResolution.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -17,11 +18,6 @@ function isSuggestionCommitMessage(message: string): boolean {
     normalized.includes("apply suggestions from code review") ||
     normalized.includes("suggestions from code review")
   );
-}
-
-function isResolutionReply(body: string): boolean {
-  const normalized = body.toLowerCase();
-  return normalized.includes("fixed") || normalized.includes("resolved") || normalized.includes("done");
 }
 
 async function isSuggestionCommit(params: {

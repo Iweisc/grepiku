@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isGeneratedMentionReply, isSelfBotComment, normalizeBotAwareLogin } from "../src/providers/commentGuards.js";
+import { isResolutionReply } from "../src/providers/commentResolution.js";
 
 test("normalizeBotAwareLogin strips [bot] suffix", () => {
   assert.equal(normalizeBotAwareLogin("grepiku-dev[bot]"), "grepiku-dev");
@@ -44,4 +45,10 @@ test("isSelfBotComment does not match unrelated bots or users", () => {
 test("isGeneratedMentionReply detects mention marker only", () => {
   assert.equal(isGeneratedMentionReply("<!-- grepiku-mention:2862044956 -->\n@grepiku-dev[bot] ok"), true);
   assert.equal(isGeneratedMentionReply("<!-- grepiku:cmt-1 -->"), false);
+});
+
+test("isResolutionReply ignores negated resolution phrases", () => {
+  assert.equal(isResolutionReply("fixed in latest commit"), true);
+  assert.equal(isResolutionReply("not done yet, still debugging"), false);
+  assert.equal(isResolutionReply("this isn't resolved"), false);
 });

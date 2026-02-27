@@ -256,6 +256,13 @@ function addAggregatedEdge(
   });
 }
 
+function hasDirectFileDepEdge(
+  edgeMap: Map<string, EdgeDraft>,
+  edge: Pick<EdgeDraft, "fromNodeId" | "toNodeId">
+): boolean {
+  return edgeMap.has(`${edge.fromNodeId}:${edge.toNodeId}:file_dep`);
+}
+
 function findOwningSymbolId(
   symbolsByFile: Map<number, SymbolLite[]>,
   fileId: number,
@@ -619,6 +626,7 @@ export async function processGraphJob(job: GraphJob) {
 
   for (const edge of edgeDrafts.values()) {
     if (edge.type !== "file_dep_inferred" || edge.weight < 2) continue;
+    if (hasDirectFileDepEdge(edgeDrafts, edge)) continue;
     await prisma.graphEdge.create({
       data: {
         repoId,
@@ -630,3 +638,7 @@ export async function processGraphJob(job: GraphJob) {
     });
   }
 }
+
+export const __graphInternals = {
+  hasDirectFileDepEdge
+};

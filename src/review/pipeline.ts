@@ -1115,12 +1115,15 @@ export async function processReviewJob(data: ReviewJobData) {
       droppedDuplicates: 0,
       droppedLowValue: 0
     };
+    const inlineCountBeforeCoverage = commentsAfterVerdict.filter(
+      (comment) => (comment.comment_type || "inline") !== "summary"
+    ).length;
     const shouldRunCoveragePass =
       coveragePlan.shouldRun &&
       coveragePlan.targets.length > 0 &&
       !resolvedConfig.output.summaryOnly &&
       resolvedConfig.commentTypes.allow.includes("inline") &&
-      commentsAfterVerdict.length < resolvedConfig.limits.max_inline_comments;
+      inlineCountBeforeCoverage < resolvedConfig.limits.max_inline_comments;
 
     if (shouldRunCoveragePass) {
       coverageDiagnostics.attempted = true;
