@@ -1,11 +1,15 @@
 import { execa } from "execa";
 
 export function resolveFollowUpPrBaseBranch(params: {
+  pullRequestHeadRef?: string | null;
   pullRequestBaseRef?: string | null;
+  refreshedHeadRef?: string | null;
   refreshedBaseRef?: string | null;
   repoDefaultBranch?: string | null;
 }): string {
   return (
+    params.pullRequestHeadRef ||
+    params.refreshedHeadRef ||
     params.pullRequestBaseRef ||
     params.refreshedBaseRef ||
     params.repoDefaultBranch ||

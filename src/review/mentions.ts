@@ -518,7 +518,9 @@ async function runImplementPath(params: {
   await pushBranch({ repoPath: params.repoPath, branchName });
 
   const baseBranch = resolveFollowUpPrBaseBranch({
+    pullRequestHeadRef: params.pullRequestHeadRef,
     pullRequestBaseRef: params.pullRequestBaseRef,
+    refreshedHeadRef: params.refreshed.headRef,
     refreshedBaseRef: params.refreshed.baseRef,
     repoDefaultBranch: params.repoDefaultBranch
   });
