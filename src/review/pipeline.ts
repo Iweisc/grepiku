@@ -1517,12 +1517,17 @@ export async function processReviewJob(data: ReviewJobData) {
       title: f.title
     }));
     if (incrementalReview) {
-      const carriedOpenCount = existingOpen.filter(
-        (finding) => !matchedOldIds.has(finding.id) && !fixedIds.has(finding.id)
-      ).length;
-      if (carriedOpenCount > 0) {
+      const carriedOpenFindings = existingOpen
+        .filter((finding) => !matchedOldIds.has(finding.id) && !fixedIds.has(finding.id))
+        .sort((a, b) => {
+          const pathCmp = a.path.localeCompare(b.path);
+          if (pathCmp !== 0) return pathCmp;
+          if (a.line !== b.line) return a.line - b.line;
+          return a.title.localeCompare(b.title);
+        });
+      for (const finding of carriedOpenFindings) {
         openFindingLinks.push({
-          title: `${carriedOpenCount} existing finding${carriedOpenCount === 1 ? "" : "s"} remain open from prior review state.`
+          title: finding.title
         });
       }
     }
