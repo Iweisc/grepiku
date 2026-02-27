@@ -347,6 +347,16 @@ function popBestFrontier(frontier: Array<{ nodeId: number; score: number; depth:
   return best;
 }
 
+function isStaleFrontierEntry(params: {
+  current: { nodeId: number; score: number; depth: number };
+  bestScore: Map<number, number>;
+  bestDepth: Map<number, number>;
+}): boolean {
+  const bestKnownScore = params.bestScore.get(params.current.nodeId) || 0;
+  const bestKnownDepth = params.bestDepth.get(params.current.nodeId) ?? Number.POSITIVE_INFINITY;
+  return params.current.score < bestKnownScore * 0.995 && params.current.depth >= bestKnownDepth;
+}
+
 function buildProvenanceTrace(params: {
   targetNodeId: number;
   parentByNode: Map<number, TraversalParent>;
@@ -621,6 +631,7 @@ async function collectGraphImpact(params: {
   while (frontier.length > 0 && visitedNodes < options.max_nodes_visited) {
     const current = popBestFrontier(frontier);
     if (!current) break;
+    if (isStaleFrontierEntry({ current, bestScore, bestDepth })) continue;
     visitedNodes += 1;
     if (current.depth >= options.max_depth) continue;
 
@@ -1123,5 +1134,6 @@ export const __contextInternals = {
   parseChangedLinesByPath,
   localEdgeFanout,
   globalEdgeBudget,
-  buildProvenanceTrace
+  buildProvenanceTrace,
+  isStaleFrontierEntry
 };

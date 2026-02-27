@@ -71,3 +71,26 @@ test("buildProvenanceTrace returns ordered chain", () => {
   assert.match(trace[0], /src\/a\.ts --contains_symbol-->/);
   assert.match(trace[1], /file_dep-->/);
 });
+
+test("isStaleFrontierEntry identifies entries superseded by better score/depth", () => {
+  const bestScore = new Map<number, number>([[42, 0.9]]);
+  const bestDepth = new Map<number, number>([[42, 2]]);
+
+  assert.equal(
+    __contextInternals.isStaleFrontierEntry({
+      current: { nodeId: 42, score: 0.7, depth: 3 },
+      bestScore,
+      bestDepth
+    }),
+    true
+  );
+
+  assert.equal(
+    __contextInternals.isStaleFrontierEntry({
+      current: { nodeId: 42, score: 0.95, depth: 3 },
+      bestScore,
+      bestDepth
+    }),
+    false
+  );
+});

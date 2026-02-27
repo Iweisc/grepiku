@@ -177,19 +177,15 @@ async function postMentionReply(params: {
       return;
     } catch (err) {
       if (params.replyInThread) {
-        console.warn(`[mention ${params.commentId}] failed to post thread reply`, {
+        console.warn(`[mention ${params.commentId}] failed to post thread reply; falling back to summary comment`, {
           error: err instanceof Error ? err.message : String(err)
         });
-        return;
       }
     }
-  }
-
-  if (params.replyInThread) {
+  } else if (params.replyInThread) {
     console.warn(
-      `[mention ${params.commentId}] thread reply requested but provider does not support replyToComment; skipping fallback summary comment`
+      `[mention ${params.commentId}] thread reply requested but provider does not support replyToComment; falling back to summary comment`
     );
-    return;
   }
 
   await params.client.createSummaryComment(normalizedBody);
@@ -781,3 +777,7 @@ ${refreshed.body || pullRequest.body || "(no description)"}
     });
   }
 }
+
+export const __mentionInternals = {
+  postMentionReply
+};

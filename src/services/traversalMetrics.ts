@@ -163,7 +163,8 @@ export function computeTraversalRunMetrics(params: {
 
   const validFindings = params.findings.filter((finding) => String(finding.status || "") !== "obsolete");
   const findingPaths = uniqPaths(validFindings.map((finding) => finding.path));
-  const crossFileFindingPaths = findingPaths.filter((path) => !changedSet.has(path));
+  const crossFileFindingPaths =
+    changedSet.size > 0 ? findingPaths.filter((path) => !changedSet.has(path)) : [];
 
   const relatedHits = crossFileFindingPaths.filter((path) => relatedSet.has(path));
   const crossFileRecall =
@@ -248,7 +249,9 @@ export function summarizeTraversalMetrics(
   };
 
   const failures: string[] = [];
-  if (runs.length >= thresholds.minRuns) {
+  if (runs.length < thresholds.minRuns) {
+    failures.push(`runCount=${runs.length} below ${thresholds.minRuns}`);
+  } else {
     const avgRecall = mean(recalls);
     const avgPrecision = mean(precisions);
     if (recalls.length >= thresholds.minRecallSamples && avgRecall < thresholds.minCrossFileRecall) {

@@ -82,7 +82,8 @@ function parseArgs(argv: string[]): Options {
     if (arg.startsWith("--limit=")) {
       const parsed = parseFinite(arg.slice("--limit=".length));
       if (parsed !== null) {
-        options.limit = Math.max(20, Math.min(5000, parsed));
+        const normalized = Math.trunc(parsed);
+        options.limit = Math.max(20, Math.min(5000, normalized));
       }
       continue;
     }
@@ -96,7 +97,8 @@ function parseArgs(argv: string[]): Options {
     if (arg.startsWith("--concurrency=")) {
       const parsed = parseFinite(arg.slice("--concurrency=".length));
       if (parsed !== null) {
-        options.concurrency = Math.max(1, Math.min(16, parsed));
+        const normalized = Math.trunc(parsed);
+        options.concurrency = Math.max(1, Math.min(16, normalized));
       }
       continue;
     }

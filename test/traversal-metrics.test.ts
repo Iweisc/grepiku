@@ -38,6 +38,31 @@ test("computeTraversalRunMetrics calculates recall and supported precision", () 
   assert.equal(metrics?.repoSizeBucket, "small");
 });
 
+test("computeTraversalRunMetrics does not classify cross-file findings without changed-file metadata", () => {
+  const metrics = computeTraversalRunMetrics({
+    runId: 11,
+    repoId: 2,
+    repoFileCount: 120,
+    contextPack: {
+      relatedFiles: ["src/a.ts"],
+      retrieved: [{ path: "src/a.ts" }],
+      graphDebug: {
+        traversalMs: 320,
+        visitedNodes: 101,
+        traversedEdges: 250,
+        prunedByBudget: 11,
+        maxNodesVisited: 2400
+      }
+    },
+    findings: [{ path: "src/a.ts", status: "open" }]
+  });
+
+  assert.ok(metrics);
+  assert.equal(metrics?.changedCount, 0);
+  assert.equal(metrics?.crossFileFindingCount, 0);
+  assert.equal(metrics?.crossFileRecall, null);
+});
+
 test("summarizeTraversalMetrics evaluates thresholds", () => {
   const runs = [
     {
@@ -73,4 +98,33 @@ test("summarizeTraversalMetrics evaluates thresholds", () => {
   assert.equal(summary.runCount, 1);
   assert.equal(summary.thresholdStatus.pass, false);
   assert.ok(summary.thresholdStatus.failures.length >= 1);
+});
+
+test("summarizeTraversalMetrics fails threshold status when run count is below minRuns", () => {
+  const runs = [
+    {
+      runId: 2,
+      repoId: 1,
+      relatedCount: 8,
+      changedCount: 3,
+      findingCount: 3,
+      crossFileFindingCount: 1,
+      crossFileRecall: 1,
+      supportedPrecision: 0.7,
+      supportedCount: 6,
+      supportedByRetrievalCount: 2,
+      supportedByGraphCount: 2,
+      traversalMs: 600,
+      visitedNodes: 500,
+      traversedEdges: 900,
+      prunedByBudget: 20,
+      maxNodesVisited: 2400,
+      repoFileCount: 200,
+      repoSizeBucket: "small" as const
+    }
+  ];
+
+  const summary = summarizeTraversalMetrics(runs, DEFAULT_TRAVERSAL_THRESHOLDS);
+  assert.equal(summary.thresholdStatus.pass, false);
+  assert.match(summary.thresholdStatus.failures[0] || "", /runCount=1 below/);
 });

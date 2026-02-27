@@ -25,3 +25,13 @@ test("parseArgs clamps valid numeric values", () => {
   assert.equal(options.sinceDays, 1);
   assert.equal(options.concurrency, 16);
 });
+
+test("parseArgs truncates fractional limit and concurrency values", () => {
+  const options = __traversalQualityInternals.parseArgs([
+    "--limit=250.9",
+    "--concurrency=3.8"
+  ]);
+
+  assert.equal(options.limit, 250);
+  assert.equal(options.concurrency, 3);
+});
