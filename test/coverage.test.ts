@@ -15,6 +15,7 @@ function makeComment(params: {
   severity?: ReviewComment["severity"];
   category?: ReviewComment["category"];
   confidence?: ReviewComment["confidence"];
+  comment_type?: ReviewComment["comment_type"];
 }): ReviewComment {
   return {
     comment_id: params.id,
@@ -28,7 +29,7 @@ function makeComment(params: {
     body: "details",
     evidence: "evidence",
     suggested_patch: "const x = 1;",
-    comment_type: "inline",
+    comment_type: params.comment_type || "inline",
     confidence: params.confidence || "high"
   };
 }
@@ -55,6 +56,28 @@ test("buildCoveragePlan prioritizes uncovered high-risk changed files", () => {
   assert.equal(plan.targets[0]?.path, "src/a.ts");
 });
 
+test("buildCoveragePlan ignores summary-only comments for changed-file coverage", () => {
+  const plan = buildCoveragePlan({
+    changedFiles: [
+      { path: "src/a.ts", additions: 40, deletions: 10 },
+      { path: "src/b.ts", additions: 30, deletions: 5 }
+    ],
+    comments: [
+      makeComment({
+        id: "s1",
+        path: "src/a.ts",
+        line: 12,
+        title: "Potential race condition",
+        comment_type: "summary"
+      })
+    ]
+  });
+
+  assert.equal(plan.shouldRun, true);
+  assert.equal(plan.stats.coveredChanged, 0);
+  assert.equal(plan.stats.uncoveredChanged, 2);
+});
+
 test("mergeSupplementalComments skips semantic duplicates and keeps net-new issues", () => {
   const base = [makeComment({ id: "a1", path: "src/a.ts", line: 22, title: "Missing null check" })];
   const supplemental = [
@@ -66,6 +89,16 @@ test("mergeSupplementalComments skips semantic duplicates and keeps net-new issu
   assert.equal(merged.comments.length, 2);
   assert.equal(merged.added, 1);
   assert.equal(merged.droppedDuplicates, 1);
+});
+
+test("mergeSupplementalComments keeps same-title findings when they are far apart", () => {
+  const base = [makeComment({ id: "a1", path: "src/a.ts", line: 22, title: "Missing null check" })];
+  const supplemental = [makeComment({ id: "a2", path: "src/a.ts", line: 58, title: "Missing null check!" })];
+
+  const merged = mergeSupplementalComments({ base, supplemental });
+  assert.equal(merged.comments.length, 2);
+  assert.equal(merged.added, 1);
+  assert.equal(merged.droppedDuplicates, 0);
 });
 
 test("mergeSupplementalSummary promotes higher risk and keeps conservative confidence", () => {

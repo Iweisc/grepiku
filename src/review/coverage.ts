@@ -46,6 +46,14 @@ function baseReason(target: {
   return churn > 0 ? `uncovered changed file (${churn} lines changed)` : "uncovered changed file";
 }
 
+function isInlineCoverageFinding(comment: ReviewComment): boolean {
+  const type = comment.comment_type || "inline";
+  if (type !== "inline") return false;
+  if (comment.category === "style" && comment.severity === "nit") return false;
+  if (comment.confidence === "low" && comment.severity === "nit") return false;
+  return true;
+}
+
 export function buildCoveragePlan(params: {
   changedFiles: Array<{
     path?: string;
@@ -111,9 +119,9 @@ export function buildCoveragePlan(params: {
   let findingsOnChanged = 0;
 
   for (const comment of params.comments) {
+    if (!isInlineCoverageFinding(comment)) continue;
     const path = normalizePath(comment.path);
     if (!changedPathSet.has(path)) continue;
-    if (comment.category === "style" && comment.severity === "nit") continue;
     findingsOnChanged += 1;
     coveredPathSet.add(path);
   }
@@ -171,7 +179,7 @@ export function mergeSupplementalComments(params: {
 } {
   const comments = [...params.base];
   const strictKeys = new Set<string>();
-  const semanticKeys = new Set<string>();
+  const semanticLines = new Map<string, number[]>();
 
   const strictKeyFor = (comment: ReviewComment) =>
     [
@@ -184,9 +192,20 @@ export function mergeSupplementalComments(params: {
   const semanticKeyFor = (comment: ReviewComment) =>
     [normalizePath(comment.path), comment.category, normalizeTitle(comment.title)].join("|");
 
+  const hasNearbySemanticDuplicate = (key: string, line: number): boolean => {
+    const lines = semanticLines.get(key) || [];
+    return lines.some((existingLine) => Math.abs(existingLine - line) <= 8);
+  };
+
+  const addSemanticLine = (key: string, line: number) => {
+    const lines = semanticLines.get(key) || [];
+    lines.push(line);
+    semanticLines.set(key, lines);
+  };
+
   for (const comment of comments) {
     strictKeys.add(strictKeyFor(comment));
-    semanticKeys.add(semanticKeyFor(comment));
+    addSemanticLine(semanticKeyFor(comment), comment.line);
   }
 
   let added = 0;
@@ -203,12 +222,12 @@ export function mergeSupplementalComments(params: {
     }
     const strictKey = strictKeyFor(comment);
     const semanticKey = semanticKeyFor(comment);
-    if (strictKeys.has(strictKey) || semanticKeys.has(semanticKey)) {
+    if (strictKeys.has(strictKey) || hasNearbySemanticDuplicate(semanticKey, comment.line)) {
       droppedDuplicates += 1;
       continue;
     }
     strictKeys.add(strictKey);
-    semanticKeys.add(semanticKey);
+    addSemanticLine(semanticKey, comment.line);
     comments.push(comment);
     added += 1;
   }
