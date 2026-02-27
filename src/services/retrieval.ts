@@ -66,8 +66,8 @@ export async function retrieveContext(params: {
   changedPaths?: string[];
   weights?: Partial<RetrievalWeights>;
 }): Promise<RetrievalResult[]> {
-  const topK = Math.max(4, Math.min(60, params.topK ?? 18));
-  const maxPerPath = Math.max(1, Math.min(12, params.maxPerPath ?? 4));
+  const topK = Math.max(4, Math.min(60, params.topK ?? 28));
+  const maxPerPath = Math.max(1, Math.min(12, params.maxPerPath ?? 6));
   const weights = mergeWeights(params.weights);
   const changedPaths = new Set(
     (params.changedPaths || [])

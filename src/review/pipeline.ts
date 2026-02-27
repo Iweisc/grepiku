@@ -6,7 +6,12 @@ import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
 import { loadRepoConfig, saveRepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
-import { buildReviewerPrompt, buildEditorPrompt, buildVerifierPrompt } from "./prompts.js";
+import {
+  buildReviewerPrompt,
+  buildEditorPrompt,
+  buildVerifierPrompt,
+  buildCoverageReviewerPrompt
+} from "./prompts.js";
 import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
 import { parseAndValidateJson, readAndValidateJson } from "./json.js";
 import {
@@ -36,6 +41,11 @@ import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 import { refineReviewComments } from "./quality.js";
 import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
+import {
+  buildCoveragePlan,
+  mergeSupplementalComments,
+  mergeSupplementalSummary
+} from "./coverage.js";
 
 const env = loadEnv();
 
@@ -1073,7 +1083,7 @@ export async function processReviewJob(data: ReviewJobData) {
 
     const diffIndex = buildDiffIndex(diffPatch);
     const verdictMap = new Map(verdicts.verdicts.map((v) => [v.comment_id, v]));
-    const commentsAfterVerdict: ReviewComment[] = [];
+    let commentsAfterVerdict: ReviewComment[] = [];
     for (const comment of finalReview.comments) {
       const verdict = verdictMap.get(comment.comment_id);
       if (verdict?.decision === "drop") continue;
@@ -1085,6 +1095,88 @@ export async function processReviewJob(data: ReviewJobData) {
         }
       }
       commentsAfterVerdict.push(comment);
+    }
+
+    const coveragePlan = buildCoveragePlan({
+      changedFiles: changedFiles as Array<{
+        path?: string;
+        filename?: string;
+        additions?: number;
+        deletions?: number;
+      }>,
+      changedFileStats: contextPack.changedFileStats,
+      comments: commentsAfterVerdict,
+      maxTargets: Math.min(12, Math.max(4, Math.ceil(resolvedConfig.limits.max_inline_comments * 0.5)))
+    });
+    const coverageDiagnostics = {
+      attempted: false,
+      targets: coveragePlan.targets.length,
+      added: 0,
+      droppedDuplicates: 0,
+      droppedLowValue: 0
+    };
+    const shouldRunCoveragePass =
+      coveragePlan.shouldRun &&
+      coveragePlan.targets.length > 0 &&
+      !resolvedConfig.output.summaryOnly &&
+      resolvedConfig.commentTypes.allow.includes("inline") &&
+      commentsAfterVerdict.length < resolvedConfig.limits.max_inline_comments;
+
+    if (shouldRunCoveragePass) {
+      coverageDiagnostics.attempted = true;
+      try {
+        const coveragePrompt = buildCoverageReviewerPrompt({
+          config: resolvedConfig,
+          paths: promptPaths,
+          existingFindings: commentsAfterVerdict
+            .slice(0, 120)
+            .map((comment) => ({
+              path: comment.path,
+              line: comment.line,
+              severity: comment.severity,
+              category: comment.category,
+              title: comment.title
+            })),
+          targets: coveragePlan.targets
+        });
+        await runCodexStage({
+          stage: "reviewer",
+          repoPath,
+          bundleDir,
+          outDir,
+          codexHomeDir,
+          prompt: coveragePrompt,
+          headSha: refreshed.headSha,
+          repoId: repo.id,
+          reviewRunId: run.id,
+          prNumber
+        });
+
+        const coverageDraft = await readJsonWithFallback(
+          path.join(outDir, "coverage_draft_review.json"),
+          ReviewSchema,
+          "reviewer"
+        );
+        const merged = mergeSupplementalComments({
+          base: commentsAfterVerdict,
+          supplemental: coverageDraft.comments
+        });
+        commentsAfterVerdict = merged.comments;
+        coverageDiagnostics.added = merged.added;
+        coverageDiagnostics.droppedDuplicates = merged.droppedDuplicates;
+        coverageDiagnostics.droppedLowValue = merged.droppedLowValue;
+        if (merged.added > 0) {
+          finalReview.summary = mergeSupplementalSummary({
+            base: finalReview.summary,
+            supplemental: coverageDraft.summary,
+            maxKeyConcerns: resolvedConfig.limits.max_key_concerns
+          });
+        }
+      } catch (err) {
+        console.warn(`[run ${run.id} pr#${prNumber}] coverage pass failed; continuing with primary review`, {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
     }
 
     const qualityRefinement = refineReviewComments({
@@ -1453,6 +1545,25 @@ export async function processReviewJob(data: ReviewJobData) {
     if (qualityRefinement.diagnostics.downgradedBlocking > 0) {
       qualityWarnings.push(
         `Quality gate downgraded ${qualityRefinement.diagnostics.downgradedBlocking} blocking comment(s) missing a concrete patch.`
+      );
+    }
+    if (coverageDiagnostics.attempted) {
+      qualityWarnings.push(
+        `Coverage pass scanned ${coverageDiagnostics.targets} uncovered changed file(s) and added ${coverageDiagnostics.added} additional finding(s).`
+      );
+      if (coverageDiagnostics.droppedDuplicates > 0) {
+        qualityWarnings.push(
+          `Coverage pass dropped ${coverageDiagnostics.droppedDuplicates} duplicate supplemental finding(s).`
+        );
+      }
+      if (coverageDiagnostics.droppedLowValue > 0) {
+        qualityWarnings.push(
+          `Coverage pass dropped ${coverageDiagnostics.droppedLowValue} low-value supplemental finding(s).`
+        );
+      }
+    } else if (coveragePlan.stats.uncoveredChanged > 0) {
+      qualityWarnings.push(
+        `Changed-file coverage before quality gate: ${(coveragePlan.stats.coverageRatio * 100).toFixed(0)}% (${coveragePlan.stats.coveredChanged}/${coveragePlan.stats.totalChanged}).`
       );
     }
     if (fullRepoStaticAudit) {

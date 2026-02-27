@@ -123,11 +123,11 @@ const GLOBAL_EDGE_BUDGET_BASE: Record<string, number> = {
 
 const DEFAULT_TRAVERSAL_OPTIONS: GraphTraversalOptions = {
   max_depth: 5,
-  min_score: 0.09,
-  max_related_files: 18,
-  max_graph_links: 80,
-  hard_include_files: 5,
-  max_nodes_visited: 1800
+  min_score: 0.07,
+  max_related_files: 28,
+  max_graph_links: 110,
+  hard_include_files: 8,
+  max_nodes_visited: 2600
 };
 
 function edgeWeightFromData(data: unknown): number {
@@ -838,10 +838,12 @@ export async function buildContextPack(params: {
     hotspotMap.set(finding.path, existing);
   }
 
-  const maxRelatedFiles = Math.min(
-    graphImpact.options.max_related_files,
-    changedPaths.length <= 2 ? 14 : changedPaths.length <= 5 ? 16 : graphImpact.options.max_related_files
-  );
+  const maxRelatedFiles =
+    changedPaths.length <= 2
+      ? Math.min(graphImpact.options.max_related_files, 20)
+      : changedPaths.length <= 5
+        ? Math.min(graphImpact.options.max_related_files, 24)
+        : graphImpact.options.max_related_files;
   const hardIncludeBudget = Math.min(
     graphImpact.options.hard_include_files,
     Math.max(2, Math.floor(maxRelatedFiles / 3))
@@ -882,11 +884,11 @@ export async function buildContextPack(params: {
                 : -Math.min(0.16, (graphDepth - 3) * 0.06);
 
       const graphOnly = retrievalRaw <= 0;
-      if (graphOnly && graphDepth > 3) return null;
-      if (graphOnly && graphScore < 0.22 && hotspotBonus < 0.04) return null;
+      if (graphOnly && graphDepth > 4) return null;
+      if (graphOnly && graphScore < 0.16 && hotspotBonus < 0.03) return null;
 
       const combinedScore = graphScore * 0.46 + retrievalScore * 0.4 + hotspotBonus + sameDirBonus + depthBonus;
-      if (combinedScore < 0.06) return null;
+      if (combinedScore < 0.045) return null;
       return { path, combinedScore };
     })
     .filter((item): item is { path: string; combinedScore: number } => Boolean(item))

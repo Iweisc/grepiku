@@ -1,4 +1,4 @@
-import { reviewQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
+import { reviewQueue, mentionQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
 
 export async function enqueueReviewJob(data: any) {
   await reviewQueue.add("review", data, {
@@ -10,7 +10,7 @@ export async function enqueueReviewJob(data: any) {
 }
 
 export async function enqueueCommentReplyJob(data: any) {
-  await reviewQueue.add("comment-reply", data, {
+  await mentionQueue.add("comment-reply", data, {
     removeOnComplete: true,
     removeOnFail: false,
     attempts: 2,

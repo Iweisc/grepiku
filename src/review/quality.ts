@@ -242,7 +242,7 @@ export function refineReviewComments(params: {
   const deduped = dedupeAndKeepStrongest(ranked);
   diagnostics.deduplicated = deduped.dropped;
 
-  const maxPerFile = Math.max(2, Math.min(6, Math.ceil(params.maxInlineComments / 3)));
+  const maxPerFile = Math.max(3, Math.min(12, Math.ceil(params.maxInlineComments / 2)));
   const keptInlineByPath = new Map<string, number>();
   const afterPerFileCap: RankedComment[] = [];
 

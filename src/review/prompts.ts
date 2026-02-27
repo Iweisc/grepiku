@@ -48,7 +48,7 @@ ${scopeRules.join("\n")}
 - Prioritize correctness, security, performance regressions, API contract breaks, and missing tests.
 - Use context_pack.json (reviewFocus, hotspots, graphLinks, graphPaths, graphDebug, retrieved) to reason about cross-file impact.
 - Avoid duplicate findings: one comment per root cause.
-- Keep inline comments concentrated on highest-impact issues; avoid flooding a single file.
+- Prefer high recall for independent high-impact issues; it is acceptable to report multiple inline comments in one file when they represent distinct root causes.
 - Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.
 - Blocking requires concrete evidence and a clear fix/suggested patch.
 - Cap inline comments at ${config.limits.max_inline_comments}.
@@ -71,6 +71,111 @@ Output requirements:
       { "path": "string", "summary": "string", "risk": "low|medium|high (optional)" }
     ],
     "diagram_mermaid": "string (optional)"
+  },
+  "comments": [
+    {
+      "comment_id": "string",
+      "comment_key": "string",
+      "path": "string",
+      "side": "RIGHT|LEFT",
+      "line": 123,
+      "severity": "blocking|important|nit",
+      "category": "bug|security|performance|maintainability|testing|style",
+      "title": "string",
+      "body": "string",
+      "evidence": "string",
+      "suggested_patch": "string (optional)",
+      "comment_type": "inline|summary (optional)",
+      "rule_id": "string (optional)",
+      "rule_reason": "string (optional)",
+      "confidence": "high|medium|low (optional)"
+    }
+  ]
+}
+
+Do not print anything else to stdout. Ensure the JSON is valid.`;
+}
+
+export function buildCoverageReviewerPrompt(params: {
+  config: RepoConfig;
+  paths: PromptPaths;
+  existingFindings: Array<{
+    path: string;
+    line: number;
+    severity: "blocking" | "important" | "nit";
+    category: "bug" | "security" | "performance" | "maintainability" | "testing" | "style";
+    title: string;
+  }>;
+  targets: Array<{
+    path: string;
+    risk: "low" | "medium" | "high";
+    additions?: number;
+    deletions?: number;
+    reason: string;
+  }>;
+}): string {
+  const existingBlock =
+    params.existingFindings.length > 0
+      ? params.existingFindings
+          .slice(0, 120)
+          .map(
+            (item) =>
+              `- ${item.path}:${item.line} [${item.severity}/${item.category}] ${item.title}`
+          )
+          .join("\n")
+      : "- (none)";
+
+  const targetBlock =
+    params.targets.length > 0
+      ? params.targets
+          .map((target) => {
+            const churn = (target.additions || 0) + (target.deletions || 0);
+            return `- ${target.path} (risk=${target.risk}, churn=${churn}) reason: ${target.reason}`;
+          })
+          .join("\n")
+      : "- (none)";
+
+  const maxExtra = Math.max(2, Math.floor(params.config.limits.max_inline_comments * 0.5));
+  return `You are running a supplemental PR review pass to improve recall.
+
+Context files:
+- ${bundlePath(params.paths, "pr.md")}
+- ${bundlePath(params.paths, "diff.patch")}
+- ${bundlePath(params.paths, "changed_files.json")}
+- ${bundlePath(params.paths, "bot_config.json")}
+- ${bundlePath(params.paths, "rules.json")}
+- ${bundlePath(params.paths, "scopes.json")}
+- ${bundlePath(params.paths, "context_pack.json")}
+- Repo checkout: ${params.paths.repoPath} (read-only)
+
+Focus only on these changed files that were not covered well in the first pass:
+${targetBlock}
+
+Existing findings already reported (do not duplicate these root causes):
+${existingBlock}
+
+Rules:
+- Only produce net-new findings; if nothing new is found, return an empty comments array.
+- Only comment on lines that exist in diff.patch.
+- Prioritize correctness, security, performance regressions, contract breaks, and missing tests.
+- Evidence is required for every comment and must quote diff/context.
+- Inline comments must include a suggested_patch.
+- Avoid style nits.
+- Cap output to at most ${maxExtra} comments.
+- Prefer high-confidence comments. Low-confidence comments should be omitted.
+
+Output requirements:
+- Write JSON to ${outPath(params.paths, "coverage_draft_review.json")} with this schema:
+{
+  "summary": {
+    "overview": "string",
+    "risk": "low|medium|high",
+    "confidence": 0.0,
+    "key_concerns": ["string"],
+    "what_to_test": ["string"],
+    "file_breakdown": [
+      { "path": "string", "summary": "string", "risk": "low|medium|high (optional)" }
+    ]
   },
   "comments": [
     {

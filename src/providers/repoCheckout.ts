@@ -5,6 +5,26 @@ import { loadEnv } from "../config/env.js";
 
 const SAME_SHA_WORKTREE_TTL_MS = 6 * 60 * 60 * 1000;
 const SAME_SHA_WORKTREE_KEEP_RECENT = 2;
+const repoCheckoutChains = new Map<string, Promise<void>>();
+
+async function withRepoCheckoutLock<T>(repoKey: string, fn: () => Promise<T>): Promise<T> {
+  const previous = repoCheckoutChains.get(repoKey) || Promise.resolve();
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const scheduled = previous.catch(() => undefined).then(() => gate);
+  repoCheckoutChains.set(repoKey, scheduled);
+  try {
+    await previous.catch(() => undefined);
+    return await fn();
+  } finally {
+    release();
+    if (repoCheckoutChains.get(repoKey) === scheduled) {
+      repoCheckoutChains.delete(repoKey);
+    }
+  }
+}
 
 function buildRemoteUrl(params: { owner: string; repo: string; token: string }) {
   const encodedToken = encodeURIComponent(params.token);
@@ -121,55 +141,57 @@ export async function ensureGitRepoCheckout(params: {
   token: string;
 }): Promise<string> {
   const { owner, repo, headSha, token } = params;
-  const env = loadEnv();
-  const baseDir = path.join(env.projectRoot, "var", "repos", owner, repo);
-  const worktreesDir = path.join(env.projectRoot, "var", "repos", owner, `${repo}-worktrees`);
+  return withRepoCheckoutLock(`${owner}/${repo}`, async () => {
+    const env = loadEnv();
+    const baseDir = path.join(env.projectRoot, "var", "repos", owner, repo);
+    const worktreesDir = path.join(env.projectRoot, "var", "repos", owner, `${repo}-worktrees`);
 
-  await fs.mkdir(path.dirname(baseDir), { recursive: true });
-  await fs.mkdir(worktreesDir, { recursive: true });
+    await fs.mkdir(path.dirname(baseDir), { recursive: true });
+    await fs.mkdir(worktreesDir, { recursive: true });
 
-  const repoExists = await fs
-    .stat(path.join(baseDir, ".git"))
-    .then(() => true)
-    .catch(() => false);
+    const repoExists = await fs
+      .stat(path.join(baseDir, ".git"))
+      .then(() => true)
+      .catch(() => false);
 
-  const remoteUrl = buildRemoteUrl({ owner, repo, token });
+    const remoteUrl = buildRemoteUrl({ owner, repo, token });
 
-  if (!repoExists) {
-    await execa("git", ["clone", remoteUrl, baseDir], { stdio: "inherit" });
-  } else {
-    await execa("git", ["-C", baseDir, "remote", "set-url", "origin", remoteUrl], {
-      stdio: "inherit"
-    });
-    await execa("git", ["-C", baseDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
-  }
-
-  await execa("git", ["-C", baseDir, "remote", "set-head", "origin", "-a"], {
-    stdio: ["ignore", "ignore", "ignore"]
-  }).catch(() => undefined);
-
-  const checkoutRef = await resolveCheckoutRef(baseDir, headSha);
-  const worktreeKey = toWorktreeKey(checkoutRef);
-
-  await pruneSameShaWorktrees({ baseDir, worktreesDir, headSha: worktreeKey });
-
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const suffix = `${Date.now()}-${process.pid}-${attempt}`;
-    const worktreePath = path.join(worktreesDir, `${worktreeKey}-${suffix}`);
-    try {
-      await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, checkoutRef], {
+    if (!repoExists) {
+      await execa("git", ["clone", remoteUrl, baseDir], { stdio: "inherit" });
+    } else {
+      await execa("git", ["-C", baseDir, "remote", "set-url", "origin", remoteUrl], {
         stdio: "inherit"
       });
-      return worktreePath;
-    } catch (err: any) {
-      lastError = err;
-      const stderr = String(err?.stderr || err?.shortMessage || err?.message || "");
-      if (!stderr.includes("already exists")) {
-        throw err;
+      await execa("git", ["-C", baseDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
+    }
+
+    await execa("git", ["-C", baseDir, "remote", "set-head", "origin", "-a"], {
+      stdio: ["ignore", "ignore", "ignore"]
+    }).catch(() => undefined);
+
+    const checkoutRef = await resolveCheckoutRef(baseDir, headSha);
+    const worktreeKey = toWorktreeKey(checkoutRef);
+
+    await pruneSameShaWorktrees({ baseDir, worktreesDir, headSha: worktreeKey });
+
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const suffix = `${Date.now()}-${process.pid}-${attempt}`;
+      const worktreePath = path.join(worktreesDir, `${worktreeKey}-${suffix}`);
+      try {
+        await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, checkoutRef], {
+          stdio: "inherit"
+        });
+        return worktreePath;
+      } catch (err: any) {
+        lastError = err;
+        const stderr = String(err?.stderr || err?.shortMessage || err?.message || "");
+        if (!stderr.includes("already exists")) {
+          throw err;
+        }
       }
     }
-  }
 
-  throw lastError instanceof Error ? lastError : new Error("Failed to create git worktree");
+    throw lastError instanceof Error ? lastError : new Error("Failed to create git worktree");
+  });
 }

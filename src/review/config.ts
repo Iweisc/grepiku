@@ -101,30 +101,30 @@ const GrepikuSchema = z.object({
       traversal: z
         .object({
           max_depth: z.number().int().min(1).max(8).default(5),
-          min_score: z.number().min(0.01).max(0.5).default(0.09),
-          max_related_files: z.number().int().min(6).max(80).default(18),
-          max_graph_links: z.number().int().min(10).max(240).default(80),
-          hard_include_files: z.number().int().min(0).max(24).default(5),
-          max_nodes_visited: z.number().int().min(200).max(12000).default(1800)
+          min_score: z.number().min(0.01).max(0.5).default(0.07),
+          max_related_files: z.number().int().min(6).max(80).default(28),
+          max_graph_links: z.number().int().min(10).max(240).default(110),
+          hard_include_files: z.number().int().min(0).max(24).default(8),
+          max_nodes_visited: z.number().int().min(200).max(12000).default(2600)
         })
         .default({
           max_depth: 5,
-          min_score: 0.09,
-          max_related_files: 18,
-          max_graph_links: 80,
-          hard_include_files: 5,
-          max_nodes_visited: 1800
+          min_score: 0.07,
+          max_related_files: 28,
+          max_graph_links: 110,
+          hard_include_files: 8,
+          max_nodes_visited: 2600
         })
     })
     .default({
       exclude_dirs: ["internal_harness"],
       traversal: {
         max_depth: 5,
-        min_score: 0.09,
-        max_related_files: 18,
-        max_graph_links: 80,
-        hard_include_files: 5,
-        max_nodes_visited: 1800
+        min_score: 0.07,
+        max_related_files: 28,
+        max_graph_links: 110,
+        hard_include_files: 8,
+        max_nodes_visited: 2600
       }
     }),
   tools: z
@@ -190,8 +190,8 @@ const GrepikuSchema = z.object({
     .default({ summaryOnly: false, destination: "both" }),
   retrieval: z
     .object({
-      topK: z.number().int().min(4).max(60).default(18),
-      maxPerPath: z.number().int().min(1).max(12).default(4),
+      topK: z.number().int().min(4).max(60).default(28),
+      maxPerPath: z.number().int().min(1).max(12).default(6),
       semanticWeight: z.number().min(0).max(1).default(0.62),
       lexicalWeight: z.number().min(0).max(1).default(0.22),
       rrfWeight: z.number().min(0).max(1).default(0.08),
@@ -202,8 +202,8 @@ const GrepikuSchema = z.object({
       chunkBoost: z.number().min(0).max(1).default(0.03)
     })
     .default({
-      topK: 18,
-      maxPerPath: 4,
+      topK: 28,
+      maxPerPath: 6,
       semanticWeight: 0.62,
       lexicalWeight: 0.22,
       rrfWeight: 0.08,

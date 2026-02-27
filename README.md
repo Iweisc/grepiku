@@ -71,11 +71,11 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
     "exclude_dirs": ["internal_harness"],
     "traversal": {
       "max_depth": 5,
-      "min_score": 0.09,
-      "max_related_files": 18,
-      "max_graph_links": 80,
-      "hard_include_files": 5,
-      "max_nodes_visited": 1800
+      "min_score": 0.07,
+      "max_related_files": 28,
+      "max_graph_links": 110,
+      "hard_include_files": 8,
+      "max_nodes_visited": 2600
     }
   },
   "tools": {
@@ -91,8 +91,8 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
   "commentTypes": { "allow": ["inline", "summary"] },
   "output": { "summaryOnly": false, "destination": "comment" },
   "retrieval": {
-    "topK": 18,
-    "maxPerPath": 4,
+    "topK": 28,
+    "maxPerPath": 6,
     "semanticWeight": 0.62,
     "lexicalWeight": 0.22,
     "rrfWeight": 0.08,
@@ -125,6 +125,11 @@ If missing, defaults are used and tools are marked as skipped.
 - Each run writes artifacts under `var/runs/<runId>`.
 - Worker executes `codex-exec` directly and injects MCP roots for repo/bundle/out paths.
 - Review and mention pipelines are local-first: diff/changed-file context is computed from local git checkout by default, with GitHub API as fallback.
+- Review and mention-reply workloads run on separate BullMQ queues, so `@grepiku` Q&A / `do:` jobs do not wait behind long PR review runs.
+- When changed-file coverage is low, Grepiku runs a supplemental coverage pass focused on uncovered changed files to improve bug recall.
+- Worker concurrency can be tuned with:
+  - `REVIEW_WORKER_CONCURRENCY` (default `3`)
+  - `MENTION_WORKER_CONCURRENCY` (default `3`)
 - Tool runs are cached in Postgres per (review run, tool).
 
 ## Endpoints
