@@ -21,6 +21,24 @@ test("parseChangedLinesByPath captures changed hunk lines", () => {
   assert.equal(lines.has(3), true);
 });
 
+test("parseChangedLinesByPath expands consecutive deletions across a line span", () => {
+  const patch = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -10,3 +10,0 @@",
+    "-line10",
+    "-line11",
+    "-line12"
+  ].join("\n");
+
+  const changed = __contextInternals.parseChangedLinesByPath(patch);
+  const lines = changed.get("src/a.ts") || new Set<number>();
+  assert.equal(lines.has(10), true);
+  assert.equal(lines.has(11), true);
+  assert.equal(lines.has(12), true);
+});
+
 test("fanout and budget internals stay deterministic", () => {
   assert.equal(__contextInternals.localEdgeFanout("file_dep"), 8);
   assert.equal(__contextInternals.localEdgeFanout("dir_contains_file"), 2);

@@ -1,6 +1,6 @@
 import { prisma } from "../db/client.js";
 import { retrieveContext } from "../services/retrieval.js";
-import { normalizePath } from "./diff.js";
+import { normalizeDiffPath, normalizePath } from "./diff.js";
 import type { RepoConfig } from "./config.js";
 
 export type ContextPack = {
@@ -129,6 +129,7 @@ const DEFAULT_TRAVERSAL_OPTIONS: GraphTraversalOptions = {
   hard_include_files: 8,
   max_nodes_visited: 2600
 };
+const ADJACENCY_PREFETCH_BATCH = 16;
 
 function edgeWeightFromData(data: unknown): number {
   if (!data || typeof data !== "object" || Array.isArray(data)) return 1;
@@ -208,6 +209,10 @@ function normalizeGraphPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/");
 }
 
+function normalizeContextPath(value: string): string {
+  return normalizeGraphPath(normalizePath(value || ""));
+}
+
 function normalizeExcludeDirPrefix(value: string): string {
   return normalizeGraphPath(value).replace(/\/+$/, "");
 }
@@ -240,6 +245,7 @@ function parseChangedLinesByPath(diffPatch: string): Map<string, Set<number>> {
   let currentPath = "";
   let inHunk = false;
   let newLine = 0;
+  let deletionRunOffset = 0;
 
   const addLine = (path: string, lineNo: number) => {
     if (!path || !Number.isFinite(lineNo) || lineNo <= 0) return;
@@ -254,11 +260,13 @@ function parseChangedLinesByPath(diffPatch: string): Map<string, Set<number>> {
       if (!target || target === "/dev/null") {
         currentPath = "";
         inHunk = false;
+        deletionRunOffset = 0;
         continue;
       }
-      const normalized = normalizePath(target.replace(/^b\//, ""));
+      const normalized = normalizeContextPath(normalizeDiffPath(target));
       currentPath = normalized;
       inHunk = false;
+      deletionRunOffset = 0;
       continue;
     }
 
@@ -270,6 +278,7 @@ function parseChangedLinesByPath(diffPatch: string): Map<string, Set<number>> {
       }
       newLine = Number(match[1]);
       inHunk = true;
+      deletionRunOffset = 0;
       continue;
     }
 
@@ -279,16 +288,19 @@ function parseChangedLinesByPath(diffPatch: string): Map<string, Set<number>> {
     if (rawLine.startsWith("+") && !rawLine.startsWith("+++")) {
       addLine(currentPath, newLine);
       newLine += 1;
+      deletionRunOffset = 0;
       continue;
     }
 
     if (rawLine.startsWith("-") && !rawLine.startsWith("---")) {
-      addLine(currentPath, Math.max(1, newLine));
+      addLine(currentPath, Math.max(1, newLine + deletionRunOffset));
+      deletionRunOffset += 1;
       continue;
     }
 
     if (rawLine.startsWith(" ")) {
       newLine += 1;
+      deletionRunOffset = 0;
       continue;
     }
   }
@@ -374,108 +386,146 @@ async function collectGraphImpact(params: {
 }): Promise<GraphImpact> {
   const options = resolveTraversalOptions(params.traversal);
   const excludePrefixes = (params.excludeDirs || []).map(normalizeExcludeDirPrefix).filter(Boolean);
-  const changedPathsForTraversal = params.changedPaths.filter(
-    (filePath) => !isExcludedGraphPath(filePath, excludePrefixes)
-  );
+  const changedPathsForTraversal = Array.from(
+    new Set(params.changedPaths.map((filePath) => normalizeContextPath(filePath)).filter(Boolean))
+  ).filter((filePath) => !isExcludedGraphPath(filePath, excludePrefixes));
 
-  if (changedPathsForTraversal.length === 0) {
-    return {
-      rankedFiles: [],
-      linkCandidates: [],
-      debug: {
-        seedNodes: 0,
-        touchedSymbolSeeds: 0,
-        visitedNodes: 0,
-        traversedEdges: 0,
-        prunedByBudget: 0,
-        maxDepth: options.max_depth,
-        minScore: options.min_score,
-        maxNodesVisited: options.max_nodes_visited,
-        traversalMs: 0
-      },
-      options
-    };
-  }
+  const emptyImpact = (): GraphImpact => ({
+    rankedFiles: [],
+    linkCandidates: [],
+    debug: {
+      seedNodes: 0,
+      touchedSymbolSeeds: 0,
+      visitedNodes: 0,
+      traversedEdges: 0,
+      prunedByBudget: 0,
+      maxDepth: options.max_depth,
+      minScore: options.min_score,
+      maxNodesVisited: options.max_nodes_visited,
+      traversalMs: 0
+    },
+    options
+  });
 
-  const [nodes, edges] = await Promise.all([
-    prisma.graphNode.findMany({
-      where: { repoId: params.repoId, type: { in: ["file", "symbol", "directory", "module"] } },
-      select: { id: true, type: true, key: true, fileId: true, data: true }
-    }),
-    prisma.graphEdge.findMany({
-      where: { repoId: params.repoId, type: { in: [...TRAVERSABLE_EDGE_TYPES] } },
-      select: { fromNodeId: true, toNodeId: true, type: true, data: true }
-    })
-  ]);
+  if (changedPathsForTraversal.length === 0) return emptyImpact();
 
-  if (nodes.length === 0 || edges.length === 0) {
-    return {
-      rankedFiles: [],
-      linkCandidates: [],
-      debug: {
-        seedNodes: 0,
-        touchedSymbolSeeds: 0,
-        visitedNodes: 0,
-        traversedEdges: 0,
-        prunedByBudget: 0,
-        maxDepth: options.max_depth,
-        minScore: options.min_score,
-        maxNodesVisited: options.max_nodes_visited,
-        traversalMs: 0
-      },
-      options
-    };
-  }
+  const changedFileNodes = await prisma.graphNode.findMany({
+    where: {
+      repoId: params.repoId,
+      type: "file",
+      key: { in: changedPathsForTraversal }
+    },
+    select: { id: true, type: true, key: true, fileId: true, data: true }
+  });
+  if (changedFileNodes.length === 0) return emptyImpact();
 
   const nodeById = new Map<number, GraphNodeLite>();
   const fileNodeIdByPath = new Map<string, number>();
-  const symbolRangesByFileId = new Map<number, Array<{ nodeId: number; startLine: number; endLine: number }>>();
   const directoryNodeIdByPath = new Map<string, number>();
+  const symbolRangesByFileId = new Map<number, Array<{ nodeId: number; startLine: number; endLine: number }>>();
+  const outgoing = new Map<number, GraphEdgeLite[]>();
+  const incoming = new Map<number, GraphEdgeLite[]>();
+  const seenEdges = new Set<string>();
+  const loadedAdjacencyFor = new Set<number>();
 
-  for (const node of nodes) {
+  const registerNode = (node: GraphNodeLite) => {
     nodeById.set(node.id, node);
     if (node.type === "file") {
-      fileNodeIdByPath.set(node.key, node.id);
-      continue;
+      fileNodeIdByPath.set(normalizeContextPath(node.key), node.id);
+      return;
     }
     if (node.type === "directory") {
-      directoryNodeIdByPath.set(node.key.replace(/^dir:/, ""), node.id);
-      continue;
+      directoryNodeIdByPath.set(normalizeContextPath(node.key.replace(/^dir:/, "")), node.id);
     }
-    if (node.type !== "symbol" || !node.fileId) continue;
-    const range = parseSymbolRange(node.data);
-    if (!range) continue;
-    const list = symbolRangesByFileId.get(node.fileId) || [];
-    list.push({ nodeId: node.id, startLine: range.startLine, endLine: range.endLine });
-    symbolRangesByFileId.set(node.fileId, list);
-  }
+  };
 
-  const changedFileNodeIds = changedPathsForTraversal
-    .map((filePath) => fileNodeIdByPath.get(filePath) || null)
-    .filter((value): value is number => value !== null);
-  if (changedFileNodeIds.length === 0) {
-    return {
-      rankedFiles: [],
-      linkCandidates: [],
-      debug: {
-        seedNodes: 0,
-        touchedSymbolSeeds: 0,
-        visitedNodes: 0,
-        traversedEdges: 0,
-        prunedByBudget: 0,
-        maxDepth: options.max_depth,
-        minScore: options.min_score,
-        maxNodesVisited: options.max_nodes_visited,
-        traversalMs: 0
+  const registerEdge = (edge: GraphEdgeLite) => {
+    const edgeKey = `${edge.fromNodeId}:${edge.toNodeId}:${edge.type}`;
+    if (seenEdges.has(edgeKey)) return;
+    seenEdges.add(edgeKey);
+
+    const outList = outgoing.get(edge.fromNodeId) || [];
+    outList.push(edge);
+    outgoing.set(edge.fromNodeId, outList);
+
+    const inList = incoming.get(edge.toNodeId) || [];
+    inList.push(edge);
+    incoming.set(edge.toNodeId, inList);
+  };
+
+  for (const node of changedFileNodes) registerNode(node);
+
+  const changedFileNodeIds = changedFileNodes.map((node) => node.id);
+  const changedFileIds = Array.from(
+    new Set(changedFileNodes.map((node) => node.fileId).filter((value): value is number => typeof value === "number"))
+  );
+  if (changedFileNodeIds.length === 0) return emptyImpact();
+
+  const ensureNodesLoaded = async (nodeIds: number[]) => {
+    const missingIds = Array.from(new Set(nodeIds.filter((nodeId) => !nodeById.has(nodeId))));
+    if (missingIds.length === 0) return;
+    const nodes = await prisma.graphNode.findMany({
+      where: {
+        repoId: params.repoId,
+        id: { in: missingIds },
+        type: { in: ["file", "symbol", "directory", "module"] }
       },
-      options
-    };
-  }
+      select: { id: true, type: true, key: true, fileId: true, data: true }
+    });
+    for (const node of nodes) registerNode(node);
+  };
+
+  const ensureAdjacencyFor = async (nodeIds: number[]) => {
+    const missingIds = Array.from(
+      new Set(nodeIds.filter((nodeId) => Number.isFinite(nodeId) && !loadedAdjacencyFor.has(nodeId)))
+    );
+    if (missingIds.length === 0) return;
+
+    const batchSize = 120;
+    for (let i = 0; i < missingIds.length; i += batchSize) {
+      const batchIds = missingIds.slice(i, i + batchSize);
+      const edges = await prisma.graphEdge.findMany({
+        where: {
+          repoId: params.repoId,
+          type: { in: [...TRAVERSABLE_EDGE_TYPES] },
+          OR: [{ fromNodeId: { in: batchIds } }, { toNodeId: { in: batchIds } }]
+        },
+        select: { fromNodeId: true, toNodeId: true, type: true, data: true }
+      });
+
+      const connectedNodeIds: number[] = [];
+      for (const edge of edges) {
+        registerEdge(edge);
+        connectedNodeIds.push(edge.fromNodeId, edge.toNodeId);
+      }
+      await ensureNodesLoaded(connectedNodeIds);
+      for (const nodeId of batchIds) loadedAdjacencyFor.add(nodeId);
+    }
+  };
 
   const changedLinesByPath = parseChangedLinesByPath(params.diffPatch);
+  if (changedFileIds.length > 0) {
+    const symbolSeedNodes = await prisma.graphNode.findMany({
+      where: {
+        repoId: params.repoId,
+        type: "symbol",
+        fileId: { in: changedFileIds }
+      },
+      select: { id: true, type: true, key: true, fileId: true, data: true }
+    });
+    for (const node of symbolSeedNodes) {
+      registerNode(node);
+      if (!node.fileId) continue;
+      const range = parseSymbolRange(node.data);
+      if (!range) continue;
+      const list = symbolRangesByFileId.get(node.fileId) || [];
+      list.push({ nodeId: node.id, startLine: range.startLine, endLine: range.endLine });
+      symbolRangesByFileId.set(node.fileId, list);
+    }
+  }
+
   const startNodeIds = new Set<number>(changedFileNodeIds);
   let touchedSymbolSeeds = 0;
-
   const addSeed = (nodeId: number) => {
     if (startNodeIds.has(nodeId)) return false;
     startNodeIds.add(nodeId);
@@ -486,7 +536,7 @@ async function collectGraphImpact(params: {
     const fileNode = nodeById.get(fileNodeId);
     if (!fileNode?.fileId) continue;
 
-    const lineSet = changedLinesByPath.get(fileNode.key);
+    const lineSet = changedLinesByPath.get(normalizeContextPath(fileNode.key));
     const ranges = symbolRangesByFileId.get(fileNode.fileId) || [];
 
     let seededInFile = 0;
@@ -508,30 +558,49 @@ async function collectGraphImpact(params: {
         if (addSeed(range.nodeId)) touchedSymbolSeeds += 1;
       }
     }
+  }
 
-    for (const dir of buildDirectoryChain(fileNode.key)) {
-      const dirNodeId = directoryNodeIdByPath.get(dir);
-      if (dirNodeId) addSeed(dirNodeId);
+  const directoryKeys = Array.from(
+    new Set(
+      changedFileNodes
+        .flatMap((node) => buildDirectoryChain(node.key))
+        .map((dirPath) => `dir:${normalizeContextPath(dirPath)}`)
+    )
+  );
+  if (directoryKeys.length > 0) {
+    const directoryNodes = await prisma.graphNode.findMany({
+      where: {
+        repoId: params.repoId,
+        type: "directory",
+        key: { in: directoryKeys }
+      },
+      select: { id: true, type: true, key: true, fileId: true, data: true }
+    });
+    for (const node of directoryNodes) {
+      registerNode(node);
+      addSeed(node.id);
     }
   }
 
-  const outgoing = new Map<number, GraphEdgeLite[]>();
-  const incoming = new Map<number, GraphEdgeLite[]>();
-  const changedFileNodeIdSet = new Set(changedFileNodeIds);
-  for (const edge of edges) {
-    if (!nodeById.has(edge.fromNodeId) || !nodeById.has(edge.toNodeId)) continue;
-    const outList = outgoing.get(edge.fromNodeId) || [];
-    outList.push(edge);
-    outgoing.set(edge.fromNodeId, outList);
-
-    const inList = incoming.get(edge.toNodeId) || [];
-    inList.push(edge);
-    incoming.set(edge.toNodeId, inList);
-
-    if (edge.type !== "module_contains" || !changedFileNodeIdSet.has(edge.toNodeId)) continue;
-    const fromNode = nodeById.get(edge.fromNodeId);
-    if (fromNode?.type === "module") addSeed(edge.fromNodeId);
+  const moduleSeedEdges = await prisma.graphEdge.findMany({
+    where: {
+      repoId: params.repoId,
+      type: "module_contains",
+      toNodeId: { in: changedFileNodeIds }
+    },
+    select: { fromNodeId: true, toNodeId: true, type: true, data: true }
+  });
+  const moduleSeedIds = Array.from(new Set(moduleSeedEdges.map((edge) => edge.fromNodeId)));
+  if (moduleSeedIds.length > 0) {
+    await ensureNodesLoaded(moduleSeedIds);
+    for (const edge of moduleSeedEdges) registerEdge(edge);
+    for (const nodeId of moduleSeedIds) {
+      const moduleNode = nodeById.get(nodeId);
+      if (moduleNode?.type === "module") addSeed(nodeId);
+    }
   }
+
+  await ensureAdjacencyFor([...startNodeIds]);
 
   const minScore = options.min_score;
   const bestScore = new Map<number, number>();
@@ -555,6 +624,14 @@ async function collectGraphImpact(params: {
     visitedNodes += 1;
     if (current.depth >= options.max_depth) continue;
 
+    const prefetchNodeIds = [current.nodeId];
+    for (let i = frontier.length - 1; i >= 0 && prefetchNodeIds.length < ADJACENCY_PREFETCH_BATCH; i -= 1) {
+      const nodeId = frontier[i]?.nodeId;
+      if (!nodeId || loadedAdjacencyFor.has(nodeId)) continue;
+      prefetchNodeIds.push(nodeId);
+    }
+    await ensureAdjacencyFor(prefetchNodeIds);
+
     const candidates: Array<{
       edge: GraphEdgeLite;
       nextNodeId: number;
@@ -575,7 +652,13 @@ async function collectGraphImpact(params: {
       if (nextScore < minScore) return;
       const nextNode = nodeById.get(nextNodeId);
       const nodeBias =
-        nextNode?.type === "file" ? 1.08 : nextNode?.type === "symbol" ? 0.95 : nextNode?.type === "module" ? 0.86 : 0.8;
+        nextNode?.type === "file"
+          ? 1.08
+          : nextNode?.type === "symbol"
+            ? 0.95
+            : nextNode?.type === "module"
+              ? 0.86
+              : 0.8;
       candidates.push({
         edge,
         nextNodeId,
@@ -636,10 +719,11 @@ async function collectGraphImpact(params: {
     .map(([nodeId, graphScore]) => {
       const node = nodeById.get(nodeId);
       if (!node || node.type !== "file") return null;
-      if (isExcludedGraphPath(node.key, excludePrefixes)) return null;
-      if (changedPathSet.has(node.key)) return null;
+      const path = normalizeContextPath(node.key);
+      if (isExcludedGraphPath(path, excludePrefixes)) return null;
+      if (changedPathSet.has(path)) return null;
       return {
-        path: node.key,
+        path,
         graphScore,
         depth: bestDepth.get(nodeId) ?? options.max_depth,
         via: buildProvenanceTrace({ targetNodeId: nodeId, parentByNode, nodeById })
@@ -649,37 +733,57 @@ async function collectGraphImpact(params: {
     .sort((a, b) => b.graphScore - a.graphScore)
     .slice(0, Math.max(options.max_related_files * 4, options.max_related_files));
 
+  const candidateFileNodeIds = new Set<number>(changedFileNodeIds);
+  for (const item of rankedFiles.slice(0, Math.max(options.max_related_files * 3, 24))) {
+    const fileNodeId = fileNodeIdByPath.get(item.path);
+    if (fileNodeId) candidateFileNodeIds.add(fileNodeId);
+  }
+
   const graphLinkByKey = new Map<string, { from: string; to: string; type: string; score: number }>();
-  for (const edge of edges) {
-    if (!edge.type.startsWith("file_dep")) continue;
-    const from = nodeById.get(edge.fromNodeId);
-    const to = nodeById.get(edge.toNodeId);
-    if (!from || !to || from.type !== "file" || to.type !== "file") continue;
-    if (isExcludedGraphPath(from.key, excludePrefixes) || isExcludedGraphPath(to.key, excludePrefixes)) {
-      continue;
-    }
-    const fromScore = bestScore.get(from.id) || 0;
-    const toScore = bestScore.get(to.id) || 0;
-    if (fromScore <= 0 && toScore <= 0 && !changedPathSet.has(from.key) && !changedPathSet.has(to.key)) {
-      continue;
-    }
-    const score =
-      fromScore +
-      toScore +
-      edgeWeightFromData(edge.data) * 0.05 +
-      (edge.type === "file_dep" ? 0.05 : 0);
-    const dedupeKey = `${from.key}|${to.key}|${edge.type}`;
-    const existing = graphLinkByKey.get(dedupeKey);
-    if (!existing || score > existing.score) {
-      graphLinkByKey.set(dedupeKey, { from: from.key, to: to.key, type: edge.type, score });
+  if (candidateFileNodeIds.size > 0) {
+    const graphLinkEdges = await prisma.graphEdge.findMany({
+      where: {
+        repoId: params.repoId,
+        type: { in: ["file_dep", "file_dep_inferred"] },
+        OR: [{ fromNodeId: { in: [...candidateFileNodeIds] } }, { toNodeId: { in: [...candidateFileNodeIds] } }]
+      },
+      select: { fromNodeId: true, toNodeId: true, type: true, data: true }
+    });
+
+    await ensureNodesLoaded(
+      graphLinkEdges.flatMap((edge) => [edge.fromNodeId, edge.toNodeId])
+    );
+
+    for (const edge of graphLinkEdges) {
+      const from = nodeById.get(edge.fromNodeId);
+      const to = nodeById.get(edge.toNodeId);
+      if (!from || !to || from.type !== "file" || to.type !== "file") continue;
+      const fromPath = normalizeContextPath(from.key);
+      const toPath = normalizeContextPath(to.key);
+      if (isExcludedGraphPath(fromPath, excludePrefixes) || isExcludedGraphPath(toPath, excludePrefixes)) {
+        continue;
+      }
+      const fromScore = bestScore.get(from.id) || 0;
+      const toScore = bestScore.get(to.id) || 0;
+      if (fromScore <= 0 && toScore <= 0 && !changedPathSet.has(fromPath) && !changedPathSet.has(toPath)) {
+        continue;
+      }
+      const score =
+        fromScore +
+        toScore +
+        edgeWeightFromData(edge.data) * 0.05 +
+        (edge.type === "file_dep" ? 0.05 : 0);
+      const dedupeKey = `${fromPath}|${toPath}|${edge.type}`;
+      const existing = graphLinkByKey.get(dedupeKey);
+      if (!existing || score > existing.score) {
+        graphLinkByKey.set(dedupeKey, { from: fromPath, to: toPath, type: edge.type, score });
+      }
     }
   }
 
-  const linkCandidates = Array.from(graphLinkByKey.values()).sort((a, b) => b.score - a.score);
-
   return {
     rankedFiles,
-    linkCandidates,
+    linkCandidates: Array.from(graphLinkByKey.values()).sort((a, b) => b.score - a.score),
     debug: {
       seedNodes: startNodeIds.size,
       touchedSymbolSeeds,
@@ -714,7 +818,7 @@ export async function buildContextPack(params: {
   const changedFileStats = params.changedFiles
     .map((file) => {
       const rawPath = file.filename || file.path || "";
-      const path = normalizePath(rawPath);
+      const path = normalizeContextPath(rawPath);
       if (!path) return null;
       const additions = typeof file.additions === "number" ? file.additions : undefined;
       const deletions = typeof file.deletions === "number" ? file.deletions : undefined;
@@ -731,7 +835,7 @@ export async function buildContextPack(params: {
     })
     .filter((value): value is NonNullable<typeof value> => Boolean(value));
 
-  const changedPaths = changedFileStats.map((file) => file.path);
+  const changedPaths = Array.from(new Set(changedFileStats.map((file) => file.path)));
   const diffSignals = buildDiffSignalSnippet(params.diffPatch);
   const queryParts = [
     params.prTitle ? `PR title: ${params.prTitle}` : "",
@@ -744,7 +848,7 @@ export async function buildContextPack(params: {
   const retrieved = await retrieveContext({
     repoId: params.repoId,
     query,
-    topK: params.retrieval?.topK ?? params.topK ?? 18,
+    topK: params.retrieval?.topK ?? params.topK ?? 28,
     maxPerPath: params.retrieval?.maxPerPath,
     changedPaths,
     weights: params.retrieval
@@ -846,11 +950,11 @@ export async function buildContextPack(params: {
         : graphImpact.options.max_related_files;
   const hardIncludeBudget = Math.min(
     graphImpact.options.hard_include_files,
-    Math.max(2, Math.floor(maxRelatedFiles / 3))
+    Math.max(1, Math.floor(maxRelatedFiles / 4))
   );
   const hardIncludePreferred = graphImpact.rankedFiles
     .filter((item) => !changedPathSet.has(item.path))
-    .filter((item) => item.depth <= 2 || item.graphScore >= 0.42)
+    .filter((item) => item.depth <= 2 || item.graphScore >= 0.5)
     .map((item) => item.path);
   const hardIncludeFallback = graphImpact.rankedFiles
     .filter((item) => !changedPathSet.has(item.path))
@@ -859,6 +963,18 @@ export async function buildContextPack(params: {
     0,
     hardIncludeBudget
   );
+
+  const retrievalRankedPaths = Array.from(retrievalScoreByPath.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([path]) => path);
+  const retrievalAnchorBudget = Math.min(maxRelatedFiles, Math.max(4, Math.floor(maxRelatedFiles / 2)));
+  const retrievalAnchorPreferred = retrievalRankedPaths.filter((path) => {
+    const retrievalScore = (retrievalScoreByPath.get(path) || 0) / maxRetrievalScore;
+    return retrievalScore >= 0.55 || sharesChangedDir(path) || (graphScoreByPath.get(path) || 0) > 0;
+  });
+  const retrievalAnchors = Array.from(
+    new Set([...retrievalAnchorPreferred, ...retrievalRankedPaths])
+  ).slice(0, retrievalAnchorBudget);
 
   const combinedRanked = candidatePaths
     .filter((path) => !changedPathSet.has(path))
@@ -884,18 +1000,21 @@ export async function buildContextPack(params: {
                 : -Math.min(0.16, (graphDepth - 3) * 0.06);
 
       const graphOnly = retrievalRaw <= 0;
-      if (graphOnly && graphDepth > 4) return null;
-      if (graphOnly && graphScore < 0.16 && hotspotBonus < 0.03) return null;
+      if (graphOnly && graphDepth > 3) return null;
+      if (graphOnly && graphScore < 0.22 && hotspotBonus < 0.04) return null;
+      if (!graphOnly && graphScore <= 0 && retrievalScore < 0.28 && !sharesChangedDir(path) && hotspotBonus < 0.03) {
+        return null;
+      }
 
-      const combinedScore = graphScore * 0.46 + retrievalScore * 0.4 + hotspotBonus + sameDirBonus + depthBonus;
-      if (combinedScore < 0.045) return null;
+      const combinedScore = graphScore * 0.34 + retrievalScore * 0.52 + hotspotBonus + sameDirBonus + depthBonus;
+      if (combinedScore < 0.06) return null;
       return { path, combinedScore };
     })
     .filter((item): item is { path: string; combinedScore: number } => Boolean(item))
     .sort((a, b) => b.combinedScore - a.combinedScore)
     .map((item) => item.path);
 
-  const relatedFiles = Array.from(new Set([...hardInclude, ...combinedRanked])).slice(
+  const relatedFiles = Array.from(new Set([...retrievalAnchors, ...hardInclude, ...combinedRanked])).slice(
     0,
     maxRelatedFiles
   );

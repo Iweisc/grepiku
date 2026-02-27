@@ -310,38 +310,17 @@ async function indexFile(params: {
   isPattern: boolean;
 }): Promise<number> {
   const contentHash = hashContent(params.content);
-  const existing = await prisma.fileIndex.findFirst({
-    where: { repoId: params.repoId, path: params.relativePath, isPattern: params.isPattern }
-  });
-  if (existing && existing.contentHash === contentHash && !params.force) {
+  const fileKey = {
+    repoId_path_isPattern: {
+      repoId: params.repoId,
+      path: params.relativePath,
+      isPattern: params.isPattern
+    }
+  };
+  const existing = await prisma.fileIndex.findUnique({ where: fileKey });
+  if (existing?.contentHash === contentHash && !params.force) {
     return existing.id;
   }
-
-  const fileRecord = existing
-    ? await prisma.fileIndex.update({
-        where: { id: existing.id },
-        data: {
-          language: params.language,
-          contentHash,
-          size: Buffer.byteLength(params.content),
-          lastIndexedAt: new Date()
-        }
-      })
-    : await prisma.fileIndex.create({
-        data: {
-          repoId: params.repoId,
-          path: params.relativePath,
-          language: params.language,
-          contentHash,
-          size: Buffer.byteLength(params.content),
-          lastIndexedAt: new Date(),
-          isPattern: params.isPattern
-        }
-      });
-
-  await prisma.symbolReference.deleteMany({ where: { fileId: fileRecord.id } });
-  await prisma.symbol.deleteMany({ where: { fileId: fileRecord.id } });
-  await prisma.embedding.deleteMany({ where: { fileId: fileRecord.id } });
 
   const languageConfig = languageMap[path.extname(params.relativePath).toLowerCase()];
   let symbols: Array<{
@@ -374,65 +353,102 @@ async function indexFile(params: {
 
   references.push(...extractImportReferences({ relativePath: params.relativePath, content: params.content }));
 
+  const symbolPayloads = symbols.map((symbol) => ({
+    ...symbol,
+    hash: hashContent(`${symbol.name}:${symbol.kind}:${symbol.startLine}:${symbol.endLine}`)
+  }));
   const symbolTexts = symbols.map((symbol) => `${symbol.name} ${symbol.signature || ""}`);
   const symbolVectors = symbolTexts.length > 0 ? await embedTexts(symbolTexts) : [];
-
-  for (const [idx, symbol] of symbols.entries()) {
-    const hash = hashContent(`${symbol.name}:${symbol.kind}:${symbol.startLine}:${symbol.endLine}`);
-    const symbolRecord = await prisma.symbol.create({
-      data: {
-        repoId: params.repoId,
-        fileId: fileRecord.id,
-        name: symbol.name,
-        kind: symbol.kind,
-        signature: symbol.signature || null,
-        startLine: symbol.startLine,
-        endLine: symbol.endLine,
-        doc: symbol.doc || null,
-        hash
-      }
-    });
-    const embeddingVector = symbolVectors[idx] || (await embedText(`${symbol.name} ${symbol.signature || ""}`));
-    await prisma.embedding.create({
-      data: {
-        repoId: params.repoId,
-        fileId: fileRecord.id,
-        symbolId: symbolRecord.id,
-        kind: "symbol",
-        vector: embeddingVector,
-        text: `${symbol.name} ${symbol.signature || ""}`
-      }
-    });
-  }
-
-  for (const ref of references) {
-    await prisma.symbolReference.create({
-      data: {
-        repoId: params.repoId,
-        fileId: fileRecord.id,
-        refName: ref.name,
-        line: ref.line,
-        kind: ref.kind
-      }
-    });
-  }
-
   const chunks = chunkTextForEmbedding({
     content: params.content,
     maxChars: CHUNK_MAX_CHARS,
     overlapChars: CHUNK_OVERLAP_CHARS,
     maxChunks: CHUNK_MAX_PER_FILE
   });
-  if (chunks.length > 0) {
-    const chunkTexts = chunks.map((chunk) =>
-      `${params.relativePath}\nL${chunk.startLine}-${chunk.endLine}\n${chunk.text}`
-    );
-    const chunkVectors = await embedTexts(chunkTexts);
-    for (const [idx, chunk] of chunks.entries()) {
+  const chunkTexts =
+    chunks.length > 0
+      ? chunks.map((chunk) => `${params.relativePath}\nL${chunk.startLine}-${chunk.endLine}\n${chunk.text}`)
+      : [];
+  const chunkVectors = chunkTexts.length > 0 ? await embedTexts(chunkTexts) : [];
+  const fileEmbeddingText = `${params.relativePath}\n${params.content}`;
+  const fileVector = await embedText(fileEmbeddingText);
+
+  return prisma.$transaction(async (tx) => {
+    const current = await tx.fileIndex.findUnique({ where: fileKey });
+    if (current?.contentHash === contentHash && !params.force) {
+      return current.id;
+    }
+
+    const fileRecord = current
+      ? await tx.fileIndex.update({
+          where: { id: current.id },
+          data: {
+            language: params.language,
+            contentHash,
+            size: Buffer.byteLength(params.content),
+            lastIndexedAt: new Date()
+          }
+        })
+      : await tx.fileIndex.create({
+          data: {
+            repoId: params.repoId,
+            path: params.relativePath,
+            language: params.language,
+            contentHash,
+            size: Buffer.byteLength(params.content),
+            lastIndexedAt: new Date(),
+            isPattern: params.isPattern
+          }
+        });
+
+    await tx.symbolReference.deleteMany({ where: { fileId: fileRecord.id } });
+    await tx.embedding.deleteMany({ where: { fileId: fileRecord.id } });
+    await tx.symbol.deleteMany({ where: { fileId: fileRecord.id } });
+
+    for (const [idx, symbol] of symbolPayloads.entries()) {
+      const symbolRecord = await tx.symbol.create({
+        data: {
+          repoId: params.repoId,
+          fileId: fileRecord.id,
+          name: symbol.name,
+          kind: symbol.kind,
+          signature: symbol.signature || null,
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          doc: symbol.doc || null,
+          hash: symbol.hash
+        }
+      });
+      const embeddingVector = symbolVectors[idx] || (await embedText(`${symbol.name} ${symbol.signature || ""}`));
+      await tx.embedding.create({
+        data: {
+          repoId: params.repoId,
+          fileId: fileRecord.id,
+          symbolId: symbolRecord.id,
+          kind: "symbol",
+          vector: embeddingVector,
+          text: `${symbol.name} ${symbol.signature || ""}`
+        }
+      });
+    }
+
+    for (const ref of references) {
+      await tx.symbolReference.create({
+        data: {
+          repoId: params.repoId,
+          fileId: fileRecord.id,
+          refName: ref.name,
+          line: ref.line,
+          kind: ref.kind
+        }
+      });
+    }
+
+    for (const [idx] of chunks.entries()) {
       const text = chunkTexts[idx];
       const vector = chunkVectors[idx];
-      if (!vector) continue;
-      await prisma.embedding.create({
+      if (!text || !vector) continue;
+      await tx.embedding.create({
         data: {
           repoId: params.repoId,
           fileId: fileRecord.id,
@@ -442,21 +458,19 @@ async function indexFile(params: {
         }
       });
     }
-  }
 
-  const fileEmbeddingText = `${params.relativePath}\n${params.content}`;
-  const fileVector = await embedText(fileEmbeddingText);
-  await prisma.embedding.create({
-    data: {
-      repoId: params.repoId,
-      fileId: fileRecord.id,
-      kind: "file",
-      vector: fileVector,
-      text: `${params.relativePath}\n${params.content.slice(0, 5000)}`
-    }
+    await tx.embedding.create({
+      data: {
+        repoId: params.repoId,
+        fileId: fileRecord.id,
+        kind: "file",
+        vector: fileVector,
+        text: `${params.relativePath}\n${params.content.slice(0, 5000)}`
+      }
+    });
+
+    return fileRecord.id;
   });
-
-  return fileRecord.id;
 }
 
 async function pruneStaleIndexedFiles(params: {

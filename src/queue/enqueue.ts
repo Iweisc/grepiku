@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { reviewQueue, mentionQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
 
 export async function enqueueReviewJob(data: any) {
@@ -19,7 +20,20 @@ export async function enqueueCommentReplyJob(data: any) {
 }
 
 export async function enqueueIndexJob(data: any) {
-  await indexQueue.add("index", data, { removeOnComplete: true, removeOnFail: false });
+  const repoId = String(data?.repoId ?? "unknown");
+  const patternRepo = data?.patternRepo as { url?: string; ref?: string; name?: string } | undefined;
+  const scopeRaw = patternRepo
+    ? `pattern:${patternRepo.url || patternRepo.name || "unknown"}:${patternRepo.ref || "HEAD"}`
+    : "repo";
+  const scope = crypto.createHash("sha1").update(scopeRaw).digest("hex").slice(0, 12);
+  const headSha = String(data?.headSha || "HEAD");
+  const force = data?.force ? "force" : "normal";
+  const jobId = `index:${repoId}:${scope}:${headSha}:${force}`;
+  await indexQueue.add("index", data, {
+    jobId,
+    removeOnComplete: true,
+    removeOnFail: false
+  });
 }
 
 export async function enqueueGraphJob(data: any) {
