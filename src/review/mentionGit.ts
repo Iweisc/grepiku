@@ -84,6 +84,11 @@ export function isGitPermissionDeniedError(error: unknown): boolean {
       ? `${error.name} ${error.message} ${(error as { stack?: string }).stack || ""}`
       : String(error || "");
   const normalized = text.toLowerCase();
+  const isKnownNonPermission403 =
+    normalized.includes("rate limit") ||
+    normalized.includes("secondary rate limit") ||
+    normalized.includes("abuse detection");
+  if (isKnownNonPermission403) return false;
   return (
     normalized.includes("permission to") && normalized.includes("denied") ||
     normalized.includes("resource not accessible by integration") ||

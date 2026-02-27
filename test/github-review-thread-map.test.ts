@@ -126,3 +126,27 @@ test("isIntegrationPermissionDenied detects GitHub integration 403 errors", asyn
     false
   );
 });
+
+test("isIntegrationPermissionDenied ignores known non-permission 403 failures", async () => {
+  ensureTestEnv();
+  const { __githubAdapterInternals } = await import("../src/providers/github/adapter.js");
+
+  assert.equal(
+    __githubAdapterInternals.isIntegrationPermissionDenied(
+      new Error("The requested URL returned error: 403 - API rate limit exceeded")
+    ),
+    false
+  );
+  assert.equal(
+    __githubAdapterInternals.isIntegrationPermissionDenied(
+      new Error("HTTP 403 secondary rate limit from GitHub")
+    ),
+    false
+  );
+  assert.equal(
+    __githubAdapterInternals.isIntegrationPermissionDenied(
+      new Error("HTTP 403 blocked by abuse detection mechanism")
+    ),
+    false
+  );
+});

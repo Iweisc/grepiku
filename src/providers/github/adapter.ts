@@ -253,6 +253,11 @@ function isIntegrationPermissionDenied(error: unknown): boolean {
       ? `${error.message} ${(error as { stack?: string }).stack || ""}`
       : String(error || "");
   const normalized = message.toLowerCase();
+  const isKnownNonPermission403 =
+    normalized.includes("rate limit") ||
+    normalized.includes("secondary rate limit") ||
+    normalized.includes("abuse detection");
+  if (isKnownNonPermission403) return false;
   return (
     normalized.includes("resource not accessible by integration") ||
     normalized.includes("requested url returned error: 403") ||
