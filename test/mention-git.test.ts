@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveFollowUpPrBaseBranch } from "../src/review/mentionGit.js";
+import { isGitPermissionDeniedError, resolveFollowUpPrBaseBranch } from "../src/review/mentionGit.js";
 
 test("resolveFollowUpPrBaseBranch prefers pull request base ref", () => {
   const base = resolveFollowUpPrBaseBranch({
@@ -34,4 +34,16 @@ test("resolveFollowUpPrBaseBranch falls back to repo default and then main", () 
     repoDefaultBranch: ""
   });
   assert.equal(fallbackMain, "main");
+});
+
+test("isGitPermissionDeniedError detects push permission failures", () => {
+  assert.equal(
+    isGitPermissionDeniedError(new Error("remote: Permission to org/repo.git denied to bot[bot].")),
+    true
+  );
+  assert.equal(
+    isGitPermissionDeniedError(new Error("The requested URL returned error: 403")),
+    true
+  );
+  assert.equal(isGitPermissionDeniedError(new Error("fatal: not a git repository")), false);
 });

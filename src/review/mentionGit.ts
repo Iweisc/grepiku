@@ -77,3 +77,17 @@ export async function pushBranch(params: {
     stdio: "inherit"
   });
 }
+
+export function isGitPermissionDeniedError(error: unknown): boolean {
+  const text =
+    error instanceof Error
+      ? `${error.name} ${error.message} ${(error as { stack?: string }).stack || ""}`
+      : String(error || "");
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("permission to") && normalized.includes("denied") ||
+    normalized.includes("resource not accessible by integration") ||
+    normalized.includes("requested url returned error: 403") ||
+    normalized.includes("http 403")
+  );
+}

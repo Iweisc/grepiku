@@ -247,6 +247,19 @@ export async function loadGithubReviewThreadMap(params: {
   return result;
 }
 
+function isIntegrationPermissionDenied(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? `${error.message} ${(error as { stack?: string }).stack || ""}`
+      : String(error || "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("resource not accessible by integration") ||
+    normalized.includes("requested url returned error: 403") ||
+    normalized.includes("http 403")
+  );
+}
+
 function createClient(params: {
   installationId: string | null;
   repo: ProviderRepo;
@@ -262,6 +275,7 @@ function createClient(params: {
   const prNumber = params.pullRequest.number;
   const headSha = params.pullRequest.headSha;
   let reviewThreadMapCache: Map<string, { threadId: string; isResolved: boolean }> | null = null;
+  let canResolveThreads = true;
 
   async function loadReviewThreadMap(): Promise<Map<string, { threadId: string; isResolved: boolean }>> {
     if (reviewThreadMapCache) return reviewThreadMapCache;
@@ -275,6 +289,7 @@ function createClient(params: {
   }
 
   async function resolveInlineThread(commentId: string): Promise<boolean> {
+    if (!canResolveThreads) return false;
     const lookup = await loadReviewThreadMap();
     const entry = lookup.get(String(commentId));
     if (!entry) return false;
@@ -289,7 +304,15 @@ function createClient(params: {
         }
       }
     `;
-    await (octokit as any).graphql(mutation, { threadId: entry.threadId });
+    try {
+      await (octokit as any).graphql(mutation, { threadId: entry.threadId });
+    } catch (error) {
+      if (isIntegrationPermissionDenied(error)) {
+        canResolveThreads = false;
+        return false;
+      }
+      throw error;
+    }
     entry.isResolved = true;
     return true;
   }
@@ -612,3 +635,7 @@ export async function resolveGithubBotLogin(): Promise<string> {
   if (configured) return configured;
   return getAppSlug();
 }
+
+export const __githubAdapterInternals = {
+  isIntegrationPermissionDenied
+};

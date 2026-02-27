@@ -104,3 +104,25 @@ test("loadGithubReviewThreadMap paginates comments after the first page", async 
   assert.equal(reviewThreadQueryCalls.length, 2);
   assert.equal(commentPageQueryCalls.length, 1);
 });
+
+test("isIntegrationPermissionDenied detects GitHub integration 403 errors", async () => {
+  ensureTestEnv();
+  const { __githubAdapterInternals } = await import("../src/providers/github/adapter.js");
+
+  assert.equal(
+    __githubAdapterInternals.isIntegrationPermissionDenied(
+      new Error("Resource not accessible by integration")
+    ),
+    true
+  );
+  assert.equal(
+    __githubAdapterInternals.isIntegrationPermissionDenied(
+      new Error("The requested URL returned error: 403")
+    ),
+    true
+  );
+  assert.equal(
+    __githubAdapterInternals.isIntegrationPermissionDenied(new Error("Validation failed")),
+    false
+  );
+});

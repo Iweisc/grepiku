@@ -18,6 +18,7 @@ import {
   changedPaths,
   commitWorkingTree,
   hasWorkingTreeChanges,
+  isGitPermissionDeniedError,
   mentionBranchName,
   prepareMentionBranch,
   pushBranch,
@@ -225,6 +226,13 @@ function ensureMentionPrefix(body: string, author: string): string {
 
 function withMentionMarker(body: string, commentId: string): string {
   return `<!-- grepiku-mention:${commentId} -->\n${body}`;
+}
+
+function permissionDeniedReply(author: string): string {
+  return ensureMentionPrefix(
+    "I couldn't open a follow-up PR because this app token lacks repository write permissions (push/PR create was denied). Please grant the GitHub App `Contents: Read and write` and `Pull requests: Read and write`, then rerun the `do:` command.",
+    author
+  );
 }
 
 function defaultCommitMessage(task: string): string {
@@ -726,31 +734,48 @@ ${refreshed.body || pullRequest.body || "(no description)"}
     return;
   }
 
-  const result = await runImplementPath({
-    repoPath,
-    bundleDir,
-    outDir,
-    codexHomeDir,
-    commentBody,
-    commentAuthor,
-    commentUrl,
-    commentId,
-    mentionTask,
-    client,
-    refreshed,
-    pullRequestBaseRef: pullRequest.baseRef || null,
-    pullRequestHeadRef: pullRequest.headRef || null,
-    repoDefaultBranch: repo.defaultBranch || null,
-    repoTools: repoConfig.tools,
-    replyInThread,
-    repoId: repo.id,
-    prNumber
-  });
+  try {
+    const result = await runImplementPath({
+      repoPath,
+      bundleDir,
+      outDir,
+      codexHomeDir,
+      commentBody,
+      commentAuthor,
+      commentUrl,
+      commentId,
+      mentionTask,
+      client,
+      refreshed,
+      pullRequestBaseRef: pullRequest.baseRef || null,
+      pullRequestHeadRef: pullRequest.headRef || null,
+      repoDefaultBranch: repo.defaultBranch || null,
+      repoTools: repoConfig.tools,
+      replyInThread,
+      repoId: repo.id,
+      prNumber
+    });
 
-  await markCompleted(runDir, {
-    mode: result.mode,
-    prUrl: result.prUrl || null,
-    prNumber: result.prNumber || null,
-    finishedAt: new Date().toISOString()
-  });
+    await markCompleted(runDir, {
+      mode: result.mode,
+      prUrl: result.prUrl || null,
+      prNumber: result.prNumber || null,
+      finishedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    if (!isGitPermissionDeniedError(error)) throw error;
+
+    const body = withMentionMarker(permissionDeniedReply(commentAuthor), commentId);
+    await postMentionReply({
+      client,
+      commentId,
+      body,
+      replyInThread
+    });
+    await markCompleted(runDir, {
+      mode: "answer",
+      permissionDenied: true,
+      finishedAt: new Date().toISOString()
+    });
+  }
 }
