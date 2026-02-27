@@ -10,6 +10,7 @@ import {
 
 const env = loadEnv();
 const DASHBOARD_AUTH_REALM = "Grepiku Dashboard";
+const MAX_GRAPH_EDGES = 20_000;
 
 function parseBasicAuthToken(value: string): string | null {
   const encoded = value.slice("Basic ".length).trim();
@@ -76,7 +77,8 @@ function isSameOriginRequest(request: any): boolean {
 }
 
 function canMutateRuleSuggestion(request: any): boolean {
-  return authorize(request) || isSameOriginRequest(request);
+  // Origin/Referer checks can help CSRF posture but are not authentication.
+  return authorize(request);
 }
 
 function sendDashboardUnauthorized(reply: any): void {
@@ -983,6 +985,10 @@ export function registerDashboard(app: FastifyInstance) {
     /* --- Repo full graph (file dep graph used by grepiku) --- */
     dashboardApp.get("/api/repos/:id/graph", async (request, reply) => {
     const repoId = Number((request.params as any).id);
+    if (!Number.isInteger(repoId) || repoId <= 0) {
+      reply.code(400).send({ error: "Invalid repo id" });
+      return;
+    }
 
     const fileNodes = await prisma.graphNode.findMany({
       where: { repoId, type: "file" },
@@ -1001,7 +1007,8 @@ export function registerDashboard(app: FastifyInstance) {
         fromNodeId: { in: nodeIds },
         toNodeId: { in: nodeIds }
       },
-      select: { fromNodeId: true, toNodeId: true, type: true, data: true }
+      select: { fromNodeId: true, toNodeId: true, type: true, data: true },
+      take: MAX_GRAPH_EDGES
     });
 
     // Compute degree per node

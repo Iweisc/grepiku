@@ -50,6 +50,7 @@ function mapPullRequest(payload: any): ProviderPullRequest {
     state: pr.state ?? payload.issue?.state ?? "open",
     baseRef: pr.base?.ref ?? null,
     headRef: pr.head?.ref ?? null,
+    headRepoFullName: pr.head?.repo?.full_name ?? null,
     baseSha: pr.base?.sha ?? null,
     headSha: pr.head?.sha ?? "",
     draft: Boolean(pr.draft),
@@ -529,6 +530,15 @@ function createClient(params: {
         side: created.data.side || null,
         inReplyToId: created.data.in_reply_to_id ? String(created.data.in_reply_to_id) : null
       };
+    },
+    deleteBranch: async (branch: string) => {
+      const normalized = branch.replace(/^refs\/heads\//i, "").trim();
+      if (!normalized) return;
+      await octokit.git.deleteRef({
+        owner,
+        repo,
+        ref: `heads/${normalized}`
+      });
     },
     createPullRequest: async ({ title, body, head, base, draft }) => {
       const created = await octokit.pulls.create({

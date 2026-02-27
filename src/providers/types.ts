@@ -27,6 +27,7 @@ export type ProviderPullRequest = {
   state: string;
   baseRef?: string | null;
   headRef?: string | null;
+  headRepoFullName?: string | null;
   baseSha?: string | null;
   headSha: string;
   draft?: boolean;
@@ -124,6 +125,7 @@ export type ProviderClient = {
   updateStatusCheck: (checkId: string, check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   addReaction?: (commentId: string, reaction: string) => Promise<void>;
   replyToComment?: (params: { commentId: string; body: string }) => Promise<ProviderReviewComment>;
+  deleteBranch?: (branch: string) => Promise<void>;
   createPullRequest?: (params: {
     title: string;
     body: string;

@@ -8,6 +8,7 @@ import { resolveGithubBotLogin } from "./github/adapter.js";
 import { rememberRepoInstruction } from "../services/repoMemory.js";
 import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
 import { isResolutionReply } from "./commentResolution.js";
+import { shouldDeleteClosedBotPrBranch } from "./pullRequestGuards.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -91,6 +92,43 @@ async function maybeBootstrapRepoGraph(params: {
   );
 }
 
+async function maybeDeleteClosedBotPrHeadBranch(params: {
+  event: Extract<ProviderWebhookEvent, { type: "pull_request" }>;
+  installationExternalId: string | null;
+}) {
+  if (!params.installationExternalId) return;
+  const botLogin = await resolveGithubBotLogin().catch(() => "");
+  if (
+    !shouldDeleteClosedBotPrBranch({
+      action: params.event.action,
+      repoFullName: params.event.repo.fullName,
+      pullRequest: params.event.pullRequest,
+      botLogin
+    })
+  ) {
+    return;
+  }
+  const branch = params.event.pullRequest.headRef?.trim() || "";
+  try {
+    const adapter = getProviderAdapter(params.event.provider);
+    const client = await adapter.createClient({
+      installationId: params.installationExternalId,
+      repo: params.event.repo,
+      pullRequest: params.event.pullRequest
+    });
+    if (!client.deleteBranch) return;
+    await client.deleteBranch(branch);
+    console.log(
+      `[pr ${params.event.pullRequest.number}] deleted closed bot branch ${branch}`
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[pr ${params.event.pullRequest.number}] failed to delete closed bot branch ${branch}: ${message}`
+    );
+  }
+}
+
 export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<void> {
   const provider = await ensureProvider({
     kind: event.provider,
@@ -149,7 +187,13 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   const config = await resolveRepoConfig(repo.id, provider.kind);
 
   if (event.type === "pull_request") {
-    if (event.pullRequest.state === "closed") return;
+    if (event.pullRequest.state === "closed") {
+      await maybeDeleteClosedBotPrHeadBranch({
+        event,
+        installationExternalId: installation.externalId
+      });
+      return;
+    }
     await maybeBootstrapRepoGraph({
       provider: event.provider,
       installationExternalId: installation.externalId,

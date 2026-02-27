@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isGeneratedMentionReply, isSelfBotComment, normalizeBotAwareLogin } from "../src/providers/commentGuards.js";
 import { isResolutionReply } from "../src/providers/commentResolution.js";
+import { shouldDeleteClosedBotPrBranch } from "../src/providers/pullRequestGuards.js";
 
 test("normalizeBotAwareLogin strips [bot] suffix", () => {
   assert.equal(normalizeBotAwareLogin("grepiku-dev[bot]"), "grepiku-dev");
@@ -51,4 +52,66 @@ test("isResolutionReply ignores negated resolution phrases", () => {
   assert.equal(isResolutionReply("fixed in latest commit"), true);
   assert.equal(isResolutionReply("not done yet, still debugging"), false);
   assert.equal(isResolutionReply("this isn't resolved"), false);
+});
+
+test("shouldDeleteClosedBotPrBranch allows deleting closed self-bot branches in same repo", () => {
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "closed",
+      repoFullName: "acme/grepiku",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        state: "closed",
+        headRef: "grepiku/mention-123",
+        headRepoFullName: "acme/grepiku",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    true
+  );
+});
+
+test("shouldDeleteClosedBotPrBranch rejects non-bot, open, and fork branches", () => {
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "closed",
+      repoFullName: "acme/grepiku",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        state: "closed",
+        headRef: "feature/refactor",
+        headRepoFullName: "acme/grepiku",
+        author: { login: "octocat", externalId: "2" }
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "synchronize",
+      repoFullName: "acme/grepiku",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        state: "open",
+        headRef: "grepiku/mention-123",
+        headRepoFullName: "acme/grepiku",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "closed",
+      repoFullName: "acme/grepiku",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        state: "closed",
+        headRef: "grepiku/mention-123",
+        headRepoFullName: "fork-user/grepiku",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
 });
