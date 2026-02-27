@@ -1,6 +1,12 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
+import {
+  DEFAULT_TRAVERSAL_THRESHOLDS,
+  computeTraversalRunMetrics,
+  summarizeTraversalMetrics,
+  type TraversalRunMetrics
+} from "../services/traversalMetrics.js";
 
 const env = loadEnv();
 
@@ -43,6 +49,10 @@ export function registerDashboard(app: FastifyInstance) {
         <div class="metric" id="acceptance">Acceptance: --</div>
         <div class="metric" id="merge-time">Avg Merge Time: --</div>
       </div>
+      <div class="card">
+        <div class="metric" id="traversal-quality">Traversal Recall/Precision: --</div>
+        <div class="metric" id="traversal-slo">Traversal p95: --</div>
+      </div>
     </div>
     <div class="card">
       <h2>Rule Suggestions</h2>
@@ -76,6 +86,14 @@ export function registerDashboard(app: FastifyInstance) {
           '</ul><strong>Hot Paths</strong><ul>' +
           insights.hotPaths.map(i => '<li>' + i.path + ': ' + i.count + '</li>').join('') +
           '</ul>';
+
+        const traversal = await fetch('/api/analytics/traversal').then(r => r.json());
+        document.getElementById('traversal-quality').textContent =
+          'Traversal Recall/Precision: ' +
+          (traversal.avgCrossFileRecall * 100).toFixed(1) + '% / ' +
+          (traversal.avgSupportedPrecision * 100).toFixed(1) + '%';
+        document.getElementById('traversal-slo').textContent =
+          'Traversal p95: ' + traversal.p95TraversalMs + 'ms, visited ' + traversal.p95VisitedNodes;
       }
       load();
     </script>
@@ -116,6 +134,65 @@ export function registerDashboard(app: FastifyInstance) {
         status: suggestion.status,
         rule: suggestion.ruleJson
       }))
+    });
+  });
+
+  app.get("/api/analytics/traversal", async (request, reply) => {
+    const limit = Math.max(20, Math.min(5000, Number((request.query as any)?.limit || 500)));
+    const repoIdFilter = Number((request.query as any)?.repoId || 0) || undefined;
+    const events = await prisma.analyticsEvent.findMany({
+      where: {
+        kind: "traversal_run",
+        ...(repoIdFilter ? { repoId: repoIdFilter } : {})
+      },
+      orderBy: { createdAt: "desc" },
+      take: limit
+    });
+
+    const runs: TraversalRunMetrics[] = [];
+    for (const event of events) {
+      const payload = event.payload as any;
+      if (!payload || typeof payload !== "object") continue;
+      if (typeof payload.repoId !== "number" || typeof payload.runId !== "number") continue;
+      runs.push(payload as TraversalRunMetrics);
+    }
+
+    if (runs.length === 0) {
+      const reviewRuns = await prisma.reviewRun.findMany({
+        where: {
+          status: "completed",
+          ...(repoIdFilter ? { pullRequest: { repoId: repoIdFilter } } : {})
+        },
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        include: {
+          pullRequest: { select: { repoId: true } },
+          findings: { select: { path: true, status: true } }
+        }
+      });
+      const repoFileCountCache = new Map<number, number>();
+      for (const run of reviewRuns) {
+        if (!run.contextPackJson || typeof run.contextPackJson !== "object") continue;
+        const repoId = run.pullRequest.repoId;
+        if (!repoFileCountCache.has(repoId)) {
+          const count = await prisma.fileIndex.count({ where: { repoId, isPattern: false } });
+          repoFileCountCache.set(repoId, count);
+        }
+        const metric = computeTraversalRunMetrics({
+          runId: run.id,
+          repoId,
+          contextPack: run.contextPackJson,
+          findings: run.findings,
+          repoFileCount: repoFileCountCache.get(repoId) || 0
+        });
+        if (metric) runs.push(metric);
+      }
+    }
+
+    const summary = summarizeTraversalMetrics(runs, DEFAULT_TRAVERSAL_THRESHOLDS);
+    reply.send({
+      ...summary,
+      recentRuns: runs.slice(0, 30)
     });
   });
 

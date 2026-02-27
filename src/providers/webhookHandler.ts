@@ -1,6 +1,6 @@
 import { prisma } from "../db/client.js";
 import { ensureInstallation, ensureProvider, ensureRepo, ensureRepoInstallation, ensureUser, upsertPullRequest } from "../db/records.js";
-import { enqueueCommentReplyJob, enqueueReviewJob } from "../queue/enqueue.js";
+import { enqueueCommentReplyJob, enqueueIndexJob, enqueueReviewJob } from "../queue/enqueue.js";
 import { ProviderWebhookEvent } from "./types.js";
 import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "../review/triggers.js";
 import { getProviderAdapter } from "./registry.js";
@@ -62,6 +62,38 @@ async function resolveTargetReviewComment(params: {
   });
 }
 
+async function maybeBootstrapRepoGraph(params: {
+  provider: string;
+  installationExternalId: string | null;
+  repoId: number;
+  headSha: string;
+  action: string;
+}) {
+  if (params.action !== "opened") return;
+  const [indexRuns, graphNodes] = await Promise.all([
+    prisma.indexRun.count({
+      where: {
+        repoId: params.repoId,
+        status: { in: ["running", "completed"] }
+      }
+    }),
+    prisma.graphNode.count({ where: { repoId: params.repoId } })
+  ]);
+
+  if (indexRuns > 0 || graphNodes > 0) return;
+
+  await enqueueIndexJob({
+    provider: params.provider,
+    installationId: params.installationExternalId,
+    repoId: params.repoId,
+    headSha: params.headSha,
+    force: true
+  });
+  console.log(
+    `[repo ${params.repoId}] queued initial full-codebase index bootstrap for first PR open at ${params.headSha}`
+  );
+}
+
 export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<void> {
   const provider = await ensureProvider({
     kind: event.provider,
@@ -121,6 +153,13 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
 
   if (event.type === "pull_request") {
     if (event.pullRequest.state === "closed") return;
+    await maybeBootstrapRepoGraph({
+      provider: event.provider,
+      installationExternalId: installation.externalId,
+      repoId: repo.id,
+      headSha: event.pullRequest.headSha,
+      action: event.action
+    });
     const latestRun = await prisma.reviewRun.findFirst({
       where: { pullRequestId: pullRequest.id },
       orderBy: { createdAt: "desc" }

@@ -12,6 +12,7 @@ GitHub PR review bot powered by Codex.
 - Hybrid context retrieval (semantic + lexical + RRF + changed-path boosts) with graph-aware related files
 - Full-repo embeddings with file, symbol, and chunk vectors for deeper codebase context
 - Deterministic quality gate to dedupe overlapping findings and prioritize high-signal comments
+- First PR bootstrap: full-codebase indexing + graph build, then incremental refresh on subsequent changes
 
 ## Architecture
 
@@ -66,6 +67,17 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
 ```yaml
 {
   "ignore": ["node_modules/**", "dist/**"],
+  "graph": {
+    "exclude_dirs": ["internal_harness"],
+    "traversal": {
+      "max_depth": 5,
+      "min_score": 0.09,
+      "max_related_files": 18,
+      "max_graph_links": 80,
+      "hard_include_files": 5,
+      "max_nodes_visited": 1800
+    }
+  },
   "tools": {
     "lint": { "cmd": "pnpm lint", "timeout_sec": 900 },
     "build": { "cmd": "pnpm build", "timeout_sec": 1200 },
@@ -103,6 +115,9 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
 }
 ```
 
+`graph.exclude_dirs` is a list of repo-relative directory prefixes excluded from graph generation and graph traversal seeding (indexing and retrieval remain unchanged).  
+`graph.traversal` tunes how aggressively graph traversal expands context during review.
+
 If missing, defaults are used and tools are marked as skipped.
 
 ## Runtime Notes
@@ -118,6 +133,7 @@ If missing, defaults are used and tools are marked as skipped.
 - `GET /healthz` health check
 - `GET /dashboard` analytics UI
 - Internal API: `/internal/review/enqueue`, `/internal/index/enqueue`, `/internal/rules/resolve`, `/internal/retrieval`
+- Traversal metrics API: `/api/analytics/traversal`
 
 ## Development
 
@@ -143,3 +159,19 @@ npm run start:review-loop
 ```
 
 Cycle logs are written to `var/loop/*.jsonl`.
+
+## Traversal Quality Loop
+
+Replay evaluator over historical completed runs:
+
+```bash
+npm run check:traversal-quality
+```
+
+Optional filters and thresholds:
+
+```bash
+tsx src/tools/traversalQuality.ts --ci --replay --repo-id=2 --since-days=14 --limit=500 --concurrency=4
+```
+
+The command exits non-zero in `--ci` mode when recall/precision or p95 SLO thresholds are violated.

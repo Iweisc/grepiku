@@ -46,7 +46,7 @@ ${scopeRules.join("\n")}
 - Do not include evidence quotes in body; put them only in evidence.
 - Avoid formatting/style nits.
 - Prioritize correctness, security, performance regressions, API contract breaks, and missing tests.
-- Use context_pack.json (reviewFocus, hotspots, graphLinks, retrieved) to reason about cross-file impact.
+- Use context_pack.json (reviewFocus, hotspots, graphLinks, graphPaths, graphDebug, retrieved) to reason about cross-file impact.
 - Avoid duplicate findings: one comment per root cause.
 - Keep inline comments concentrated on highest-impact issues; avoid flooding a single file.
 - Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.

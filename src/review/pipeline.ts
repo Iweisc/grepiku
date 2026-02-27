@@ -29,7 +29,7 @@ import { selectSemanticFindingCandidate } from "./findingMatch.js";
 import { ReviewOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
-import { enqueueAnalyticsJob, enqueueGraphJob, enqueueIndexJob } from "../queue/enqueue.js";
+import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
 import { resolveRules } from "./triggers.js";
 import { buildContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
@@ -525,45 +525,121 @@ function sanitizeMermaidLabel(label: string): string {
     .trim();
 }
 
-function generateMermaidDiagram(changedFiles: Array<{ filename?: string; path?: string }>, relatedFiles: string[]): string {
+function makeMermaidNodeId(path: string, index: number): string {
+  const slug = path
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 42);
+  return `p_${slug || "node"}_${index}`;
+}
+
+function generateMermaidDiagram(params: {
+  changedFiles: Array<{ filename?: string; path?: string }>;
+  relatedFiles: string[];
+  graphLinks: Array<{ from: string; to: string; type: string }>;
+}): string {
+  const changedFiles = params.changedFiles;
+  const relatedFiles = params.relatedFiles;
   const changed = changedFiles
     .map((file) => file.filename || file.path)
     .filter((value): value is string => Boolean(value));
-  if (changed.length === 0 || relatedFiles.length === 0) return "";
+  if (changed.length === 0) return "";
 
-  const maxChanged = 10;
-  const maxRelated = 12;
-  const maxEdges = 30;
-  const changedSlice = changed.slice(0, maxChanged);
-  const relatedSlice = relatedFiles.slice(0, maxRelated);
+  const maxNodes = 28;
+  const maxEdges = 42;
+  const changedSlice = changed.slice(0, 12);
+  const relatedSlice = relatedFiles.slice(0, 18);
+  const scopeSet = new Set([...changedSlice, ...relatedSlice]);
 
   const nodeIds = new Map<string, string>();
-  const allNodes = [...new Set([...changedSlice, ...relatedSlice])];
-  allNodes.forEach((path, idx) => {
-    nodeIds.set(path, `n${idx}`);
+  const edges: Array<{ from: string; to: string }> = [];
+  const dedupe = new Set<string>();
+
+  for (const link of params.graphLinks) {
+    if (link.type !== "file_dep") continue;
+    if (link.from === link.to) continue;
+    if (!scopeSet.has(link.from) && !scopeSet.has(link.to)) continue;
+    const key = `${link.from}->${link.to}`;
+    if (dedupe.has(key)) continue;
+    dedupe.add(key);
+    edges.push({ from: link.from, to: link.to });
+    if (edges.length >= maxEdges) break;
+  }
+
+  if (edges.length === 0) {
+    for (const from of changedSlice) {
+      for (const to of relatedSlice) {
+        if (from === to) continue;
+        const key = `${from}->${to}`;
+        if (dedupe.has(key)) continue;
+        dedupe.add(key);
+        edges.push({ from, to });
+        if (edges.length >= Math.min(maxEdges, 16)) break;
+      }
+      if (edges.length >= Math.min(maxEdges, 16)) break;
+    }
+  }
+  if (edges.length === 0) return "";
+
+  const nodeOrder: string[] = [];
+  const addNode = (path: string) => {
+    if (nodeIds.has(path)) return;
+    const idx = nodeIds.size;
+    nodeIds.set(path, makeMermaidNodeId(path, idx));
+    nodeOrder.push(path);
+  };
+
+  for (const path of changedSlice) addNode(path);
+  for (const edge of edges) {
+    addNode(edge.from);
+    addNode(edge.to);
+    if (nodeOrder.length >= maxNodes) break;
+  }
+
+  const allowed = new Set(nodeOrder.slice(0, maxNodes));
+  const filteredEdges = edges
+    .filter((edge) => allowed.has(edge.from) && allowed.has(edge.to))
+    .slice(0, maxEdges);
+  if (filteredEdges.length === 0) return "";
+
+  const finalNodes = nodeOrder.filter((path) => allowed.has(path));
+  finalNodes.forEach((path, idx) => {
+    if (!nodeIds.has(path)) {
+      nodeIds.set(path, makeMermaidNodeId(path, idx));
+    }
   });
 
-  const nodeLines = allNodes.map((path) => {
+  const changedSet = new Set(changedSlice);
+  const nodeLines = finalNodes.map((path) => {
     const id = nodeIds.get(path);
     const label = sanitizeMermaidLabel(path);
     return `${id}["${label}"]`;
   });
 
-  const edges: string[] = [];
-  for (const file of changedSlice) {
-    for (const rel of relatedSlice.slice(0, 5)) {
-      if (file === rel) continue;
-      const fromId = nodeIds.get(file);
-      const toId = nodeIds.get(rel);
-      if (!fromId || !toId) continue;
-      edges.push(`${fromId} --> ${toId}`);
-      if (edges.length >= maxEdges) break;
-    }
-    if (edges.length >= maxEdges) break;
-  }
+  const edgeLines = filteredEdges
+    .map((edge) => {
+      const fromId = nodeIds.get(edge.from);
+      const toId = nodeIds.get(edge.to);
+      if (!fromId || !toId) return null;
+      return `${fromId} --> ${toId}`;
+    })
+    .filter((line): line is string => Boolean(line));
 
-  if (edges.length === 0) return "";
-  return ["graph TD", ...nodeLines, ...edges].join("\n");
+  const classLines = finalNodes
+    .filter((path) => changedSet.has(path))
+    .map((path) => {
+      const id = nodeIds.get(path);
+      return id ? `class ${id} changed;` : null;
+    })
+    .filter((line): line is string => Boolean(line));
+
+  return [
+    "graph TD",
+    ...nodeLines,
+    ...edgeLines,
+    "classDef changed fill:#ffd7ba,stroke:#c2410c,stroke-width:1px,color:#111;",
+    ...classLines
+  ].join("\n");
 }
 
 function enrichSummary(params: {
@@ -571,6 +647,7 @@ function enrichSummary(params: {
   comments: ReviewComment[];
   changedFiles: Array<{ filename?: string; path?: string }>;
   relatedFiles: string[];
+  graphLinks: Array<{ from: string; to: string; type: string }>;
 }): ReviewOutput["summary"] {
   const summary = { ...params.summary };
   if (!summary.file_breakdown || summary.file_breakdown.length === 0) {
@@ -587,7 +664,11 @@ function enrichSummary(params: {
       }));
   }
   if (!summary.diagram_mermaid) {
-    const diagram = generateMermaidDiagram(params.changedFiles, params.relatedFiles);
+    const diagram = generateMermaidDiagram({
+      changedFiles: params.changedFiles,
+      relatedFiles: params.relatedFiles,
+      graphLinks: params.graphLinks
+    });
     if (diagram) summary.diagram_mermaid = diagram;
   }
   if (summary.confidence === undefined) {
@@ -898,7 +979,8 @@ export async function processReviewJob(data: ReviewJobData) {
       }>,
       prTitle: refreshed.title || pullRequest.title,
       prBody: refreshed.body || pullRequest.body,
-      retrieval: resolvedConfig.retrieval
+      retrieval: resolvedConfig.retrieval,
+      graph: resolvedConfig.graph
     });
 
     const { bundleDir, outDir, codexHomeDir } = await createRunDirs(env.projectRoot, run.id);
@@ -1020,7 +1102,8 @@ export async function processReviewJob(data: ReviewJobData) {
       summary: finalReview.summary,
       comments: finalReview.comments,
       changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
-      relatedFiles: contextPack.relatedFiles
+      relatedFiles: contextPack.relatedFiles,
+      graphLinks: contextPack.graphLinks
     });
 
     const filteredComments = filterAndNormalizeComments(
@@ -1449,7 +1532,6 @@ export async function processReviewJob(data: ReviewJobData) {
       repoId: repo.id,
       headSha: refreshed.headSha
     });
-    await enqueueGraphJob({ repoId: repo.id });
     await enqueueAnalyticsJob({ reviewRunId: run.id });
   } catch (err) {
     await prisma.reviewRun.update({

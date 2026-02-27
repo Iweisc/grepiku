@@ -44,6 +44,7 @@ export async function writeBundleFiles(params: {
     JSON.stringify(
       {
         ignore: repoConfig.ignore,
+        graph: repoConfig.graph,
         tools: repoConfig.tools,
         limits: repoConfig.limits,
         strictness: repoConfig.strictness,

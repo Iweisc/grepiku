@@ -14,6 +14,7 @@ import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { embedText, embedTexts } from "./embeddings.js";
 import { loadEnv } from "../config/env.js";
 import { chunkTextForEmbedding } from "./chunking.js";
+import { enqueueGraphJob } from "../queue/enqueue.js";
 
 const env = loadEnv();
 const MAX_INDEX_BYTES = 1_000_000;
@@ -126,6 +127,113 @@ function inferredLanguageName(relativePath: string, knownLanguage?: string): str
   return ext.replace(/^\./, "") || "text";
 }
 
+function extractImportReferences(params: {
+  relativePath: string;
+  content: string;
+}): Array<{ name: string; line: number; kind: string }> {
+  const ext = path.extname(params.relativePath).toLowerCase();
+  const text = params.content;
+  const refs: Array<{ name: string; line: number; kind: string }> = [];
+  const seen = new Set<string>();
+
+  if (![".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go", ".rs"].includes(ext)) return [];
+
+  const newlinePositions: number[] = [];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) newlinePositions.push(i);
+  }
+
+  const lineForIndex = (index: number): number => {
+    if (index <= 0 || newlinePositions.length === 0) return 1;
+    let low = 0;
+    let high = newlinePositions.length - 1;
+    let answer = newlinePositions.length;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      if (newlinePositions[mid] >= index) {
+        answer = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    return answer + 1;
+  };
+
+  const addRef = (specRaw: string, index: number, kind: "import" | "export" = "import") => {
+    const spec = specRaw.trim();
+    if (!spec) return;
+    const key = `${kind}|${spec}|${index}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    refs.push({ name: spec, line: lineForIndex(index), kind });
+  };
+
+  if ([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(ext)) {
+    const patterns = [
+      /^\s*import\s+(?:[^'"]*?\s+from\s+)?["']([^"']+)["']/gm,
+      /^\s*export\s+[^'"]*?\s+from\s+["']([^"']+)["']/gm,
+      /require\(\s*["']([^"']+)["']\s*\)/g,
+      /import\(\s*["']([^"']+)["']\s*\)/g
+    ];
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(pattern)) {
+        addRef(match[1] || "", match.index || 0);
+      }
+    }
+
+    for (const match of text.matchAll(/^\s*export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)) {
+      addRef(match[1] || "", match.index || 0, "export");
+    }
+    for (const match of text.matchAll(/^\s*export\s+(?:const|let|var|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/gm)) {
+      addRef(match[1] || "", match.index || 0, "export");
+    }
+    for (const match of text.matchAll(/^\s*export\s*\{([^}]+)\}(?!\s*from)/gm)) {
+      const items = (match[1] || "").split(",");
+      for (const item of items) {
+        const local = item.trim().split(/\s+as\s+/i)[0] || "";
+        addRef(local, match.index || 0, "export");
+      }
+    }
+    return refs;
+  }
+
+  if (ext === ".py") {
+    for (const match of text.matchAll(/^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+/gm)) {
+      addRef(match[1] || "", match.index || 0);
+    }
+    for (const match of text.matchAll(/^\s*import\s+([A-Za-z0-9_.,\s]+)$/gm)) {
+      const group = (match[1] || "").split(",");
+      for (const part of group) {
+        const token = part.trim().split(/\s+as\s+/i)[0] || "";
+        addRef(token, match.index || 0);
+      }
+    }
+    return refs;
+  }
+
+  if (ext === ".go") {
+    for (const match of text.matchAll(/^\s*import\s+"([^"]+)"/gm)) {
+      addRef(match[1] || "", match.index || 0);
+    }
+    for (const block of text.matchAll(/^\s*import\s*\(([\s\S]*?)\)/gm)) {
+      const body = block[1] || "";
+      for (const item of body.matchAll(/"([^"]+)"/g)) {
+        addRef(item[1] || "", (block.index || 0) + (item.index || 0));
+      }
+    }
+    return refs;
+  }
+
+  if (ext === ".rs") {
+    for (const match of text.matchAll(/^\s*use\s+([^;]+);/gm)) {
+      addRef(match[1] || "", match.index || 0);
+    }
+  }
+
+  return refs;
+}
+
 
 async function walk(dir: string, ignoreDirs: Set<string>, files: string[] = []): Promise<string[]> {
   const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -200,13 +308,13 @@ async function indexFile(params: {
   language: string;
   force: boolean;
   isPattern: boolean;
-}) {
+}): Promise<number> {
   const contentHash = hashContent(params.content);
   const existing = await prisma.fileIndex.findFirst({
     where: { repoId: params.repoId, path: params.relativePath, isPattern: params.isPattern }
   });
   if (existing && existing.contentHash === contentHash && !params.force) {
-    return;
+    return existing.id;
   }
 
   const fileRecord = existing
@@ -263,6 +371,8 @@ async function indexFile(params: {
       }
     }
   }
+
+  references.push(...extractImportReferences({ relativePath: params.relativePath, content: params.content }));
 
   const symbolTexts = symbols.map((symbol) => `${symbol.name} ${symbol.signature || ""}`);
   const symbolVectors = symbolTexts.length > 0 ? await embedTexts(symbolTexts) : [];
@@ -345,6 +455,30 @@ async function indexFile(params: {
       text: `${params.relativePath}\n${params.content.slice(0, 5000)}`
     }
   });
+
+  return fileRecord.id;
+}
+
+async function pruneStaleIndexedFiles(params: {
+  repoId: number;
+  isPattern: boolean;
+  keepFileIds: number[];
+}) {
+  const stale = await prisma.fileIndex.findMany({
+    where: {
+      repoId: params.repoId,
+      isPattern: params.isPattern,
+      id: params.keepFileIds.length > 0 ? { notIn: params.keepFileIds } : undefined
+    },
+    select: { id: true }
+  });
+  const staleIds = stale.map((item) => item.id);
+  if (staleIds.length === 0) return;
+
+  await prisma.symbolReference.deleteMany({ where: { fileId: { in: staleIds } } });
+  await prisma.embedding.deleteMany({ where: { fileId: { in: staleIds } } });
+  await prisma.symbol.deleteMany({ where: { fileId: { in: staleIds } } });
+  await prisma.fileIndex.deleteMany({ where: { id: { in: staleIds } } });
 }
 
 export async function processIndexJob(job: IndexJob) {
@@ -424,8 +558,9 @@ export async function processIndexJob(job: IndexJob) {
       throw new Error("Unable to resolve repo path for indexing");
     }
 
-    const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var", "internal_harness"]);
+    const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var"]);
     const files = await walk(repoPath, ignoreDirs);
+    const indexedFileIds = new Set<number>();
     for (const filePath of files) {
       const relativePath = path.relative(repoPath, filePath);
       const ext = path.extname(filePath).toLowerCase();
@@ -435,7 +570,7 @@ export async function processIndexJob(job: IndexJob) {
       if (raw.includes(0)) continue;
       if (!shouldIndexAsText({ relativePath, raw, languageKnown: Boolean(languageConfig) })) continue;
       const content = raw.toString("utf8");
-      await indexFile({
+      const fileId = await indexFile({
         repoId: repo.id,
         filePath,
         relativePath,
@@ -444,7 +579,14 @@ export async function processIndexJob(job: IndexJob) {
         force: Boolean(job.force),
         isPattern: Boolean(job.patternRepo)
       });
+      indexedFileIds.add(fileId);
     }
+
+    await pruneStaleIndexedFiles({
+      repoId: repo.id,
+      isPattern: Boolean(job.patternRepo),
+      keepFileIds: Array.from(indexedFileIds)
+    });
 
     await prisma.indexRun.update({
       where: { id: indexRun.id },
@@ -453,6 +595,7 @@ export async function processIndexJob(job: IndexJob) {
         completedAt: new Date()
       }
     });
+    await enqueueGraphJob({ repoId: repo.id });
   } catch (err) {
     await prisma.indexRun.update({
       where: { id: indexRun.id },

@@ -11,6 +11,29 @@ function buildRemoteUrl(params: { owner: string; repo: string; token: string }) 
   return `https://x-access-token:${encodedToken}@github.com/${params.owner}/${params.repo}.git`;
 }
 
+function toWorktreeKey(ref: string): string {
+  const trimmed = ref.trim();
+  if (!trimmed) return "HEAD";
+  if (/^[0-9a-f]{7,40}$/i.test(trimmed)) return trimmed.toLowerCase();
+  return trimmed.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 96) || "HEAD";
+}
+
+async function resolveCheckoutRef(baseDir: string, requestedRef: string): Promise<string> {
+  const candidates = requestedRef === "HEAD" ? ["origin/HEAD", "HEAD"] : [requestedRef];
+  for (const candidate of candidates) {
+    try {
+      const { stdout } = await execa("git", ["-C", baseDir, "rev-parse", "--verify", candidate], {
+        stdio: ["ignore", "pipe", "ignore"]
+      });
+      const resolved = stdout.trim();
+      if (resolved) return resolved;
+    } catch {
+      // keep trying candidates
+    }
+  }
+  return requestedRef;
+}
+
 type SameShaWorktreeCandidate = {
   path: string;
   mtimeMs: number;
@@ -121,14 +144,21 @@ export async function ensureGitRepoCheckout(params: {
     await execa("git", ["-C", baseDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
   }
 
-  await pruneSameShaWorktrees({ baseDir, worktreesDir, headSha });
+  await execa("git", ["-C", baseDir, "remote", "set-head", "origin", "-a"], {
+    stdio: ["ignore", "ignore", "ignore"]
+  }).catch(() => undefined);
+
+  const checkoutRef = await resolveCheckoutRef(baseDir, headSha);
+  const worktreeKey = toWorktreeKey(checkoutRef);
+
+  await pruneSameShaWorktrees({ baseDir, worktreesDir, headSha: worktreeKey });
 
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 6; attempt += 1) {
     const suffix = `${Date.now()}-${process.pid}-${attempt}`;
-    const worktreePath = path.join(worktreesDir, `${headSha}-${suffix}`);
+    const worktreePath = path.join(worktreesDir, `${worktreeKey}-${suffix}`);
     try {
-      await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, headSha], {
+      await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, checkoutRef], {
         stdio: "inherit"
       });
       return worktreePath;

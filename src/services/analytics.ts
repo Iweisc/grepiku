@@ -1,4 +1,5 @@
 import { prisma } from "../db/client.js";
+import { computeTraversalRunMetrics } from "./traversalMetrics.js";
 
 type AnalyticsJob = {
   reviewRunId: number;
@@ -10,6 +11,13 @@ export async function processAnalyticsJob(job: AnalyticsJob) {
     include: { findings: true, pullRequest: true, feedback: true }
   });
   if (!run) return;
+
+  await prisma.analyticsEvent.deleteMany({
+    where: {
+      runId: run.id,
+      kind: { in: ["review_run", "traversal_run"] }
+    }
+  });
 
   const durationMs =
     run.startedAt && run.completedAt ? run.completedAt.getTime() - run.startedAt.getTime() : null;
@@ -36,6 +44,27 @@ export async function processAnalyticsJob(job: AnalyticsJob) {
       }
     }
   });
+
+  const repoFileCount = await prisma.fileIndex.count({
+    where: { repoId: run.pullRequest.repoId, isPattern: false }
+  });
+  const traversalMetrics = computeTraversalRunMetrics({
+    runId: run.id,
+    repoId: run.pullRequest.repoId,
+    contextPack: run.contextPackJson,
+    findings: run.findings.map((finding) => ({ path: finding.path, status: finding.status })),
+    repoFileCount
+  });
+  if (traversalMetrics) {
+    await prisma.analyticsEvent.create({
+      data: {
+        repoId: run.pullRequest.repoId,
+        runId: run.id,
+        kind: "traversal_run",
+        payload: traversalMetrics
+      }
+    });
+  }
 
   const positiveReactions = new Set(["thumbs_up", "+1", "heart", "laugh", "hooray"]);
   const negativeReactions = new Set(["thumbs_down", "-1", "confused"]);

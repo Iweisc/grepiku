@@ -671,7 +671,8 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
     }>,
     prTitle: refreshed.title || pullRequest.title,
     prBody: refreshed.body || pullRequest.body,
-    retrieval: repoConfig.retrieval
+    retrieval: repoConfig.retrieval,
+    graph: repoConfig.graph
   });
 
   const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}
