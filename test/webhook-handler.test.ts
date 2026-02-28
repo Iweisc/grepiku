@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isGeneratedMentionReply, isSelfBotComment, normalizeBotAwareLogin } from "../src/providers/commentGuards.js";
 import { isResolutionReply } from "../src/providers/commentResolution.js";
-import { shouldDeleteClosedBotPrBranch } from "../src/providers/pullRequestGuards.js";
+import { shouldDeleteClosedBotPrBranch, shouldSkipSelfBotFollowUpPrReview } from "../src/providers/pullRequestGuards.js";
 
 test("normalizeBotAwareLogin strips [bot] suffix", () => {
   assert.equal(normalizeBotAwareLogin("grepiku-dev[bot]"), "grepiku-dev");
@@ -137,6 +137,67 @@ test("shouldDeleteClosedBotPrBranch rejects non-bot, open, and fork branches", (
         state: "closed",
         headRef: "grepiku/mention-123",
         headRepoFullName: null,
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+});
+
+test("shouldSkipSelfBotFollowUpPrReview skips bot-authored follow-up pull requests", () => {
+  assert.equal(
+    shouldSkipSelfBotFollowUpPrReview({
+      action: "opened",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    true
+  );
+  assert.equal(
+    shouldSkipSelfBotFollowUpPrReview({
+      action: "synchronize",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    true
+  );
+});
+
+test("shouldSkipSelfBotFollowUpPrReview does not skip non-follow-up or non-bot pull requests", () => {
+  assert.equal(
+    shouldSkipSelfBotFollowUpPrReview({
+      action: "opened",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "feature/refactor",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldSkipSelfBotFollowUpPrReview({
+      action: "opened",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "octocat", externalId: "2" }
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldSkipSelfBotFollowUpPrReview({
+      action: "edited",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
         author: { login: "grepiku-dev[bot]", externalId: "1" }
       }
     }),

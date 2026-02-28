@@ -8,7 +8,7 @@ import { resolveGithubBotLogin } from "./github/adapter.js";
 import { rememberRepoInstruction } from "../services/repoMemory.js";
 import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
 import { isResolutionReply } from "./commentResolution.js";
-import { shouldDeleteClosedBotPrBranch } from "./pullRequestGuards.js";
+import { shouldDeleteClosedBotPrBranch, shouldSkipSelfBotFollowUpPrReview } from "./pullRequestGuards.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -22,11 +22,11 @@ function isSuggestionCommitMessage(message: string): boolean {
 }
 
 async function isSuggestionCommit(params: {
-  provider: string;
   installationId: string | null;
   repo: ProviderWebhookEvent["repo"];
   pullRequest: ProviderWebhookEvent["pullRequest"];
   headSha: string | null | undefined;
+  botLogin: string;
 }): Promise<boolean> {
   if (!params.installationId || !params.headSha) return false;
   try {
@@ -37,7 +37,11 @@ async function isSuggestionCommit(params: {
       pullRequest: params.pullRequest
     });
     const commit = await client.fetchCommit(params.headSha);
-    return isSuggestionCommitMessage(commit.message || "");
+    if (isSuggestionCommitMessage(commit.message || "")) return true;
+    return isSelfBotComment({
+      authorLogin: commit.authorLogin || "",
+      botLogin: params.botLogin
+    });
   } catch {
     return false;
   }
@@ -194,6 +198,16 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       });
       return;
     }
+    const botLogin = await resolveGithubBotLogin().catch(() => "");
+    if (
+      shouldSkipSelfBotFollowUpPrReview({
+        action: event.action,
+        pullRequest: event.pullRequest,
+        botLogin
+      })
+    ) {
+      return;
+    }
     await maybeBootstrapRepoGraph({
       provider: event.provider,
       installationExternalId: installation.externalId,
@@ -220,11 +234,11 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
     if (!shouldTrigger) return;
     if (event.action === "synchronize") {
       const skipSuggestion = await isSuggestionCommit({
-        provider: event.provider,
         installationId: installation.externalId,
         repo: event.repo,
         pullRequest: event.pullRequest,
-        headSha: event.pullRequest.headSha
+        headSha: event.pullRequest.headSha,
+        botLogin
       });
       if (skipSuggestion) return;
     }
