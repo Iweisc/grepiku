@@ -13,10 +13,12 @@ import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { buildContextPack } from "./context.js";
 import { extractMentionDoTask } from "./triggers.js";
+import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
 import {
   changedPaths,
   commitWorkingTree,
   hasWorkingTreeChanges,
+  isGitPermissionDeniedError,
   mentionBranchName,
   prepareMentionBranch,
   pushBranch,
@@ -153,7 +155,39 @@ export type CommentReplyJobData = {
   commentBody: string;
   commentAuthor: string;
   commentUrl?: string;
+  replyInThread?: boolean;
 };
+
+async function postMentionReply(params: {
+  client: {
+    createSummaryComment: (body: string) => Promise<unknown>;
+    replyToComment?: (params: { commentId: string; body: string }) => Promise<unknown>;
+  };
+  commentId: string;
+  body: string;
+  replyInThread?: boolean;
+}) {
+  const normalizedBody = normalizeReplyBody(params.body);
+  if (params.replyInThread && params.client.replyToComment) {
+    try {
+      await params.client.replyToComment({
+        commentId: params.commentId,
+        body: normalizedBody
+      });
+      return;
+    } catch (err) {
+      console.warn(`[mention ${params.commentId}] failed to post thread reply; falling back to summary comment`, {
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  } else if (params.replyInThread && !params.client.replyToComment) {
+    console.warn(
+      `[mention ${params.commentId}] thread reply requested but provider does not support replyToComment; falling back to summary comment`
+    );
+  }
+
+  await params.client.createSummaryComment(normalizedBody);
+}
 
 async function createReplyDirs(root: string, commentId: string) {
   const runDir = path.join(root, "var", "replies", String(commentId));
@@ -186,6 +220,13 @@ function ensureMentionPrefix(body: string, author: string): string {
 
 function withMentionMarker(body: string, commentId: string): string {
   return `<!-- grepiku-mention:${commentId} -->\n${body}`;
+}
+
+function permissionDeniedReply(author: string): string {
+  return ensureMentionPrefix(
+    "I couldn't open a follow-up PR because this app token lacks repository write permissions (push/PR create was denied). Please grant the GitHub App `Contents: Read and write` and `Pull requests: Read and write`, then rerun the `do:` command.",
+    author
+  );
 }
 
 function defaultCommitMessage(task: string): string {
@@ -303,7 +344,11 @@ async function runAnswerOnlyPath(params: {
   commentAuthor: string;
   commentUrl?: string;
   commentId: string;
-  client: { createSummaryComment: (body: string) => Promise<unknown> };
+  client: {
+    createSummaryComment: (body: string) => Promise<unknown>;
+    replyToComment?: (params: { commentId: string; body: string }) => Promise<unknown>;
+  };
+  replyInThread?: boolean;
   refreshedHeadSha: string;
   repoId: number;
   prNumber: number;
@@ -336,7 +381,12 @@ async function runAnswerOnlyPath(params: {
     ensureMentionPrefix(reply.body, params.commentAuthor),
     params.commentId
   );
-  await params.client.createSummaryComment(normalizeReplyBody(body));
+  await postMentionReply({
+    client: params.client,
+    commentId: params.commentId,
+    body,
+    replyInThread: params.replyInThread
+  });
 }
 
 async function runImplementPath(params: {
@@ -351,6 +401,7 @@ async function runImplementPath(params: {
   mentionTask: string;
   client: {
     createSummaryComment: (body: string) => Promise<unknown>;
+    replyToComment?: (params: { commentId: string; body: string }) => Promise<unknown>;
     createPullRequest?: (params: {
       title: string;
       body: string;
@@ -365,6 +416,7 @@ async function runImplementPath(params: {
   pullRequestHeadRef: string | null;
   repoDefaultBranch: string | null;
   repoTools: RepoConfig["tools"];
+  replyInThread?: boolean;
   repoId: number;
   prNumber: number;
 }): Promise<{ mode: string; prUrl?: string | null; prNumber?: number }> {
@@ -373,7 +425,12 @@ async function runImplementPath(params: {
       ensureMentionPrefix("I cannot open pull requests with the current provider client.", params.commentAuthor),
       params.commentId
     );
-    await params.client.createSummaryComment(normalizeReplyBody(replyBody));
+    await postMentionReply({
+      client: params.client,
+      commentId: params.commentId,
+      body: replyBody,
+      replyInThread: params.replyInThread
+    });
     return { mode: "answer" };
   }
 
@@ -423,7 +480,12 @@ async function runImplementPath(params: {
       ensureMentionPrefix(action.reply || fallback, params.commentAuthor),
       params.commentId
     );
-    await params.client.createSummaryComment(normalizeReplyBody(replyBody));
+    await postMentionReply({
+      client: params.client,
+      commentId: params.commentId,
+      body: replyBody,
+      replyInThread: params.replyInThread
+    });
     return { mode: "answer" };
   }
 
@@ -450,7 +512,9 @@ async function runImplementPath(params: {
   await pushBranch({ repoPath: params.repoPath, branchName });
 
   const baseBranch = resolveFollowUpPrBaseBranch({
+    pullRequestHeadRef: params.pullRequestHeadRef,
     pullRequestBaseRef: params.pullRequestBaseRef,
+    refreshedHeadRef: params.refreshed.headRef,
     refreshedBaseRef: params.refreshed.baseRef,
     repoDefaultBranch: params.repoDefaultBranch
   });
@@ -492,7 +556,12 @@ async function runImplementPath(params: {
     formatChecksForComment(checks)
   ];
   const replyBody = withMentionMarker(replyParts.join("\n\n"), params.commentId);
-  await params.client.createSummaryComment(normalizeReplyBody(replyBody));
+  await postMentionReply({
+    client: params.client,
+    commentId: params.commentId,
+    body: replyBody,
+    replyInThread: params.replyInThread
+  });
 
   return {
     mode: "change_pr",
@@ -502,7 +571,18 @@ async function runImplementPath(params: {
 }
 
 export async function processCommentReplyJob(data: CommentReplyJobData) {
-  const { provider, installationId, repoId, pullRequestId, prNumber, commentId, commentBody, commentAuthor, commentUrl } =
+  const {
+    provider,
+    installationId,
+    repoId,
+    pullRequestId,
+    prNumber,
+    commentId,
+    commentBody,
+    commentAuthor,
+    commentUrl,
+    replyInThread
+  } =
     data;
   const repo = await prisma.repo.findFirst({ where: { id: repoId } });
   const pullRequest = await prisma.pullRequest.findFirst({ where: { id: pullRequestId } });
@@ -535,8 +615,13 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   const refreshed = await client.fetchPullRequest();
 
   const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
-  const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
-  await saveRepoConfig(repo.id, repoConfig, warnings);
+  const { config: fileRepoConfig, warnings } = await loadRepoConfig(repoPath);
+  await saveRepoConfig(repo.id, fileRepoConfig, warnings);
+  const memoryRules = await loadAcceptedRepoMemoryRules(repo.id);
+  const repoConfig =
+    memoryRules.length > 0
+      ? { ...fileRepoConfig, rules: mergeRulesWithRepoMemory(fileRepoConfig.rules, memoryRules) }
+      : fileRepoConfig;
 
   let diffPatch = "";
   let changedFiles: Array<{ path?: string; status?: string; additions?: number; deletions?: number; patch?: string | null }> = [];
@@ -590,7 +675,8 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
     }>,
     prTitle: refreshed.title || pullRequest.title,
     prBody: refreshed.body || pullRequest.body,
-    retrieval: repoConfig.retrieval
+    retrieval: repoConfig.retrieval,
+    graph: repoConfig.graph
   });
 
   const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}
@@ -635,6 +721,7 @@ ${refreshed.body || pullRequest.body || "(no description)"}
       commentUrl,
       commentId,
       client,
+      replyInThread,
       refreshedHeadSha: refreshed.headSha,
       repoId: repo.id,
       prNumber
@@ -643,30 +730,52 @@ ${refreshed.body || pullRequest.body || "(no description)"}
     return;
   }
 
-  const result = await runImplementPath({
-    repoPath,
-    bundleDir,
-    outDir,
-    codexHomeDir,
-    commentBody,
-    commentAuthor,
-    commentUrl,
-    commentId,
-    mentionTask,
-    client,
-    refreshed,
-    pullRequestBaseRef: pullRequest.baseRef || null,
-    pullRequestHeadRef: pullRequest.headRef || null,
-    repoDefaultBranch: repo.defaultBranch || null,
-    repoTools: repoConfig.tools,
-    repoId: repo.id,
-    prNumber
-  });
+  try {
+    const result = await runImplementPath({
+      repoPath,
+      bundleDir,
+      outDir,
+      codexHomeDir,
+      commentBody,
+      commentAuthor,
+      commentUrl,
+      commentId,
+      mentionTask,
+      client,
+      refreshed,
+      pullRequestBaseRef: pullRequest.baseRef || null,
+      pullRequestHeadRef: pullRequest.headRef || null,
+      repoDefaultBranch: repo.defaultBranch || null,
+      repoTools: repoConfig.tools,
+      replyInThread,
+      repoId: repo.id,
+      prNumber
+    });
 
-  await markCompleted(runDir, {
-    mode: result.mode,
-    prUrl: result.prUrl || null,
-    prNumber: result.prNumber || null,
-    finishedAt: new Date().toISOString()
-  });
+    await markCompleted(runDir, {
+      mode: result.mode,
+      prUrl: result.prUrl || null,
+      prNumber: result.prNumber || null,
+      finishedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    if (!isGitPermissionDeniedError(error)) throw error;
+
+    const body = withMentionMarker(permissionDeniedReply(commentAuthor), commentId);
+    await postMentionReply({
+      client,
+      commentId,
+      body,
+      replyInThread
+    });
+    await markCompleted(runDir, {
+      mode: "answer",
+      permissionDenied: true,
+      finishedAt: new Date().toISOString()
+    });
+  }
 }
+
+export const __mentionInternals = {
+  postMentionReply
+};

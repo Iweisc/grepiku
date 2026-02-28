@@ -227,6 +227,15 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     "--model",
     env.openaiModel
   ];
+  if (params.stage === "mention" && params.repoPath) {
+    codexArgs.push("--cd", params.repoPath);
+    const extraWritableRoots = Array.from(
+      new Set([params.bundleDir, params.outDir].filter((dir) => dir && dir !== params.repoPath))
+    );
+    for (const dir of extraWritableRoots) {
+      codexArgs.push("--add-dir", dir);
+    }
+  }
   if (params.captureLastMessage !== false) {
     codexArgs.push("--output-last-message", path.join(params.outDir, `last_message_${params.stage}.txt`));
   }
@@ -259,12 +268,13 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
   );
   const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
   const startedAt = Date.now();
+  const stageCwd = params.stage === "mention" && params.repoPath ? params.repoPath : params.outDir;
   console.log(`${stageTag} starting`);
   try {
     await execa(codexExecPath, codexArgs, {
       input: fullPrompt,
       stdio: ["pipe", "ignore", "inherit"],
-      cwd: params.outDir,
+      cwd: stageCwd,
       env: stageEnv,
       timeout: env.codexStageTimeoutMs,
       killSignal: "SIGTERM",

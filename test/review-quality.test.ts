@@ -83,11 +83,11 @@ test("normal mode still applies per-file inline cap", () => {
     allowedTypes: ["inline", "summary"]
   });
 
-  assert.equal(refined.comments.length, 2);
+  assert.equal(refined.comments.length, 3);
   for (const comment of refined.comments) {
     assert.equal(comment.comment_type, "inline");
   }
-  assert.equal(refined.diagnostics.droppedPerFileCap, 2);
+  assert.equal(refined.diagnostics.droppedPerFileCap, 1);
 });
 
 test("blocking finding without patch is downgraded", () => {

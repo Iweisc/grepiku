@@ -41,7 +41,6 @@ const DEFAULT_WEIGHTS: RetrievalWeights = {
 };
 
 const EMBEDDING_FETCH_BATCH = 2000;
-const EMBEDDING_FETCH_MAX = 80000;
 
 type EmbeddingRow = {
   id: number;
@@ -50,6 +49,25 @@ type EmbeddingRow = {
   kind: string;
   vector: number[];
   text: string;
+};
+
+type ScoredRetrievalItem = {
+  embedding: {
+    id: number;
+    fileId: number | null;
+    symbolId: number | null;
+    kind: string;
+  };
+  path?: string;
+  symbol?: string;
+  isPattern?: boolean;
+  semantic: number;
+  lexical: number;
+  pathBoost: number;
+  patternBoost: number;
+  kindBoost: number;
+  rrf: number;
+  score: number;
 };
 
 type RankedRetrievalItem = {
@@ -66,8 +84,8 @@ export async function retrieveContext(params: {
   changedPaths?: string[];
   weights?: Partial<RetrievalWeights>;
 }): Promise<RetrievalResult[]> {
-  const topK = Math.max(4, Math.min(60, params.topK ?? 18));
-  const maxPerPath = Math.max(1, Math.min(12, params.maxPerPath ?? 4));
+  const topK = Math.max(4, Math.min(60, params.topK ?? 28));
+  const maxPerPath = Math.max(1, Math.min(12, params.maxPerPath ?? 6));
   const weights = mergeWeights(params.weights);
   const changedPaths = new Set(
     (params.changedPaths || [])
@@ -81,8 +99,7 @@ export async function retrieveContext(params: {
   );
 
   const queryVec = await embedQueryWithCache({ repoId: params.repoId, query: params.query });
-  const [embeddings, files, symbols] = await Promise.all([
-    loadRepoEmbeddings(params.repoId),
+  const [files, symbols] = await Promise.all([
     prisma.fileIndex.findMany({ where: { repoId: params.repoId }, select: { id: true, path: true, isPattern: true } }),
     prisma.symbol.findMany({ where: { repoId: params.repoId }, select: { id: true, name: true } })
   ]);
@@ -100,46 +117,58 @@ export async function retrieveContext(params: {
   const queryTokens = tokenize(params.query);
   const queryPathHints = extractPathHints(params.query);
 
-  const scored = embeddings.map((embedding) => {
-    const fileMeta = embedding.fileId ? fileMap.get(embedding.fileId) : undefined;
-    const path = fileMeta?.path;
-    const symbol = embedding.symbolId ? symbolMap.get(embedding.symbolId) : undefined;
-    const semanticRaw = cosineSimilarity(queryVec, embedding.vector);
-    const semantic = normalizeCosine(semanticRaw);
-    const lexical = lexicalSimilarity(
-      queryTokens,
-      tokenize(buildLexicalInput({ path, symbol, text: embedding.text }))
-    );
-    const pathBoost = path
-      ? computePathBoost({
-          path,
-          changedPaths,
-          changedDirectories,
-          queryPathHints,
-          changedPathBoost: weights.changedPathBoost,
-          sameDirectoryBoost: weights.sameDirectoryBoost
-        })
-      : 0;
-    const patternBoost = fileMeta?.isPattern ? weights.patternBoost : 0;
-    const kindBoost =
-      embedding.kind === "symbol"
-        ? weights.symbolBoost
-        : embedding.kind === "chunk"
-          ? weights.chunkBoost
+  const scored: ScoredRetrievalItem[] = [];
+  await forEachRepoEmbeddingBatch({
+    repoId: params.repoId,
+    onBatch: (batch) => {
+      for (const embedding of batch) {
+        const fileMeta = embedding.fileId ? fileMap.get(embedding.fileId) : undefined;
+        const path = fileMeta?.path;
+        const symbol = embedding.symbolId ? symbolMap.get(embedding.symbolId) : undefined;
+        const semanticRaw = cosineSimilarity(queryVec, embedding.vector);
+        const semantic = normalizeCosine(semanticRaw);
+        const lexical = lexicalSimilarity(
+          queryTokens,
+          tokenize(buildLexicalInput({ path, symbol, text: embedding.text }))
+        );
+        const pathBoost = path
+          ? computePathBoost({
+              path,
+              changedPaths,
+              changedDirectories,
+              queryPathHints,
+              changedPathBoost: weights.changedPathBoost,
+              sameDirectoryBoost: weights.sameDirectoryBoost
+            })
           : 0;
+        const patternBoost = fileMeta?.isPattern ? weights.patternBoost : 0;
+        const kindBoost =
+          embedding.kind === "symbol"
+            ? weights.symbolBoost
+            : embedding.kind === "chunk"
+              ? weights.chunkBoost
+              : 0;
 
-    return {
-      embedding,
-      path,
-      symbol,
-      semantic,
-      lexical,
-      pathBoost,
-      patternBoost,
-      kindBoost,
-      rrf: 0,
-      score: 0
-    };
+        scored.push({
+          embedding: {
+            id: embedding.id,
+            fileId: embedding.fileId,
+            symbolId: embedding.symbolId,
+            kind: embedding.kind
+          },
+          path,
+          symbol,
+          isPattern: fileMeta?.isPattern,
+          semantic,
+          lexical,
+          pathBoost,
+          patternBoost,
+          kindBoost,
+          rrf: 0,
+          score: 0
+        });
+      }
+    }
   });
 
   applyRrfScores(scored);
@@ -163,13 +192,26 @@ export async function retrieveContext(params: {
     changedPaths
   });
 
+  const selectedIds = selected.map((item) => item.embedding.id);
+  const selectedRows =
+    selectedIds.length > 0
+      ? await prisma.embedding.findMany({
+          where: { id: { in: selectedIds } },
+          select: { id: true, text: true }
+        })
+      : [];
+  const textByEmbeddingId = new Map<number, string>();
+  for (const row of selectedRows) {
+    textByEmbeddingId.set(row.id, row.text);
+  }
+
   return selected.map((item) => ({
     kind: mapEmbeddingKind(item.embedding.kind),
     score: item.score,
     path: item.path,
     symbol: item.symbol,
-    text: item.embedding.text,
-    isPattern: item.path && item.embedding.fileId ? fileMap.get(item.embedding.fileId)?.isPattern : undefined,
+    text: textByEmbeddingId.get(item.embedding.id) || "",
+    isPattern: item.isPattern,
     signals: {
       semantic: item.semantic,
       lexical: item.lexical,
@@ -201,20 +243,32 @@ function sanitizeWeight(input: number | undefined, fallback: number): number {
   return Math.min(input, 1);
 }
 
-export async function loadRepoEmbeddings(repoId: number) {
-  const rows: EmbeddingRow[] = [];
+async function forEachRepoEmbeddingBatch(params: {
+  repoId: number;
+  onBatch: (batch: EmbeddingRow[]) => Promise<void> | void;
+  maxRows?: number;
+}) {
+  const maxRows = Number.isFinite(params.maxRows) ? Math.max(0, Number(params.maxRows)) : Number.POSITIVE_INFINITY;
   let cursor: number | null = null;
+  let loadedRows = 0;
 
-  while (rows.length < EMBEDDING_FETCH_MAX) {
+  while (loadedRows < maxRows) {
+    const remaining = Number.isFinite(maxRows) ? Math.max(0, maxRows - loadedRows) : EMBEDDING_FETCH_BATCH;
+    const take =
+      Number.isFinite(maxRows) && maxRows !== Number.POSITIVE_INFINITY
+        ? Math.min(EMBEDDING_FETCH_BATCH, remaining)
+        : EMBEDDING_FETCH_BATCH;
+    if (take <= 0) break;
+
     const batch = (await prisma.embedding.findMany({
       where: {
-        repoId,
+        repoId: params.repoId,
         kind: { in: ["file", "symbol", "chunk"] }
       },
       orderBy: { id: "desc" },
       cursor: cursor ? { id: cursor } : undefined,
       skip: cursor ? 1 : 0,
-      take: EMBEDDING_FETCH_BATCH,
+      take,
       select: {
         id: true,
         fileId: true,
@@ -226,12 +280,23 @@ export async function loadRepoEmbeddings(repoId: number) {
     })) as EmbeddingRow[];
 
     if (batch.length === 0) break;
-    rows.push(...batch);
-    if (batch.length < EMBEDDING_FETCH_BATCH) break;
+    loadedRows += batch.length;
+    await params.onBatch(batch);
+    if (batch.length < take) break;
     cursor = batch[batch.length - 1].id;
   }
+}
 
-  return rows.slice(0, EMBEDDING_FETCH_MAX);
+export async function loadRepoEmbeddings(repoId: number, options?: { maxRows?: number }) {
+  const rows: EmbeddingRow[] = [];
+  await forEachRepoEmbeddingBatch({
+    repoId,
+    maxRows: options?.maxRows,
+    onBatch: (batch) => {
+      rows.push(...batch);
+    }
+  });
+  return rows;
 }
 
 function mapEmbeddingKind(kind: string): RetrievalResult["kind"] {
@@ -418,8 +483,9 @@ function computePathBoost(params: {
   }
 
   if (queryPathHints.length > 0) {
+    const pathLower = path.toLowerCase();
     for (const hint of queryPathHints) {
-      if (path.includes(hint)) {
+      if (pathLower.includes(hint)) {
         boost += 0.04;
         break;
       }
@@ -448,9 +514,14 @@ function directoryPath(value: string): string {
 }
 
 function normalizeRepoPath(pathValue: string): string {
-  let normalized = pathValue.trim().replace(/\\/g, "/").replace(/^\//, "");
-  if (normalized.startsWith("a/") || normalized.startsWith("b/")) {
-    normalized = normalized.slice(2);
-  }
-  return normalized.toLowerCase();
+  return pathValue
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\//, "")
+    .replace(/\/+/g, "/");
 }
+
+export const __retrievalInternals = {
+  normalizeRepoPath
+};

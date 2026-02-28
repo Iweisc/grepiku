@@ -12,7 +12,7 @@ const EnvSchema = z.object({
   INTERNAL_API_KEY: z.string().default(""),
   OPENAI_COMPAT_BASE_URL: z.string().min(1),
   OPENAI_COMPAT_API_KEY: z.string().min(1),
-  OPENAI_COMPAT_MODEL: z.string().default("gpt-5.2-codex-xhigh"),
+  OPENAI_COMPAT_MODEL: z.string().default("gpt-5.3-codex"),
   OPENAI_EMBEDDINGS_MODEL: z.string().default("text-embedding-3-small"),
   OPENAI_EMBEDDINGS_DIMENSIONS: z.string().default(""),
   OPENAI_EMBEDDINGS_MAX_CHARS: z.string().default("12000"),

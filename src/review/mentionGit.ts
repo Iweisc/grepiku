@@ -1,11 +1,15 @@
 import { execa } from "execa";
 
 export function resolveFollowUpPrBaseBranch(params: {
+  pullRequestHeadRef?: string | null;
   pullRequestBaseRef?: string | null;
+  refreshedHeadRef?: string | null;
   refreshedBaseRef?: string | null;
   repoDefaultBranch?: string | null;
 }): string {
   return (
+    params.pullRequestHeadRef ||
+    params.refreshedHeadRef ||
     params.pullRequestBaseRef ||
     params.refreshedBaseRef ||
     params.repoDefaultBranch ||
@@ -76,4 +80,18 @@ export async function pushBranch(params: {
   await execa("git", ["-C", params.repoPath, "push", "origin", `HEAD:refs/heads/${params.branchName}`], {
     stdio: "inherit"
   });
+}
+
+export function isGitPermissionDeniedError(error: unknown): boolean {
+  const text =
+    error instanceof Error
+      ? `${error.name} ${error.message} ${(error as { stack?: string }).stack || ""}`
+      : String(error || "");
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("permission to") && normalized.includes("denied") ||
+    normalized.includes("resource not accessible by integration") ||
+    normalized.includes("requested url returned error: 403") ||
+    normalized.includes("http 403")
+  );
 }

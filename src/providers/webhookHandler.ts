@@ -1,10 +1,14 @@
 import { prisma } from "../db/client.js";
 import { ensureInstallation, ensureProvider, ensureRepo, ensureRepoInstallation, ensureUser, upsertPullRequest } from "../db/records.js";
-import { enqueueCommentReplyJob, enqueueReviewJob } from "../queue/enqueue.js";
+import { enqueueCommentReplyJob, enqueueIndexJob, enqueueReviewJob } from "../queue/enqueue.js";
 import { ProviderWebhookEvent } from "./types.js";
 import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "../review/triggers.js";
 import { getProviderAdapter } from "./registry.js";
 import { resolveGithubBotLogin } from "./github/adapter.js";
+import { rememberRepoInstruction } from "../services/repoMemory.js";
+import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
+import { isResolutionReply } from "./commentResolution.js";
+import { shouldDeleteClosedBotPrBranch } from "./pullRequestGuards.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -36,6 +40,92 @@ async function isSuggestionCommit(params: {
     return isSuggestionCommitMessage(commit.message || "");
   } catch {
     return false;
+  }
+}
+
+async function resolveTargetReviewComment(params: {
+  pullRequestId: number;
+  providerCommentId: string;
+  inReplyToId?: string | null;
+}) {
+  const direct = await prisma.reviewComment.findFirst({
+    where: { pullRequestId: params.pullRequestId, providerCommentId: params.providerCommentId },
+    include: { finding: true }
+  });
+  if (direct) return direct;
+  if (!params.inReplyToId) return null;
+  return prisma.reviewComment.findFirst({
+    where: { pullRequestId: params.pullRequestId, providerCommentId: params.inReplyToId },
+    include: { finding: true }
+  });
+}
+
+async function maybeBootstrapRepoGraph(params: {
+  provider: string;
+  installationExternalId: string | null;
+  repoId: number;
+  headSha: string;
+  action: string;
+}) {
+  if (params.action !== "opened") return;
+  const [indexRuns, graphNodes] = await Promise.all([
+    prisma.indexRun.count({
+      where: {
+        repoId: params.repoId,
+        status: { in: ["running", "completed"] }
+      }
+    }),
+    prisma.graphNode.count({ where: { repoId: params.repoId } })
+  ]);
+
+  if (indexRuns > 0 || graphNodes > 0) return;
+
+  await enqueueIndexJob({
+    provider: params.provider,
+    installationId: params.installationExternalId,
+    repoId: params.repoId,
+    headSha: params.headSha,
+    force: true
+  });
+  console.log(
+    `[repo ${params.repoId}] queued initial full-codebase index bootstrap for first PR open at ${params.headSha}`
+  );
+}
+
+async function maybeDeleteClosedBotPrHeadBranch(params: {
+  event: Extract<ProviderWebhookEvent, { type: "pull_request" }>;
+  installationExternalId: string | null;
+}) {
+  if (!params.installationExternalId) return;
+  const botLogin = await resolveGithubBotLogin().catch(() => "");
+  if (
+    !shouldDeleteClosedBotPrBranch({
+      action: params.event.action,
+      repoFullName: params.event.repo.fullName,
+      pullRequest: params.event.pullRequest,
+      botLogin
+    })
+  ) {
+    return;
+  }
+  const branch = params.event.pullRequest.headRef?.trim() || "";
+  try {
+    const adapter = getProviderAdapter(params.event.provider);
+    const client = await adapter.createClient({
+      installationId: params.installationExternalId,
+      repo: params.event.repo,
+      pullRequest: params.event.pullRequest
+    });
+    if (!client.deleteBranch) return;
+    await client.deleteBranch(branch);
+    console.log(
+      `[pr ${params.event.pullRequest.number}] deleted closed bot branch ${branch}`
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[pr ${params.event.pullRequest.number}] failed to delete closed bot branch ${branch}: ${message}`
+    );
   }
 }
 
@@ -97,7 +187,20 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   const config = await resolveRepoConfig(repo.id, provider.kind);
 
   if (event.type === "pull_request") {
-    if (event.pullRequest.state === "closed") return;
+    if (event.pullRequest.state === "closed") {
+      await maybeDeleteClosedBotPrHeadBranch({
+        event,
+        installationExternalId: installation.externalId
+      });
+      return;
+    }
+    await maybeBootstrapRepoGraph({
+      provider: event.provider,
+      installationExternalId: installation.externalId,
+      repoId: repo.id,
+      headSha: event.pullRequest.headSha,
+      action: event.action
+    });
     const latestRun = await prisma.reviewRun.findFirst({
       where: { pullRequestId: pullRequest.id },
       orderBy: { createdAt: "desc" }
@@ -139,28 +242,31 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   }
 
   if (event.type === "comment") {
+    const commentBody = event.comment.body || "";
     const botLogin = await resolveGithubBotLogin().catch(() => "");
-    if (botLogin && event.author.login.toLowerCase() === botLogin.toLowerCase()) {
+    if (isSelfBotComment({ authorLogin: event.author.login || "", botLogin })) {
       return;
     }
-    const commentBody = event.comment.body || "";
+    if (isGeneratedMentionReply(commentBody) && /\[bot\]$/i.test((event.author.login || "").trim())) {
+      return;
+    }
     const commentTrigger = detectCommentTrigger(commentBody, config);
 
     const latestRun = await prisma.reviewRun.findFirst({
       where: { pullRequestId: pullRequest.id },
       orderBy: { createdAt: "desc" }
     });
+    const providerCommentId = event.comment.id;
+    const targetComment = await resolveTargetReviewComment({
+      pullRequestId: pullRequest.id,
+      providerCommentId,
+      inReplyToId: event.comment.inReplyToId
+    });
+
     if (latestRun) {
-      const providerCommentId = event.comment.id;
-      const reviewComment = await prisma.reviewComment.findFirst({
-        where: { pullRequestId: pullRequest.id, providerCommentId },
-        include: { finding: true }
-      });
-      const canonicalCommentId = reviewComment?.finding?.commentId || providerCommentId;
-      const normalized = commentBody.toLowerCase();
-      const action = normalized.includes("fixed") || normalized.includes("resolved") || normalized.includes("done")
-        ? "resolved"
-        : null;
+      const canonicalCommentId =
+        targetComment?.finding?.commentId || event.comment.inReplyToId || providerCommentId;
+      const action = isResolutionReply(commentBody) ? "resolved" : null;
       await prisma.feedback.create({
         data: {
           reviewRunId: latestRun.id,
@@ -175,9 +281,20 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         }
       });
     }
-    if (!commentTrigger) return;
 
-    if (installation.externalId) {
+    const shouldAttemptMemory = Boolean(targetComment) || commentTrigger === "mention";
+    if (shouldAttemptMemory) {
+      await rememberRepoInstruction({
+        repoId: repo.id,
+        commentBody,
+        author: event.author.login,
+        commentId: providerCommentId,
+        commentUrl: event.comment.url || null
+      }).catch(() => undefined);
+    }
+
+    const shouldAcknowledge = Boolean(commentTrigger) || Boolean(targetComment);
+    if (installation.externalId && shouldAcknowledge) {
       try {
         const adapter = getProviderAdapter(event.provider);
         const client = await adapter.createClient({
@@ -193,7 +310,17 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       }
     }
 
-    if (commentTrigger === "mention") {
+    const shouldReply =
+      commentTrigger === "mention" ||
+      (Boolean(targetComment) && !isResolutionReply(commentBody) && commentBody.trim().length > 0);
+    if (shouldReply) {
+      const replyInThread =
+        Boolean(event.comment.path) ||
+        Boolean(event.comment.inReplyToId) ||
+        targetComment?.kind === "inline";
+      console.log(
+        `[comment ${providerCommentId}] enqueue mention reply (trigger=${commentTrigger || "thread-reply"} target=${targetComment?.providerCommentId || "none"} thread=${replyInThread ? "yes" : "no"})`
+      );
       await enqueueCommentReplyJob({
         provider: event.provider,
         installationId: installation.externalId,
@@ -203,9 +330,12 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         commentId: event.comment.id,
         commentBody,
         commentAuthor: event.author.login,
-        commentUrl: event.comment.url
+        commentUrl: event.comment.url,
+        replyInThread
       });
     }
+
+    if (!commentTrigger) return;
 
     if (commentTrigger === "review") {
       await enqueueReviewJob({
@@ -230,11 +360,13 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
     });
     if (latestRun) {
       const providerCommentId = event.comment.id;
-      const reviewComment = await prisma.reviewComment.findFirst({
-        where: { pullRequestId: pullRequest.id, providerCommentId },
-        include: { finding: true }
+      const reviewComment = await resolveTargetReviewComment({
+        pullRequestId: pullRequest.id,
+        providerCommentId,
+        inReplyToId: event.comment.inReplyToId
       });
-      const canonicalCommentId = reviewComment?.finding?.commentId || providerCommentId;
+      const canonicalCommentId =
+        reviewComment?.finding?.commentId || event.comment.inReplyToId || providerCommentId;
       await prisma.feedback.create({
         data: {
           reviewRunId: latestRun.id,

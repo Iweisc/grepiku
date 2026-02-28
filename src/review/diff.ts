@@ -97,15 +97,24 @@ export function buildDiffIndex(patch: string): DiffIndex {
   return { files };
 }
 
+function resolveDiffFile(index: DiffIndex, pathValue: string) {
+  const normalized = normalizePath(pathValue);
+  const exact = index.files.get(normalized);
+  if (exact) return exact;
+  const diffNormalized = normalizeDiffPath(pathValue);
+  if (diffNormalized === normalized) return undefined;
+  return index.files.get(diffNormalized);
+}
+
 export function isLineInDiff(index: DiffIndex, comment: ReviewComment): boolean {
-  const file = index.files.get(normalizePath(comment.path));
+  const file = resolveDiffFile(index, comment.path);
   if (!file) return false;
   const set = comment.side === "RIGHT" ? file.right : file.left;
   return set.has(comment.line);
 }
 
 export function hunkHashForComment(index: DiffIndex, comment: ReviewComment): string {
-  const file = index.files.get(normalizePath(comment.path));
+  const file = resolveDiffFile(index, comment.path);
   if (!file) return "";
   const hunks = file.hunks;
   for (const hunk of hunks) {
@@ -118,7 +127,7 @@ export function hunkHashForComment(index: DiffIndex, comment: ReviewComment): st
 }
 
 export function contextHashForComment(index: DiffIndex, comment: ReviewComment): string {
-  const file = index.files.get(normalizePath(comment.path));
+  const file = resolveDiffFile(index, comment.path);
   if (!file) return "";
   const hunks = file.hunks;
   for (const hunk of hunks) {
@@ -140,9 +149,18 @@ export function contextHashForComment(index: DiffIndex, comment: ReviewComment):
 }
 
 export function normalizePath(path: string): string {
-  let normalized = path.replace(/^\//, "");
+  return path
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+export function normalizeDiffPath(path: string): string {
+  const normalized = normalizePath(path);
   if (normalized.startsWith("a/") || normalized.startsWith("b/")) {
-    normalized = normalized.slice(2);
+    return normalized.slice(2);
   }
   return normalized;
 }

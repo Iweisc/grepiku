@@ -50,6 +50,7 @@ function mapPullRequest(payload: any): ProviderPullRequest {
     state: pr.state ?? payload.issue?.state ?? "open",
     baseRef: pr.base?.ref ?? null,
     headRef: pr.head?.ref ?? null,
+    headRepoFullName: pr.head?.repo?.full_name ?? null,
     baseSha: pr.base?.sha ?? null,
     headSha: pr.head?.sha ?? "",
     draft: Boolean(pr.draft),
@@ -74,6 +75,7 @@ function mapComment(payload: any): ProviderReviewComment {
     path: comment.path || null,
     line: comment.line ?? null,
     side: comment.side || null,
+    inReplyToId: comment.in_reply_to_id ? String(comment.in_reply_to_id) : null,
     createdAt: comment.created_at || null
   };
 }
@@ -246,6 +248,19 @@ export async function loadGithubReviewThreadMap(params: {
   return result;
 }
 
+function isIntegrationPermissionDenied(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? `${error.message} ${(error as { stack?: string }).stack || ""}`
+      : String(error || "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("resource not accessible by integration") ||
+    normalized.includes("requested url returned error: 403") ||
+    normalized.includes("http 403")
+  );
+}
+
 function createClient(params: {
   installationId: string | null;
   repo: ProviderRepo;
@@ -261,6 +276,7 @@ function createClient(params: {
   const prNumber = params.pullRequest.number;
   const headSha = params.pullRequest.headSha;
   let reviewThreadMapCache: Map<string, { threadId: string; isResolved: boolean }> | null = null;
+  let canResolveThreads = true;
 
   async function loadReviewThreadMap(): Promise<Map<string, { threadId: string; isResolved: boolean }>> {
     if (reviewThreadMapCache) return reviewThreadMapCache;
@@ -274,6 +290,7 @@ function createClient(params: {
   }
 
   async function resolveInlineThread(commentId: string): Promise<boolean> {
+    if (!canResolveThreads) return false;
     const lookup = await loadReviewThreadMap();
     const entry = lookup.get(String(commentId));
     if (!entry) return false;
@@ -288,7 +305,15 @@ function createClient(params: {
         }
       }
     `;
-    await (octokit as any).graphql(mutation, { threadId: entry.threadId });
+    try {
+      await (octokit as any).graphql(mutation, { threadId: entry.threadId });
+    } catch (error) {
+      if (isIntegrationPermissionDenied(error)) {
+        canResolveThreads = false;
+        return false;
+      }
+      throw error;
+    }
     entry.isResolved = true;
     return true;
   }
@@ -466,11 +491,53 @@ function createClient(params: {
       return { ...check, id: String(updated.data.id) };
     },
     addReaction: async (commentId: string, reaction: string) => {
-      await octokit.reactions.createForIssueComment({
+      const normalizedCommentId = Number(commentId);
+      try {
+        await octokit.reactions.createForIssueComment({
+          owner,
+          repo,
+          comment_id: normalizedCommentId,
+          content: reaction as any
+        });
+        return;
+      } catch {
+        await octokit.reactions.createForPullRequestReviewComment({
+          owner,
+          repo,
+          comment_id: normalizedCommentId,
+          content: reaction as any
+        });
+      }
+    },
+    replyToComment: async ({ commentId, body }: { commentId: string; body: string }) => {
+      const normalizedBody = normalizePostedBody(body);
+      const created = await octokit.request(
+        "POST /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies",
+        {
+          owner,
+          repo,
+          pull_number: params.pullRequest.number,
+          comment_id: Number(commentId),
+          body: normalizedBody
+        }
+      );
+      return {
+        id: String(created.data.id),
+        body: created.data.body || normalizedBody,
+        url: created.data.html_url || null,
+        path: created.data.path || null,
+        line: created.data.line || null,
+        side: created.data.side || null,
+        inReplyToId: created.data.in_reply_to_id ? String(created.data.in_reply_to_id) : null
+      };
+    },
+    deleteBranch: async (branch: string) => {
+      const normalized = branch.replace(/^refs\/heads\//i, "").trim();
+      if (!normalized) return;
+      await octokit.git.deleteRef({
         owner,
         repo,
-        comment_id: Number(commentId),
-        content: reaction as any
+        ref: `heads/${normalized}`
       });
     },
     createPullRequest: async ({ title, body, head, base, draft }) => {
@@ -578,3 +645,7 @@ export async function resolveGithubBotLogin(): Promise<string> {
   if (configured) return configured;
   return getAppSlug();
 }
+
+export const __githubAdapterInternals = {
+  isIntegrationPermissionDenied
+};

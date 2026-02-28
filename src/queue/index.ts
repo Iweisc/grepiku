@@ -12,6 +12,10 @@ export const reviewQueue = new Queue("review-orchestrator", {
   connection: redisConnection
 });
 
+export const mentionQueue = new Queue("mention-replies", {
+  connection: redisConnection
+});
+
 export const indexQueue = new Queue("indexer", {
   connection: redisConnection
 });

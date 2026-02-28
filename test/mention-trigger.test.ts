@@ -5,6 +5,17 @@ import type { RepoConfig } from "../src/review/config.js";
 
 const baseConfig: RepoConfig = {
   ignore: [],
+  graph: {
+    exclude_dirs: ["internal_harness"],
+    traversal: {
+      max_depth: 5,
+      min_score: 0.07,
+      max_related_files: 24,
+      max_graph_links: 80,
+      hard_include_files: 8,
+      max_nodes_visited: 2400
+    }
+  },
   tools: {},
   limits: { max_inline_comments: 20, max_key_concerns: 5 },
   rules: [],
@@ -12,7 +23,12 @@ const baseConfig: RepoConfig = {
   patternRepositories: [],
   strictness: "medium",
   commentTypes: { allow: ["inline", "summary"] },
-  output: { summaryOnly: false, destination: "comment" },
+  output: {
+    summaryOnly: false,
+    destination: "comment",
+    syncSummaryWithStatus: true,
+    allowIncrementalPrBodyUpdates: true
+  },
   retrieval: {
     topK: 18,
     maxPerPath: 4,

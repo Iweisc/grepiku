@@ -6,6 +6,10 @@ export type PromptPaths = {
   outDir: string;
 };
 
+export type ReviewPromptOptions = {
+  fullRepoStaticAudit?: boolean;
+};
+
 function bundlePath(paths: PromptPaths, file: string): string {
   return `${paths.bundleDir}/${file}`;
 }
@@ -14,7 +18,14 @@ function outPath(paths: PromptPaths, file: string): string {
   return `${paths.outDir}/${file}`;
 }
 
-export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths): string {
+export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths, options: ReviewPromptOptions = {}): string {
+  const scopeRules = options.fullRepoStaticAudit
+    ? [
+        "- This is the first completed review for this PR. Perform a one-time full repository static audit against the current checkout.",
+        "- Inline comments must still target lines that exist in diff.patch.",
+        '- You may include findings outside diff.patch only as `comment_type: "summary"`.'
+      ]
+    : ["- Only comment on lines that exist in diff.patch."];
   return `You are a pull request reviewer. You must produce a structured review.
 
 Context files:
@@ -29,15 +40,15 @@ Context files:
 - Repo checkout: ${paths.repoPath} (read-only)
 
 Rules:
-- Only comment on lines that exist in diff.patch.
+${scopeRules.join("\n")}
 - Default to RIGHT side unless the issue is on removed code.
 - Evidence is required for every comment (quote from diff/context).
 - Do not include evidence quotes in body; put them only in evidence.
 - Avoid formatting/style nits.
 - Prioritize correctness, security, performance regressions, API contract breaks, and missing tests.
-- Use context_pack.json (reviewFocus, hotspots, graphLinks, retrieved) to reason about cross-file impact.
+- Use context_pack.json (reviewFocus, hotspots, graphLinks, graphPaths, graphDebug, retrieved) to reason about cross-file impact.
 - Avoid duplicate findings: one comment per root cause.
-- Keep inline comments concentrated on highest-impact issues; avoid flooding a single file.
+- Prefer high recall for independent high-impact issues; it is acceptable to report multiple inline comments in one file when they represent distinct root causes.
 - Inline comments must include a suggested_patch. If you cannot provide a patch, make it a summary comment instead.
 - Blocking requires concrete evidence and a clear fix/suggested patch.
 - Cap inline comments at ${config.limits.max_inline_comments}.
@@ -85,7 +96,122 @@ Output requirements:
 Do not print anything else to stdout. Ensure the JSON is valid.`;
 }
 
-export function buildEditorPrompt(draftReviewJson: string, paths: PromptPaths): string {
+export function buildCoverageReviewerPrompt(params: {
+  config: RepoConfig;
+  paths: PromptPaths;
+  existingFindings: Array<{
+    path: string;
+    line: number;
+    severity: "blocking" | "important" | "nit";
+    category: "bug" | "security" | "performance" | "maintainability" | "testing" | "style";
+    title: string;
+  }>;
+  targets: Array<{
+    path: string;
+    risk: "low" | "medium" | "high";
+    additions?: number;
+    deletions?: number;
+    reason: string;
+  }>;
+}): string {
+  const existingBlock =
+    params.existingFindings.length > 0
+      ? params.existingFindings
+          .slice(0, 120)
+          .map(
+            (item) =>
+              `- ${item.path}:${item.line} [${item.severity}/${item.category}] ${item.title}`
+          )
+          .join("\n")
+      : "- (none)";
+
+  const targetBlock =
+    params.targets.length > 0
+      ? params.targets
+          .map((target) => {
+            const churn = (target.additions || 0) + (target.deletions || 0);
+            return `- ${target.path} (risk=${target.risk}, churn=${churn}) reason: ${target.reason}`;
+          })
+          .join("\n")
+      : "- (none)";
+
+  const maxExtra = Math.max(2, Math.floor(params.config.limits.max_inline_comments * 0.5));
+  return `You are running a supplemental PR review pass to improve recall.
+
+Context files:
+- ${bundlePath(params.paths, "pr.md")}
+- ${bundlePath(params.paths, "diff.patch")}
+- ${bundlePath(params.paths, "changed_files.json")}
+- ${bundlePath(params.paths, "bot_config.json")}
+- ${bundlePath(params.paths, "rules.json")}
+- ${bundlePath(params.paths, "scopes.json")}
+- ${bundlePath(params.paths, "context_pack.json")}
+- Repo checkout: ${params.paths.repoPath} (read-only)
+
+Focus only on these changed files that were not covered well in the first pass:
+${targetBlock}
+
+Existing findings already reported (do not duplicate these root causes):
+${existingBlock}
+
+Rules:
+- Only produce net-new findings; if nothing new is found, return an empty comments array.
+- Only comment on lines that exist in diff.patch.
+- Prioritize correctness, security, performance regressions, contract breaks, and missing tests.
+- Evidence is required for every comment and must quote diff/context.
+- Inline comments must include a suggested_patch.
+- Avoid style nits.
+- Cap output to at most ${maxExtra} comments.
+- Prefer high-confidence comments. Low-confidence comments should be omitted.
+
+Output requirements:
+- Write JSON to ${outPath(params.paths, "coverage_draft_review.json")} with this schema:
+{
+  "summary": {
+    "overview": "string",
+    "risk": "low|medium|high",
+    "confidence": 0.0,
+    "key_concerns": ["string"],
+    "what_to_test": ["string"],
+    "file_breakdown": [
+      { "path": "string", "summary": "string", "risk": "low|medium|high (optional)" }
+    ]
+  },
+  "comments": [
+    {
+      "comment_id": "string",
+      "comment_key": "string",
+      "path": "string",
+      "side": "RIGHT|LEFT",
+      "line": 123,
+      "severity": "blocking|important|nit",
+      "category": "bug|security|performance|maintainability|testing|style",
+      "title": "string",
+      "body": "string",
+      "evidence": "string",
+      "suggested_patch": "string (optional)",
+      "comment_type": "inline|summary (optional)",
+      "rule_id": "string (optional)",
+      "rule_reason": "string (optional)",
+      "confidence": "high|medium|low (optional)"
+    }
+  ]
+}
+
+Do not print anything else to stdout. Ensure the JSON is valid.`;
+}
+
+export function buildEditorPrompt(
+  draftReviewJson: string,
+  paths: PromptPaths,
+  options: ReviewPromptOptions = {}
+): string {
+  const placementRules = options.fullRepoStaticAudit
+    ? [
+        "- Inline comments must be on diff lines.",
+        '- Summary comments may cover issues outside diff.patch when they are high-confidence and actionable.'
+      ]
+    : ["- Only comment on diff lines."];
   return `You are the editor pass. Your job is to reduce false positives and enforce all constraints.
 
 Inputs:
@@ -97,7 +223,7 @@ ${draftReviewJson}
 - Context pack: ${bundlePath(paths, "context_pack.json")}
 
 Rules to enforce:
-- Only comment on diff lines.
+${placementRules.join("\n")}
 - Evidence required.
 - Do not include evidence quotes in body; keep quotes only in evidence.
 - Blocking requires clear fix/suggested patch.

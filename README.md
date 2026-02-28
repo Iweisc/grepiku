@@ -7,10 +7,12 @@ GitHub PR review bot powered by Codex.
 - Inline review comments on PR diffs plus a summary
 - Tracks findings across pushes and marks them as new, still open, or fixed
 - Re-runs on new commits and on `/review` comments
+- Mention workflow: `@grepiku` answers questions, and `@grepiku do: ...` applies code changes and opens a follow-up PR
 - 3-stage pipeline: reviewer, editor, execution verifier
 - Hybrid context retrieval (semantic + lexical + RRF + changed-path boosts) with graph-aware related files
 - Full-repo embeddings with file, symbol, and chunk vectors for deeper codebase context
 - Deterministic quality gate to dedupe overlapping findings and prioritize high-signal comments
+- First PR bootstrap: full-codebase indexing + graph build, then incremental refresh on subsequent changes
 
 ## Architecture
 
@@ -29,13 +31,17 @@ GitHub PR review bot powered by Codex.
 
 1) Create a GitHub App
 - Permissions (minimum):
-  - Pull requests: read
+  - Pull requests: read & write
   - Issues: read & write
   - Reactions: write
   - Contents: read
   - Checks: read
 - Subscribe to webhook events:
   - `pull_request`, `issue_comment`, `pull_request_review_comment`, `reaction`
+
+Important:
+- `pull_request_review_comment` is required for replies on inline review threads.
+- After changing webhook subscriptions or permissions, re-install/update the GitHub App on the target repo/org so changes take effect.
 
 2) Configure environment
 
@@ -61,6 +67,17 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
 ```yaml
 {
   "ignore": ["node_modules/**", "dist/**"],
+  "graph": {
+    "exclude_dirs": ["internal_harness"],
+    "traversal": {
+      "max_depth": 5,
+      "min_score": 0.07,
+      "max_related_files": 28,
+      "max_graph_links": 110,
+      "hard_include_files": 8,
+      "max_nodes_visited": 2600
+    }
+  },
   "tools": {
     "lint": { "cmd": "pnpm lint", "timeout_sec": 900 },
     "build": { "cmd": "pnpm build", "timeout_sec": 1200 },
@@ -72,10 +89,15 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
   "patternRepositories": [],
   "strictness": "medium",
   "commentTypes": { "allow": ["inline", "summary"] },
-  "output": { "summaryOnly": false, "destination": "comment" },
+  "output": {
+    "summaryOnly": false,
+    "destination": "comment",
+    "syncSummaryWithStatus": true,
+    "allowIncrementalPrBodyUpdates": true
+  },
   "retrieval": {
-    "topK": 18,
-    "maxPerPath": 4,
+    "topK": 28,
+    "maxPerPath": 6,
     "semanticWeight": 0.62,
     "lexicalWeight": 0.22,
     "rrfWeight": 0.08,
@@ -98,12 +120,23 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
 }
 ```
 
+`graph.exclude_dirs` is a list of repo-relative directory prefixes excluded from graph generation and graph traversal seeding (indexing and retrieval remain unchanged).  
+`graph.traversal` tunes how aggressively graph traversal expands context during review.
+`output.syncSummaryWithStatus` keeps the PR body "Grepiku Summary" synchronized with each AI review status run (default: `true`).  
+`output.allowIncrementalPrBodyUpdates` allows PR body summary updates on incremental/synchronize runs (default: `true`).
+
 If missing, defaults are used and tools are marked as skipped.
 
 ## Runtime Notes
 
 - Each run writes artifacts under `var/runs/<runId>`.
 - Worker executes `codex-exec` directly and injects MCP roots for repo/bundle/out paths.
+- Review and mention pipelines are local-first: diff/changed-file context is computed from local git checkout by default, with GitHub API as fallback.
+- Review and mention-reply workloads run on separate BullMQ queues, so `@grepiku` Q&A / `do:` jobs do not wait behind long PR review runs.
+- When changed-file coverage is low, Grepiku runs a supplemental coverage pass focused on uncovered changed files to improve bug recall.
+- Worker concurrency can be tuned with:
+  - `REVIEW_WORKER_CONCURRENCY` (default `3`)
+  - `MENTION_WORKER_CONCURRENCY` (default `3`)
 - Tool runs are cached in Postgres per (review run, tool).
 
 ## Endpoints
@@ -112,6 +145,7 @@ If missing, defaults are used and tools are marked as skipped.
 - `GET /healthz` health check
 - `GET /dashboard` analytics UI
 - Internal API: `/internal/review/enqueue`, `/internal/index/enqueue`, `/internal/rules/resolve`, `/internal/retrieval`
+- Traversal metrics API: `/api/analytics/traversal`
 
 ## Development
 
@@ -137,3 +171,19 @@ npm run start:review-loop
 ```
 
 Cycle logs are written to `var/loop/*.jsonl`.
+
+## Traversal Quality Loop
+
+Replay evaluator over historical completed runs:
+
+```bash
+npm run check:traversal-quality
+```
+
+Optional filters and thresholds:
+
+```bash
+tsx src/tools/traversalQuality.ts --ci --replay --repo-id=2 --since-days=14 --limit=500 --concurrency=4
+```
+
+The command exits non-zero in `--ci` mode when recall/precision or p95 SLO thresholds are violated.

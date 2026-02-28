@@ -3,7 +3,7 @@ import test from "node:test";
 import { prisma } from "../src/db/client.js";
 import { loadRepoEmbeddings } from "../src/services/retrieval.js";
 
-test("loadRepoEmbeddings keeps newest embeddings when capped", async () => {
+test("loadRepoEmbeddings paginates through all embeddings without silent truncation", async () => {
   const totalEmbeddings = 100_000;
   let calls = 0;
 
@@ -34,11 +34,10 @@ test("loadRepoEmbeddings keeps newest embeddings when capped", async () => {
 
   try {
     const rows = await loadRepoEmbeddings(77);
-    assert.equal(rows.length, 80_000);
+    assert.equal(rows.length, totalEmbeddings);
     assert.equal(rows[0]?.id, 100_000);
-    assert.equal(rows[rows.length - 1]?.id, 20_001);
-    assert.equal(rows.some((row) => row.id === 20_000), false);
-    assert.equal(calls, 40);
+    assert.equal(rows[rows.length - 1]?.id, 1);
+    assert.equal(calls, 51);
   } finally {
     prisma.embedding.findMany = originalFindMany;
   }

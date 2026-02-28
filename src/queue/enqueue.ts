@@ -1,4 +1,5 @@
-import { reviewQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
+import { reviewQueue, mentionQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
+import { buildIndexJobId } from "./jobId.js";
 
 export async function enqueueReviewJob(data: any) {
   await reviewQueue.add("review", data, {
@@ -10,7 +11,7 @@ export async function enqueueReviewJob(data: any) {
 }
 
 export async function enqueueCommentReplyJob(data: any) {
-  await reviewQueue.add("comment-reply", data, {
+  await mentionQueue.add("comment-reply", data, {
     removeOnComplete: true,
     removeOnFail: false,
     attempts: 2,
@@ -19,7 +20,12 @@ export async function enqueueCommentReplyJob(data: any) {
 }
 
 export async function enqueueIndexJob(data: any) {
-  await indexQueue.add("index", data, { removeOnComplete: true, removeOnFail: false });
+  const jobId = buildIndexJobId(data);
+  await indexQueue.add("index", data, {
+    jobId,
+    removeOnComplete: true,
+    removeOnFail: false
+  });
 }
 
 export async function enqueueGraphJob(data: any) {

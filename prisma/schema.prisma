@@ -429,6 +429,9 @@ model GraphNode {
   updatedAt DateTime @updatedAt
 
   repo Repo @relation(fields: [repoId], references: [id])
+
+  @@index([repoId, type, key])
+  @@index([repoId, fileId, type])
 }
 
 model GraphEdge {
@@ -442,6 +445,9 @@ model GraphEdge {
   updatedAt  DateTime @updatedAt
 
   repo Repo @relation(fields: [repoId], references: [id])
+
+  @@index([repoId, type, fromNodeId])
+  @@index([repoId, type, toNodeId])
 }
 
 model Embedding {
@@ -458,6 +464,8 @@ model Embedding {
   repo   Repo      @relation(fields: [repoId], references: [id])
   file   FileIndex? @relation(fields: [fileId], references: [id])
   symbol Symbol?   @relation(fields: [symbolId], references: [id])
+
+  @@index([repoId, kind, id])
 }
 
 model AnalyticsEvent {

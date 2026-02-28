@@ -1,13 +1,17 @@
 import fs from "fs/promises";
 import path from "path";
 import { minimatch } from "minimatch";
-import { execa } from "execa";
 import { ZodSchema } from "zod";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
 import { loadRepoConfig, saveRepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
-import { buildReviewerPrompt, buildEditorPrompt, buildVerifierPrompt } from "./prompts.js";
+import {
+  buildReviewerPrompt,
+  buildEditorPrompt,
+  buildVerifierPrompt,
+  buildCoverageReviewerPrompt
+} from "./prompts.js";
 import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
 import { parseAndValidateJson, readAndValidateJson } from "./json.js";
 import {
@@ -30,11 +34,18 @@ import { selectSemanticFindingCandidate } from "./findingMatch.js";
 import { ReviewOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
-import { enqueueAnalyticsJob, enqueueGraphJob, enqueueIndexJob } from "../queue/enqueue.js";
+import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
 import { resolveRules } from "./triggers.js";
 import { buildContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 import { refineReviewComments } from "./quality.js";
+import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
+import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
+import {
+  buildCoveragePlan,
+  mergeSupplementalComments,
+  mergeSupplementalSummary
+} from "./coverage.js";
 
 const env = loadEnv();
 
@@ -524,45 +535,121 @@ function sanitizeMermaidLabel(label: string): string {
     .trim();
 }
 
-function generateMermaidDiagram(changedFiles: Array<{ filename?: string; path?: string }>, relatedFiles: string[]): string {
+function makeMermaidNodeId(path: string, index: number): string {
+  const slug = path
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 42);
+  return `p_${slug || "node"}_${index}`;
+}
+
+function generateMermaidDiagram(params: {
+  changedFiles: Array<{ filename?: string; path?: string }>;
+  relatedFiles: string[];
+  graphLinks: Array<{ from: string; to: string; type: string }>;
+}): string {
+  const changedFiles = params.changedFiles;
+  const relatedFiles = params.relatedFiles;
   const changed = changedFiles
     .map((file) => file.filename || file.path)
     .filter((value): value is string => Boolean(value));
-  if (changed.length === 0 || relatedFiles.length === 0) return "";
+  if (changed.length === 0) return "";
 
-  const maxChanged = 10;
-  const maxRelated = 12;
-  const maxEdges = 30;
-  const changedSlice = changed.slice(0, maxChanged);
-  const relatedSlice = relatedFiles.slice(0, maxRelated);
+  const maxNodes = 28;
+  const maxEdges = 42;
+  const changedSlice = changed.slice(0, 12);
+  const relatedSlice = relatedFiles.slice(0, 18);
+  const scopeSet = new Set([...changedSlice, ...relatedSlice]);
 
   const nodeIds = new Map<string, string>();
-  const allNodes = [...new Set([...changedSlice, ...relatedSlice])];
-  allNodes.forEach((path, idx) => {
-    nodeIds.set(path, `n${idx}`);
+  const edges: Array<{ from: string; to: string }> = [];
+  const dedupe = new Set<string>();
+
+  for (const link of params.graphLinks) {
+    if (link.type !== "file_dep") continue;
+    if (link.from === link.to) continue;
+    if (!scopeSet.has(link.from) && !scopeSet.has(link.to)) continue;
+    const key = `${link.from}->${link.to}`;
+    if (dedupe.has(key)) continue;
+    dedupe.add(key);
+    edges.push({ from: link.from, to: link.to });
+    if (edges.length >= maxEdges) break;
+  }
+
+  if (edges.length === 0) {
+    for (const from of changedSlice) {
+      for (const to of relatedSlice) {
+        if (from === to) continue;
+        const key = `${from}->${to}`;
+        if (dedupe.has(key)) continue;
+        dedupe.add(key);
+        edges.push({ from, to });
+        if (edges.length >= Math.min(maxEdges, 16)) break;
+      }
+      if (edges.length >= Math.min(maxEdges, 16)) break;
+    }
+  }
+  if (edges.length === 0) return "";
+
+  const nodeOrder: string[] = [];
+  const addNode = (path: string) => {
+    if (nodeIds.has(path)) return;
+    const idx = nodeIds.size;
+    nodeIds.set(path, makeMermaidNodeId(path, idx));
+    nodeOrder.push(path);
+  };
+
+  for (const path of changedSlice) addNode(path);
+  for (const edge of edges) {
+    addNode(edge.from);
+    addNode(edge.to);
+    if (nodeOrder.length >= maxNodes) break;
+  }
+
+  const allowed = new Set(nodeOrder.slice(0, maxNodes));
+  const filteredEdges = edges
+    .filter((edge) => allowed.has(edge.from) && allowed.has(edge.to))
+    .slice(0, maxEdges);
+  if (filteredEdges.length === 0) return "";
+
+  const finalNodes = nodeOrder.filter((path) => allowed.has(path));
+  finalNodes.forEach((path, idx) => {
+    if (!nodeIds.has(path)) {
+      nodeIds.set(path, makeMermaidNodeId(path, idx));
+    }
   });
 
-  const nodeLines = allNodes.map((path) => {
+  const changedSet = new Set(changedSlice);
+  const nodeLines = finalNodes.map((path) => {
     const id = nodeIds.get(path);
     const label = sanitizeMermaidLabel(path);
     return `${id}["${label}"]`;
   });
 
-  const edges: string[] = [];
-  for (const file of changedSlice) {
-    for (const rel of relatedSlice.slice(0, 5)) {
-      if (file === rel) continue;
-      const fromId = nodeIds.get(file);
-      const toId = nodeIds.get(rel);
-      if (!fromId || !toId) continue;
-      edges.push(`${fromId} --> ${toId}`);
-      if (edges.length >= maxEdges) break;
-    }
-    if (edges.length >= maxEdges) break;
-  }
+  const edgeLines = filteredEdges
+    .map((edge) => {
+      const fromId = nodeIds.get(edge.from);
+      const toId = nodeIds.get(edge.to);
+      if (!fromId || !toId) return null;
+      return `${fromId} --> ${toId}`;
+    })
+    .filter((line): line is string => Boolean(line));
 
-  if (edges.length === 0) return "";
-  return ["graph TD", ...nodeLines, ...edges].join("\n");
+  const classLines = finalNodes
+    .filter((path) => changedSet.has(path))
+    .map((path) => {
+      const id = nodeIds.get(path);
+      return id ? `class ${id} changed;` : null;
+    })
+    .filter((line): line is string => Boolean(line));
+
+  return [
+    "graph TD",
+    ...nodeLines,
+    ...edgeLines,
+    "classDef changed fill:#ffd7ba,stroke:#c2410c,stroke-width:1px,color:#111;",
+    ...classLines
+  ].join("\n");
 }
 
 function enrichSummary(params: {
@@ -570,6 +657,7 @@ function enrichSummary(params: {
   comments: ReviewComment[];
   changedFiles: Array<{ filename?: string; path?: string }>;
   relatedFiles: string[];
+  graphLinks: Array<{ from: string; to: string; type: string }>;
 }): ReviewOutput["summary"] {
   const summary = { ...params.summary };
   if (!summary.file_breakdown || summary.file_breakdown.length === 0) {
@@ -586,7 +674,11 @@ function enrichSummary(params: {
       }));
   }
   if (!summary.diagram_mermaid) {
-    const diagram = generateMermaidDiagram(params.changedFiles, params.relatedFiles);
+    const diagram = generateMermaidDiagram({
+      changedFiles: params.changedFiles,
+      relatedFiles: params.relatedFiles,
+      graphLinks: params.graphLinks
+    });
     if (diagram) summary.diagram_mermaid = diagram;
   }
   if (summary.confidence === undefined) {
@@ -608,46 +700,6 @@ function upsertSummaryBlock(body: string, block: string): string {
   const trimmed = body.trim();
   if (trimmed.length === 0) return block;
   return `${trimmed}\n\n${block}`;
-}
-
-async function buildLocalDiffPatch(params: {
-  repoPath: string;
-  baseSha: string | null | undefined;
-  headSha: string;
-}): Promise<string> {
-  const { repoPath, baseSha, headSha } = params;
-  if (!baseSha) return "";
-  const { stdout } = await execa(
-    "git",
-    ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
-    { maxBuffer: 1024 * 1024 * 200 }
-  );
-  return stdout;
-}
-
-async function buildLocalChangedFiles(params: {
-  repoPath: string;
-  baseSha: string;
-  headSha: string;
-}): Promise<Array<{ path: string; status?: string }>> {
-  const { repoPath, baseSha, headSha } = params;
-  const { stdout } = await execa(
-    "git",
-    ["-C", repoPath, "diff", "--name-status", `${baseSha}...${headSha}`],
-    { maxBuffer: 1024 * 1024 * 200 }
-  );
-  if (!stdout.trim()) return [];
-  return stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const parts = line.split("\t");
-      const status = parts[0] || "";
-      const path = parts[parts.length - 1] || "";
-      return { path, status };
-    })
-    .filter((item) => item.path);
 }
 
 function renderPrMarkdown(params: {
@@ -782,6 +834,13 @@ export async function processReviewJob(data: ReviewJobData) {
   try {
     const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
 
+    const latestCompletedRun = await prisma.reviewRun.findFirst({
+      where: {
+        pullRequestId: pullRequest.id,
+        status: "completed"
+      },
+      orderBy: { createdAt: "desc" }
+    });
     const previousRun = await prisma.reviewRun.findFirst({
       where: {
         pullRequestId: pullRequest.id,
@@ -792,9 +851,15 @@ export async function processReviewJob(data: ReviewJobData) {
     });
     const incrementalFrom = previousRun?.headSha || null;
     const incrementalReview = Boolean(incrementalFrom) && !data.force && trigger !== "manual";
+    const fullRepoStaticAudit = !latestCompletedRun;
 
-    const { config: repoConfig, warnings } = await loadRepoConfig(repoPath);
-    await saveRepoConfig(repo.id, repoConfig, warnings);
+    const { config: fileRepoConfig, warnings } = await loadRepoConfig(repoPath);
+    await saveRepoConfig(repo.id, fileRepoConfig, warnings);
+    const memoryRules = await loadAcceptedRepoMemoryRules(repo.id);
+    const repoConfig =
+      memoryRules.length > 0
+        ? { ...fileRepoConfig, rules: mergeRulesWithRepoMemory(fileRepoConfig.rules, memoryRules) }
+        : fileRepoConfig;
     const resolvedConfig = resolveRules(repoConfig, {
       orgDefaults: (installation?.configJson as any) || undefined,
       uiRules: rulesOverride?.rules || [],
@@ -859,20 +924,36 @@ export async function processReviewJob(data: ReviewJobData) {
       });
     }
 
-    let diffPatch: string;
+    let diffPatch = "";
     let changedFiles: Array<{ path?: string; status?: string; additions?: number; deletions?: number; patch?: string | null }>;
-    if (incrementalReview && incrementalFrom) {
-      diffPatch = await buildLocalDiffPatch({
-        repoPath,
-        baseSha: incrementalFrom,
-        headSha: refreshed.headSha
-      });
-      changedFiles = await buildLocalChangedFiles({
-        repoPath,
-        baseSha: incrementalFrom,
-        headSha: refreshed.headSha
-      });
-    } else {
+    changedFiles = [];
+    const comparisonBaseSha = incrementalReview && incrementalFrom ? incrementalFrom : refreshed.baseSha;
+    let localCompareSucceeded = false;
+
+    if (comparisonBaseSha) {
+      try {
+        diffPatch = await buildLocalDiffPatch({
+          repoPath,
+          baseSha: comparisonBaseSha,
+          headSha: refreshed.headSha
+        });
+        changedFiles = await buildLocalChangedFiles({
+          repoPath,
+          baseSha: comparisonBaseSha,
+          headSha: refreshed.headSha
+        });
+        localCompareSucceeded = true;
+        console.log(
+          `[run ${run.id} pr#${prNumber}] using local git compare (${changedFiles.length} changed file${changedFiles.length === 1 ? "" : "s"})`
+        );
+      } catch (err) {
+        console.warn(`[run ${run.id} pr#${prNumber}] local git compare failed; falling back to provider API`, {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
+
+    if (!localCompareSucceeded) {
       try {
         diffPatch = await client.fetchDiffPatch();
       } catch {
@@ -908,7 +989,8 @@ export async function processReviewJob(data: ReviewJobData) {
       }>,
       prTitle: refreshed.title || pullRequest.title,
       prBody: refreshed.body || pullRequest.body,
-      retrieval: resolvedConfig.retrieval
+      retrieval: resolvedConfig.retrieval,
+      graph: resolvedConfig.graph
     });
 
     const { bundleDir, outDir, codexHomeDir } = await createRunDirs(env.projectRoot, run.id);
@@ -952,7 +1034,7 @@ export async function processReviewJob(data: ReviewJobData) {
         ? `\n\nReview only code changes between ${incrementalFrom} and ${refreshed.headSha}. Treat this as a full review of the update and do not mention that this run is incremental.`
         : "";
     const reviewerPrompt =
-      buildReviewerPrompt(resolvedConfig, promptPaths) +
+      buildReviewerPrompt(resolvedConfig, promptPaths, { fullRepoStaticAudit }) +
       buildFeedbackHint(feedbackPolicy) +
       incrementalHint;
     await runCodexStage({
@@ -974,7 +1056,7 @@ export async function processReviewJob(data: ReviewJobData) {
       "reviewer"
     );
 
-    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths);
+    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, { fullRepoStaticAudit });
     await runCodexStage({
       stage: "editor",
       repoPath,
@@ -1001,7 +1083,7 @@ export async function processReviewJob(data: ReviewJobData) {
 
     const diffIndex = buildDiffIndex(diffPatch);
     const verdictMap = new Map(verdicts.verdicts.map((v) => [v.comment_id, v]));
-    const commentsAfterVerdict: ReviewComment[] = [];
+    let commentsAfterVerdict: ReviewComment[] = [];
     for (const comment of finalReview.comments) {
       const verdict = verdictMap.get(comment.comment_id);
       if (verdict?.decision === "drop") continue;
@@ -1013,6 +1095,87 @@ export async function processReviewJob(data: ReviewJobData) {
         }
       }
       commentsAfterVerdict.push(comment);
+    }
+
+    const coveragePlan = buildCoveragePlan({
+      changedFiles: changedFiles as Array<{
+        path?: string;
+        filename?: string;
+        additions?: number;
+        deletions?: number;
+      }>,
+      changedFileStats: contextPack.changedFileStats,
+      comments: commentsAfterVerdict,
+      maxTargets: Math.min(12, Math.max(4, Math.ceil(resolvedConfig.limits.max_inline_comments * 0.5)))
+    });
+    const coverageDiagnostics = {
+      attempted: false,
+      targets: coveragePlan.targets.length,
+      added: 0,
+      droppedDuplicates: 0,
+      droppedLowValue: 0
+    };
+    const shouldRunCoveragePass =
+      coveragePlan.shouldRun &&
+      coveragePlan.targets.length > 0 &&
+      !resolvedConfig.output.summaryOnly &&
+      resolvedConfig.commentTypes.allow.includes("inline");
+
+    if (shouldRunCoveragePass) {
+      coverageDiagnostics.attempted = true;
+      try {
+        const coveragePrompt = buildCoverageReviewerPrompt({
+          config: resolvedConfig,
+          paths: promptPaths,
+          existingFindings: commentsAfterVerdict
+            .slice(0, 120)
+            .map((comment) => ({
+              path: comment.path,
+              line: comment.line,
+              severity: comment.severity,
+              category: comment.category,
+              title: comment.title
+            })),
+          targets: coveragePlan.targets
+        });
+        await runCodexStage({
+          stage: "reviewer",
+          repoPath,
+          bundleDir,
+          outDir,
+          codexHomeDir,
+          prompt: coveragePrompt,
+          headSha: refreshed.headSha,
+          repoId: repo.id,
+          reviewRunId: run.id,
+          prNumber
+        });
+
+        const coverageDraft = await readJsonWithFallback(
+          path.join(outDir, "coverage_draft_review.json"),
+          ReviewSchema,
+          "reviewer"
+        );
+        const merged = mergeSupplementalComments({
+          base: commentsAfterVerdict,
+          supplemental: coverageDraft.comments
+        });
+        commentsAfterVerdict = merged.comments;
+        coverageDiagnostics.added = merged.added;
+        coverageDiagnostics.droppedDuplicates = merged.droppedDuplicates;
+        coverageDiagnostics.droppedLowValue = merged.droppedLowValue;
+        if (merged.added > 0) {
+          finalReview.summary = mergeSupplementalSummary({
+            base: finalReview.summary,
+            supplemental: coverageDraft.summary,
+            maxKeyConcerns: resolvedConfig.limits.max_key_concerns
+          });
+        }
+      } catch (err) {
+        console.warn(`[run ${run.id} pr#${prNumber}] coverage pass failed; continuing with primary review`, {
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
     }
 
     const qualityRefinement = refineReviewComments({
@@ -1030,7 +1193,8 @@ export async function processReviewJob(data: ReviewJobData) {
       summary: finalReview.summary,
       comments: finalReview.comments,
       changedFiles: changedFiles as Array<{ filename?: string; path?: string }>,
-      relatedFiles: contextPack.relatedFiles
+      relatedFiles: contextPack.relatedFiles,
+      graphLinks: contextPack.graphLinks
     });
 
     const filteredComments = filterAndNormalizeComments(
@@ -1068,10 +1232,12 @@ export async function processReviewJob(data: ReviewJobData) {
     const originalBody = pullRequest.body || "";
     const updatedBody = upsertSummaryBlock(originalBody, summaryBlock);
     const shouldUpdateBody =
+      resolvedConfig.output.syncSummaryWithStatus ||
       resolvedConfig.output.destination === "pr_body" ||
       resolvedConfig.output.destination === "both" ||
       originalBody.trim().length === 0;
-    const allowBodyUpdate = !incrementalReview;
+    const allowBodyUpdate =
+      resolvedConfig.output.allowIncrementalPrBodyUpdates || !incrementalReview;
     if (shouldUpdateBody && allowBodyUpdate && updatedBody !== originalBody) {
       try {
         await client.updatePullRequestBody(updatedBody);
@@ -1347,12 +1513,17 @@ export async function processReviewJob(data: ReviewJobData) {
       title: f.title
     }));
     if (incrementalReview) {
-      const carriedOpenCount = existingOpen.filter(
-        (finding) => !matchedOldIds.has(finding.id) && !fixedIds.has(finding.id)
-      ).length;
-      if (carriedOpenCount > 0) {
+      const carriedOpenFindings = existingOpen
+        .filter((finding) => !matchedOldIds.has(finding.id) && !fixedIds.has(finding.id))
+        .sort((a, b) => {
+          const pathCmp = a.path.localeCompare(b.path);
+          if (pathCmp !== 0) return pathCmp;
+          if (a.line !== b.line) return a.line - b.line;
+          return a.title.localeCompare(b.title);
+        });
+      for (const finding of carriedOpenFindings) {
         openFindingLinks.push({
-          title: `${carriedOpenCount} existing finding${carriedOpenCount === 1 ? "" : "s"} remain open from prior review state.`
+          title: finding.title
         });
       }
     }
@@ -1381,6 +1552,28 @@ export async function processReviewJob(data: ReviewJobData) {
       qualityWarnings.push(
         `Quality gate downgraded ${qualityRefinement.diagnostics.downgradedBlocking} blocking comment(s) missing a concrete patch.`
       );
+    }
+    if (coverageDiagnostics.attempted) {
+      qualityWarnings.push(
+        `Coverage pass scanned ${coverageDiagnostics.targets} uncovered changed file(s) and added ${coverageDiagnostics.added} additional finding(s).`
+      );
+      if (coverageDiagnostics.droppedDuplicates > 0) {
+        qualityWarnings.push(
+          `Coverage pass dropped ${coverageDiagnostics.droppedDuplicates} duplicate supplemental finding(s).`
+        );
+      }
+      if (coverageDiagnostics.droppedLowValue > 0) {
+        qualityWarnings.push(
+          `Coverage pass dropped ${coverageDiagnostics.droppedLowValue} low-value supplemental finding(s).`
+        );
+      }
+    } else if (coveragePlan.stats.uncoveredChanged > 0) {
+      qualityWarnings.push(
+        `Changed-file coverage before quality gate: ${(coveragePlan.stats.coverageRatio * 100).toFixed(0)}% (${coveragePlan.stats.coveredChanged}/${coveragePlan.stats.totalChanged}).`
+      );
+    }
+    if (fullRepoStaticAudit) {
+      qualityWarnings.push("Initial review mode: one-time full-repo static audit with off-diff findings reported as summary comments.");
     }
     if (overlapSuppressed > 0) {
       qualityWarnings.push(
@@ -1456,7 +1649,6 @@ export async function processReviewJob(data: ReviewJobData) {
       repoId: repo.id,
       headSha: refreshed.headSha
     });
-    await enqueueGraphJob({ repoId: repo.id });
     await enqueueAnalyticsJob({ reviewRunId: run.id });
   } catch (err) {
     await prisma.reviewRun.update({

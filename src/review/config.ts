@@ -3,6 +3,7 @@ import path from "path";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { prisma } from "../db/client.js";
+import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
 
 export type ToolConfig = {
   cmd: string;
@@ -24,6 +25,17 @@ export type RuleConfig = {
 
 export type RepoConfig = {
   ignore: string[];
+  graph: {
+    exclude_dirs: string[];
+    traversal: {
+      max_depth: number;
+      min_score: number;
+      max_related_files: number;
+      max_graph_links: number;
+      hard_include_files: number;
+      max_nodes_visited: number;
+    };
+  };
   tools: {
     lint?: ToolConfig;
     build?: ToolConfig;
@@ -53,6 +65,8 @@ export type RepoConfig = {
   output: {
     summaryOnly: boolean;
     destination: "comment" | "pr_body" | "both";
+    syncSummaryWithStatus: boolean;
+    allowIncrementalPrBodyUpdates: boolean;
   };
   retrieval: {
     topK: number;
@@ -83,6 +97,38 @@ export type RepoConfig = {
 
 const GrepikuSchema = z.object({
   ignore: z.array(z.string()).default(["node_modules/**", "dist/**"]),
+  graph: z
+    .object({
+      exclude_dirs: z.array(z.string()).default(["internal_harness"]),
+      traversal: z
+        .object({
+          max_depth: z.number().int().min(1).max(8).default(5),
+          min_score: z.number().min(0.01).max(0.5).default(0.07),
+          max_related_files: z.number().int().min(6).max(80).default(28),
+          max_graph_links: z.number().int().min(10).max(240).default(110),
+          hard_include_files: z.number().int().min(0).max(24).default(8),
+          max_nodes_visited: z.number().int().min(200).max(12000).default(2600)
+        })
+        .default({
+          max_depth: 5,
+          min_score: 0.07,
+          max_related_files: 28,
+          max_graph_links: 110,
+          hard_include_files: 8,
+          max_nodes_visited: 2600
+        })
+    })
+    .default({
+      exclude_dirs: ["internal_harness"],
+      traversal: {
+        max_depth: 5,
+        min_score: 0.07,
+        max_related_files: 28,
+        max_graph_links: 110,
+        hard_include_files: 8,
+        max_nodes_visited: 2600
+      }
+    }),
   tools: z
     .object({
       lint: z.object({ cmd: z.string(), timeout_sec: z.number().int().positive() }).optional(),
@@ -141,13 +187,20 @@ const GrepikuSchema = z.object({
   output: z
     .object({
       summaryOnly: z.boolean().default(false),
-      destination: z.enum(["comment", "pr_body", "both"]).default("both")
+      destination: z.enum(["comment", "pr_body", "both"]).default("both"),
+      syncSummaryWithStatus: z.boolean().default(true),
+      allowIncrementalPrBodyUpdates: z.boolean().default(true)
     })
-    .default({ summaryOnly: false, destination: "both" }),
+    .default({
+      summaryOnly: false,
+      destination: "both",
+      syncSummaryWithStatus: true,
+      allowIncrementalPrBodyUpdates: true
+    }),
   retrieval: z
     .object({
-      topK: z.number().int().min(4).max(60).default(18),
-      maxPerPath: z.number().int().min(1).max(12).default(4),
+      topK: z.number().int().min(4).max(60).default(28),
+      maxPerPath: z.number().int().min(1).max(12).default(6),
       semanticWeight: z.number().min(0).max(1).default(0.62),
       lexicalWeight: z.number().min(0).max(1).default(0.22),
       rrfWeight: z.number().min(0).max(1).default(0.08),
@@ -158,8 +211,8 @@ const GrepikuSchema = z.object({
       chunkBoost: z.number().min(0).max(1).default(0.03)
     })
     .default({
-      topK: 18,
-      maxPerPath: 4,
+      topK: 28,
+      maxPerPath: 6,
       semanticWeight: 0.62,
       lexicalWeight: 0.22,
       rrfWeight: 0.08,
@@ -234,6 +287,17 @@ export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoCo
     const legacy: RepoConfig = {
       ...defaultConfig,
       ignore: Array.isArray(parsed.ignore) ? parsed.ignore : defaultConfig.ignore,
+      graph: {
+        exclude_dirs: Array.isArray(parsed.graph?.exclude_dirs)
+          ? parsed.graph.exclude_dirs
+          : defaultConfig.graph.exclude_dirs,
+        traversal: {
+          ...defaultConfig.graph.traversal,
+          ...(typeof parsed.graph?.traversal === "object" && parsed.graph?.traversal
+            ? parsed.graph.traversal
+            : {})
+        }
+      },
       tools: {
         lint: parsed.tools?.lint,
         build: parsed.tools?.build,
@@ -260,6 +324,13 @@ export async function resolveRepoConfig(repoId: number, providerKind?: string): 
   const triggerSetting = await prisma.triggerSetting.findFirst({ where: { repoId } });
   if (triggerSetting?.configJson) {
     config = { ...config, triggers: triggerSetting.configJson as RepoConfig["triggers"] };
+  }
+  const memoryRules = await loadAcceptedRepoMemoryRules(repoId);
+  if (memoryRules.length > 0) {
+    config = {
+      ...config,
+      rules: mergeRulesWithRepoMemory(config.rules, memoryRules)
+    };
   }
   return config;
 }

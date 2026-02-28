@@ -2,7 +2,7 @@ import "dotenv/config";
 import { Worker } from "bullmq";
 import { redisConnection, reviewQueue } from "../queue/index.js";
 import { processReviewJob } from "../review/pipeline.js";
-import { processCommentReplyJob } from "../review/mentions.js";
+import { enqueueCommentReplyJob } from "../queue/enqueue.js";
 import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
@@ -15,14 +15,15 @@ const worker = new Worker(
   reviewQueue.name,
   async (job) => {
     if (job.name === "comment-reply") {
-      await processCommentReplyJob(job.data);
+      console.warn(`Review queue received legacy comment-reply job ${job.id}; forwarding to mention queue`);
+      await enqueueCommentReplyJob(job.data);
       return;
     }
     await processReviewJob(job.data);
   },
   {
     connection: redisConnection,
-    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 1)
+    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 3)
   }
 );
 

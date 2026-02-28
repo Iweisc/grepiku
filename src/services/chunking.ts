@@ -37,8 +37,15 @@ export function chunkTextForEmbedding(params: {
       const line = lines[lineIndex];
       const lineLen = line.length + 1;
       if (buffer.length === 0 && lineLen > maxChars) {
-        buffer.push(line.slice(0, maxChars));
-        lineIndex += 1;
+        const segment = line.slice(0, maxChars);
+        buffer.push(segment);
+        const remainderStart = Math.max(1, maxChars - overlapChars);
+        const remainder = line.slice(remainderStart);
+        if (remainder.length > 0) {
+          lines[lineIndex] = remainder;
+        } else {
+          lineIndex += 1;
+        }
         break;
       }
       if (buffer.length > 0 && length + lineLen > maxChars) break;
@@ -49,8 +56,15 @@ export function chunkTextForEmbedding(params: {
 
     if (buffer.length === 0) {
       const line = lines[lineIndex] || "";
-      buffer.push(line.slice(0, maxChars));
-      lineIndex += 1;
+      const segment = line.slice(0, maxChars);
+      buffer.push(segment);
+      const remainderStart = Math.max(1, maxChars - overlapChars);
+      const remainder = line.slice(remainderStart);
+      if (remainder.length > 0) {
+        lines[lineIndex] = remainder;
+      } else {
+        lineIndex += 1;
+      }
     }
 
     const endLine = startLine + buffer.length - 1;
