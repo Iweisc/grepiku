@@ -6,6 +6,20 @@ type PullRequestBranchCleanupCandidate = Pick<
   "state" | "headRef" | "headRepoFullName" | "author"
 >;
 
+type PullRequestReviewSkipCandidate = Pick<
+  ProviderPullRequest,
+  "headRef" | "author"
+>;
+
+const FOLLOW_UP_BRANCH_PREFIX = "grepiku/mention-";
+
+const REVIEWABLE_PULL_REQUEST_ACTIONS = new Set([
+  "opened",
+  "reopened",
+  "ready_for_review",
+  "synchronize"
+]);
+
 export function shouldDeleteClosedBotPrBranch(params: {
   action: string;
   repoFullName: string;
@@ -16,7 +30,7 @@ export function shouldDeleteClosedBotPrBranch(params: {
   if (params.pullRequest.state !== "closed") return false;
   const headRef = params.pullRequest.headRef?.trim() || "";
   if (!headRef) return false;
-  if (!headRef.startsWith("grepiku/mention-")) return false;
+  if (!headRef.startsWith(FOLLOW_UP_BRANCH_PREFIX)) return false;
 
   const authorLogin = params.pullRequest.author?.login || "";
   if (!isSelfBotComment({ authorLogin, botLogin: params.botLogin })) {
@@ -30,4 +44,18 @@ export function shouldDeleteClosedBotPrBranch(params: {
   }
 
   return true;
+}
+
+export function shouldSkipSelfBotFollowUpPrReview(params: {
+  action: string;
+  pullRequest: PullRequestReviewSkipCandidate;
+  botLogin: string;
+}): boolean {
+  if (!REVIEWABLE_PULL_REQUEST_ACTIONS.has(params.action)) return false;
+
+  const headRef = params.pullRequest.headRef?.trim() || "";
+  if (!headRef.startsWith(FOLLOW_UP_BRANCH_PREFIX)) return false;
+
+  const authorLogin = params.pullRequest.author?.login || "";
+  return isSelfBotComment({ authorLogin, botLogin: params.botLogin });
 }
