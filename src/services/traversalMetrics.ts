@@ -254,12 +254,16 @@ export function summarizeTraversalMetrics(
   } else {
     const avgRecall = mean(recalls);
     const avgPrecision = mean(precisions);
-    if (recalls.length >= thresholds.minRecallSamples && avgRecall < thresholds.minCrossFileRecall) {
+    if (recalls.length < thresholds.minRecallSamples) {
+      failures.push(`recallSampleCount=${recalls.length} below ${thresholds.minRecallSamples}`);
+    } else if (avgRecall < thresholds.minCrossFileRecall) {
       failures.push(
         `avgCrossFileRecall=${avgRecall.toFixed(3)} below ${thresholds.minCrossFileRecall.toFixed(3)}`
       );
     }
-    if (precisions.length >= thresholds.minPrecisionSamples && avgPrecision < thresholds.minSupportedPrecision) {
+    if (precisions.length < thresholds.minPrecisionSamples) {
+      failures.push(`precisionSampleCount=${precisions.length} below ${thresholds.minPrecisionSamples}`);
+    } else if (avgPrecision < thresholds.minSupportedPrecision) {
       failures.push(
         `avgSupportedPrecision=${avgPrecision.toFixed(3)} below ${thresholds.minSupportedPrecision.toFixed(3)}`
       );

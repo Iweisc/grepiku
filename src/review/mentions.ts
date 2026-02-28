@@ -168,7 +168,7 @@ async function postMentionReply(params: {
   replyInThread?: boolean;
 }) {
   const normalizedBody = normalizeReplyBody(params.body);
-  if (params.client.replyToComment) {
+  if (params.replyInThread && params.client.replyToComment) {
     try {
       await params.client.replyToComment({
         commentId: params.commentId,
@@ -176,13 +176,11 @@ async function postMentionReply(params: {
       });
       return;
     } catch (err) {
-      if (params.replyInThread) {
-        console.warn(`[mention ${params.commentId}] failed to post thread reply; falling back to summary comment`, {
-          error: err instanceof Error ? err.message : String(err)
-        });
-      }
+      console.warn(`[mention ${params.commentId}] failed to post thread reply; falling back to summary comment`, {
+        error: err instanceof Error ? err.message : String(err)
+      });
     }
-  } else if (params.replyInThread) {
+  } else if (params.replyInThread && !params.client.replyToComment) {
     console.warn(
       `[mention ${params.commentId}] thread reply requested but provider does not support replyToComment; falling back to summary comment`
     );

@@ -84,3 +84,26 @@ test("postMentionReply falls back to summary comment when replyToComment is unav
   assert.equal(summaries.length, 1);
   assert.match(String(warnings[0]?.[0] || ""), /provider does not support replyToComment; falling back/);
 });
+
+test("postMentionReply skips thread endpoint when replyInThread is false", async () => {
+  const { postMentionReply } = await loadMentionInternals();
+  let replyAttempts = 0;
+  const summaries: string[] = [];
+
+  await postMentionReply({
+    client: {
+      createSummaryComment: async (body: string) => {
+        summaries.push(body);
+      },
+      replyToComment: async () => {
+        replyAttempts += 1;
+      }
+    },
+    commentId: "103",
+    body: "hello",
+    replyInThread: false
+  });
+
+  assert.equal(replyAttempts, 0);
+  assert.equal(summaries.length, 1);
+});

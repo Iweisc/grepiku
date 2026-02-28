@@ -12,6 +12,12 @@ const env = loadEnv();
 const DASHBOARD_AUTH_REALM = "Grepiku Dashboard";
 const MAX_GRAPH_EDGES = 20_000;
 
+function parseBoundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
 function parseBasicAuthToken(value: string): string | null {
   const encoded = value.slice("Basic ".length).trim();
   if (!encoded) return null;
@@ -1061,7 +1067,7 @@ export function registerDashboard(app: FastifyInstance) {
 
     /* --- Recent reviews --- */
     dashboardApp.get("/api/reviews/recent", async (request, reply) => {
-    const limit = Math.max(1, Math.min(100, Number((request.query as any)?.limit || 20)));
+    const limit = parseBoundedInt((request.query as any)?.limit, 20, 1, 100);
     const runs = await prisma.reviewRun.findMany({
       orderBy: { createdAt: "desc" },
       take: limit,
@@ -1132,7 +1138,7 @@ export function registerDashboard(app: FastifyInstance) {
 
     /* --- Traversal analytics (null when no data) --- */
     dashboardApp.get("/api/analytics/traversal", async (request, reply) => {
-    const limit = Math.max(20, Math.min(5000, Number((request.query as any)?.limit || 500)));
+    const limit = parseBoundedInt((request.query as any)?.limit, 500, 20, 5000);
     const repoIdFilter = Number((request.query as any)?.repoId || 0) || undefined;
     const events = await prisma.analyticsEvent.findMany({
       where: {

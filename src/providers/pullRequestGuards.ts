@@ -14,7 +14,9 @@ export function shouldDeleteClosedBotPrBranch(params: {
 }): boolean {
   if (params.action !== "closed") return false;
   if (params.pullRequest.state !== "closed") return false;
-  if (!params.pullRequest.headRef?.trim()) return false;
+  const headRef = params.pullRequest.headRef?.trim() || "";
+  if (!headRef) return false;
+  if (!headRef.startsWith("grepiku/mention-")) return false;
 
   const authorLogin = params.pullRequest.author?.login || "";
   if (!isSelfBotComment({ authorLogin, botLogin: params.botLogin })) {
@@ -23,7 +25,7 @@ export function shouldDeleteClosedBotPrBranch(params: {
 
   const headRepoFullName = params.pullRequest.headRepoFullName?.trim().toLowerCase();
   const repoFullName = params.repoFullName.trim().toLowerCase();
-  if (headRepoFullName && repoFullName && headRepoFullName !== repoFullName) {
+  if (!headRepoFullName || !repoFullName || headRepoFullName !== repoFullName) {
     return false;
   }
 

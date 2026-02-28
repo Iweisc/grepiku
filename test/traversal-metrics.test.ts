@@ -128,3 +128,42 @@ test("summarizeTraversalMetrics fails threshold status when run count is below m
   assert.equal(summary.thresholdStatus.pass, false);
   assert.match(summary.thresholdStatus.failures[0] || "", /runCount=1 below/);
 });
+
+test("summarizeTraversalMetrics fails when recall/precision samples are below required minimums", () => {
+  const runs = [
+    {
+      runId: 3,
+      repoId: 1,
+      relatedCount: 8,
+      changedCount: 3,
+      findingCount: 3,
+      crossFileFindingCount: 1,
+      crossFileRecall: null,
+      supportedPrecision: null,
+      supportedCount: 6,
+      supportedByRetrievalCount: 2,
+      supportedByGraphCount: 2,
+      traversalMs: 600,
+      visitedNodes: 500,
+      traversedEdges: 900,
+      prunedByBudget: 20,
+      maxNodesVisited: 2400,
+      repoFileCount: 200,
+      repoSizeBucket: "small" as const
+    }
+  ];
+
+  const summary = summarizeTraversalMetrics(runs, {
+    ...DEFAULT_TRAVERSAL_THRESHOLDS,
+    minRuns: 1,
+    minRecallSamples: 2,
+    minPrecisionSamples: 2
+  });
+  assert.equal(summary.thresholdStatus.pass, false);
+  assert.ok(
+    summary.thresholdStatus.failures.some((failure) => failure.includes("recallSampleCount=0 below 2"))
+  );
+  assert.ok(
+    summary.thresholdStatus.failures.some((failure) => failure.includes("precisionSampleCount=0 below 2"))
+  );
+});

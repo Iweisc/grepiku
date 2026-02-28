@@ -191,6 +191,86 @@ test("repo graph endpoint caps edge query size", async (t) => {
   }
 });
 
+test("recent reviews route falls back to safe limit when query limit is invalid", async (t) => {
+  const { registerDashboard } = await loadDashboardModule();
+  const app = Fastify({ logger: false });
+  t.after(async () => {
+    await app.close();
+  });
+  registerDashboard(app);
+
+  const originalReviewRunFindMany = prisma.reviewRun.findMany;
+  let reviewRunQueryArgs: any = null;
+  prisma.reviewRun.findMany = (async (args: any) => {
+    reviewRunQueryArgs = args;
+    return [];
+  }) as typeof prisma.reviewRun.findMany;
+
+  try {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/reviews/recent?limit=abc",
+      headers: { "x-internal-key": dashboardAuthKey() }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(reviewRunQueryArgs?.take, 20);
+    assert.deepEqual(response.json(), { items: [] });
+  } finally {
+    prisma.reviewRun.findMany = originalReviewRunFindMany;
+  }
+});
+
+test("traversal analytics route falls back to safe limit when query limit is invalid", async (t) => {
+  const { registerDashboard } = await loadDashboardModule();
+  const app = Fastify({ logger: false });
+  t.after(async () => {
+    await app.close();
+  });
+  registerDashboard(app);
+
+  const originalAnalyticsFindMany = prisma.analyticsEvent.findMany;
+  let analyticsQueryArgs: any = null;
+  prisma.analyticsEvent.findMany = (async (args: any) => {
+    analyticsQueryArgs = args;
+    return [
+      {
+        payload: {
+          runId: 1,
+          repoId: 1,
+          relatedCount: 2,
+          changedCount: 1,
+          findingCount: 1,
+          crossFileFindingCount: 1,
+          crossFileRecall: 1,
+          supportedPrecision: 1,
+          supportedCount: 2,
+          supportedByRetrievalCount: 1,
+          supportedByGraphCount: 1,
+          traversalMs: 100,
+          visitedNodes: 80,
+          traversedEdges: 120,
+          prunedByBudget: 0,
+          maxNodesVisited: 2400,
+          repoFileCount: 80,
+          repoSizeBucket: "small"
+        }
+      }
+    ];
+  }) as typeof prisma.analyticsEvent.findMany;
+
+  try {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/analytics/traversal?limit=abc",
+      headers: { "x-internal-key": dashboardAuthKey() }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(analyticsQueryArgs?.take, 500);
+  } finally {
+    prisma.analyticsEvent.findMany = originalAnalyticsFindMany;
+  }
+});
+
 test("isSameOriginRequest allows same-origin requests via Origin header", async () => {
   const { isSameOriginRequest } = await loadDashboardInternals();
   assert.equal(

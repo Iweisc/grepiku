@@ -114,4 +114,32 @@ test("shouldDeleteClosedBotPrBranch rejects non-bot, open, and fork branches", (
     }),
     false
   );
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "closed",
+      repoFullName: "acme/grepiku",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        state: "closed",
+        headRef: "grepiku/manual-fix",
+        headRepoFullName: "acme/grepiku",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "closed",
+      repoFullName: "acme/grepiku",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        state: "closed",
+        headRef: "grepiku/mention-123",
+        headRepoFullName: null,
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
 });
