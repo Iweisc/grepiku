@@ -1,16 +1,82 @@
 {
+  "ignore": ["node_modules/**", "dist/**"],
+  "graph": {
+    "exclude_dirs": ["internal_harness"],
+    "traversal": {
+      "max_depth": 8,
+      "min_score": 0.04,
+      "max_related_files": 80,
+      "max_graph_links": 240,
+      "hard_include_files": 24,
+      "max_nodes_visited": 12000
+    }
+  },
   "tools": {
     "lint": {
       "cmd": "npm run lint",
-      "timeout_sec": 900
+      "timeout_sec": 3600
     },
     "build": {
       "cmd": "npm run build",
-      "timeout_sec": 1200
+      "timeout_sec": 5400
     },
     "test": {
       "cmd": "npm test",
-      "timeout_sec": 1800
+      "timeout_sec": 10800
     }
+  },
+  "limits": {
+    "max_inline_comments": 120,
+    "max_key_concerns": 20
+  },
+  "rules": [],
+  "scopes": [],
+  "patternRepositories": [],
+  "strictness": "high",
+  "commentTypes": {
+    "allow": ["inline", "summary"]
+  },
+  "output": {
+    "summaryOnly": false,
+    "destination": "both",
+    "syncSummaryWithStatus": true,
+    "allowIncrementalPrBodyUpdates": true
+  },
+  "retrieval": {
+    "topK": 60,
+    "maxPerPath": 12,
+    "semanticWeight": 0.72,
+    "lexicalWeight": 0.34,
+    "rrfWeight": 0.14,
+    "changedPathBoost": 0.22,
+    "sameDirectoryBoost": 0.12,
+    "patternBoost": 0.06,
+    "symbolBoost": 0.1,
+    "chunkBoost": 0.12
+  },
+  "statusChecks": {
+    "name": "Grepiku Review",
+    "required": false
+  },
+  "triggers": {
+    "manualOnly": false,
+    "allowAutoOnPush": true,
+    "labels": {
+      "include": [],
+      "exclude": []
+    },
+    "branches": {
+      "include": [],
+      "exclude": []
+    },
+    "authors": {
+      "include": [],
+      "exclude": []
+    },
+    "keywords": {
+      "include": [],
+      "exclude": []
+    },
+    "commentTriggers": ["/review", "@grepiku"]
   }
 }
