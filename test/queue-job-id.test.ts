@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildIndexJobId } from "../src/queue/jobId.js";
+import { buildIndexJobId, buildReviewJobId } from "../src/queue/jobId.js";
 
 test("buildIndexJobId produces BullMQ-safe id characters", () => {
   const jobId = buildIndexJobId({
@@ -31,4 +31,45 @@ test("buildIndexJobId is deterministic and scope-sensitive", () => {
   assert.equal(a, b);
   assert.notEqual(repoScoped, patternScoped);
   assert.ok(repoScoped.endsWith("_normal"));
+});
+
+test("buildReviewJobId is deterministic across non-force triggers", () => {
+  const first = buildReviewJobId({
+    repoId: "acme/repo",
+    pullRequestId: 77,
+    headSha: "deadbeef1234",
+    trigger: "opened"
+  });
+  const second = buildReviewJobId({
+    repoId: "acme/repo",
+    pullRequestId: 77,
+    headSha: "deadbeef1234",
+    trigger: "synchronize"
+  });
+
+  assert.equal(first, second);
+  assert.match(first, /^[A-Za-z0-9_-]+$/);
+  assert.ok(first.endsWith("_auto"));
+});
+
+test("buildReviewJobId changes by SHA and mode", () => {
+  const autoJob = buildReviewJobId({
+    repoId: 1,
+    pullRequestId: 2,
+    headSha: "aaa111"
+  });
+  const differentSha = buildReviewJobId({
+    repoId: 1,
+    pullRequestId: 2,
+    headSha: "bbb222"
+  });
+  const forceJob = buildReviewJobId({
+    repoId: 1,
+    pullRequestId: 2,
+    headSha: "aaa111",
+    force: true
+  });
+
+  assert.notEqual(autoJob, differentSha);
+  assert.ok(forceJob.endsWith("_force"));
 });

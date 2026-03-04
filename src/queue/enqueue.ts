@@ -1,10 +1,13 @@
 import { reviewQueue, mentionQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
-import { buildIndexJobId } from "./jobId.js";
+import { buildIndexJobId, buildReviewJobId } from "./jobId.js";
 
 export async function enqueueReviewJob(data: any) {
+  const forceRun = Boolean(data?.force);
+  const jobId = forceRun ? undefined : buildReviewJobId(data);
   await reviewQueue.add("review", data, {
+    jobId,
     removeOnComplete: true,
-    removeOnFail: false,
+    removeOnFail: forceRun ? false : true,
     attempts: 3,
     backoff: { type: "exponential", delay: 5000 }
   });

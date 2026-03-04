@@ -31,6 +31,7 @@ import {
 } from "./diff.js";
 import { fingerprintForComment, matchKeyForComment } from "./findings.js";
 import { selectSemanticFindingCandidate } from "./findingMatch.js";
+import { semanticFindingKey, selectFixedFindingCandidates } from "./findingLifecycle.js";
 import { ReviewOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
@@ -115,17 +116,6 @@ function filterAndNormalizeComments(
     }
   }
   return { inline, summary };
-}
-
-function normalizeFindingTitle(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function semanticFindingKey(pathValue: string, category: string, title: string): string {
-  return `${normalizePath(pathValue)}|${category}|${normalizeFindingTitle(title)}`;
 }
 
 function buildFeedbackHint(policy: FeedbackPolicy): string {
@@ -822,6 +812,23 @@ export async function processReviewJob(data: ReviewJobData) {
     }
   });
 
+  if (!data.force) {
+    const duplicateRun = await prisma.reviewRun.findFirst({
+      where: {
+        pullRequestId: pullRequest.id,
+        headSha: refreshed.headSha,
+        status: { in: ["running", "completed"] }
+      },
+      orderBy: { createdAt: "desc" }
+    });
+    if (duplicateRun) {
+      console.log(
+        `[pr#${prNumber}] duplicate review request skipped: existing run #${duplicateRun.id} (${duplicateRun.status}) for ${refreshed.headSha.slice(0, 12)}`
+      );
+      return;
+    }
+  }
+
   const run = await prisma.reviewRun.create({
     data: {
       pullRequestId: pullRequest.id,
@@ -1262,15 +1269,37 @@ export async function processReviewJob(data: ReviewJobData) {
     const checksPath = path.join(outDir, "checks.json");
     const checks: ChecksOutput = await readAndValidateJson(checksPath, ChecksSchema);
 
-    const existingOpen = await prisma.finding.findMany({
-      where: { pullRequestId: pullRequest.id, status: "open" }
+    const existingOpenOrFixed = await prisma.finding.findMany({
+      where: { pullRequestId: pullRequest.id, status: { in: ["open", "fixed"] } }
     });
+    const seenRunIds = Array.from(
+      new Set(
+        existingOpenOrFixed
+          .map((finding) => finding.lastSeenRunId || finding.reviewRunId)
+          .filter((id): id is number => typeof id === "number")
+      )
+    );
+    const seenRuns = seenRunIds.length
+      ? await prisma.reviewRun.findMany({
+          where: { id: { in: seenRunIds } },
+          select: { id: true, headSha: true }
+        })
+      : [];
+    const headShaByRunId = new Map<number, string>(seenRuns.map((seenRun) => [seenRun.id, seenRun.headSha]));
+    const existingOpen = existingOpenOrFixed.filter((finding) => finding.status === "open");
+    const sameHeadFixed = existingOpenOrFixed.filter((finding) => {
+      if (finding.status !== "fixed") return false;
+      const seenRunId = finding.lastSeenRunId || finding.reviewRunId;
+      const seenHeadSha = headShaByRunId.get(seenRunId);
+      return Boolean(seenHeadSha) && seenHeadSha === refreshed.headSha;
+    });
+    const existingCandidates = [...existingOpen, ...sameHeadFixed];
 
-    const existingByKey = new Map<string, typeof existingOpen[number]>();
-    const existingByHunkCategory = new Map<string, Array<typeof existingOpen[number]>>();
-    const existingByPathCategory = new Map<string, Array<typeof existingOpen[number]>>();
-    const existingBySemanticTitle = new Map<string, Array<typeof existingOpen[number]>>();
-    for (const finding of existingOpen) {
+    const existingByKey = new Map<string, typeof existingCandidates[number]>();
+    const existingByHunkCategory = new Map<string, Array<typeof existingCandidates[number]>>();
+    const existingByPathCategory = new Map<string, Array<typeof existingCandidates[number]>>();
+    const existingBySemanticTitle = new Map<string, Array<typeof existingCandidates[number]>>();
+    for (const finding of existingCandidates) {
       const key = `${finding.fingerprint}|${finding.path}|${finding.hunkHash}|${finding.title}`;
       existingByKey.set(key, finding);
       const fallbackKey = `${normalizePath(finding.path)}|${finding.hunkHash}|${finding.category}`;
@@ -1292,7 +1321,7 @@ export async function processReviewJob(data: ReviewJobData) {
     const stillOpen: Array<{ title: string; url?: string; commentId: string; path: string; category: string }> = [];
     const matchedOldIds = new Set<number>();
 
-    const selectSemanticMatch = (comment: ReviewComment): (typeof existingOpen)[number] | undefined => {
+    const selectSemanticMatch = (comment: ReviewComment): (typeof existingCandidates)[number] | undefined => {
       const semanticKey = `${normalizePath(comment.path)}|${comment.category}`;
       const candidates = existingByPathCategory.get(semanticKey) || [];
       return selectSemanticFindingCandidate({
@@ -1408,11 +1437,14 @@ export async function processReviewJob(data: ReviewJobData) {
     const incomingSemanticKeys = new Set(
       reviewComments.map((comment) => semanticFindingKey(comment.path, comment.category, comment.title))
     );
-    const fixed = existingOpen.filter((f) => {
-      if (matchedOldIds.has(f.id)) return false;
-      if (incomingSemanticKeys.has(semanticFindingKey(f.path, f.category, f.title))) return false;
-      if (!incrementalReview) return true;
-      return changedPathSet.has(normalizePath(f.path));
+    const fixed = selectFixedFindingCandidates({
+      existingOpen,
+      matchedOldIds,
+      incomingSemanticKeys,
+      incrementalReview,
+      changedPathSet,
+      currentHeadSha: refreshed.headSha,
+      headShaByRunId
     });
     const fixedIds = new Set(fixed.map((f) => f.id));
     for (const finding of fixed) {
