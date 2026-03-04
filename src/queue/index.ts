@@ -1,12 +1,14 @@
-import { Queue } from "bullmq";
+import { Queue, type ConnectionOptions } from "bullmq";
 import { Redis } from "ioredis";
 import { loadEnv } from "../config/env.js";
 
 const env = loadEnv();
 
+// BullMQ and ioredis can resolve different type instances in some installs.
+// Cast to BullMQ's connection shape while keeping the runtime Redis client.
 export const redisConnection = new Redis(env.redisUrl, {
   maxRetriesPerRequest: null
-});
+}) as unknown as ConnectionOptions;
 
 export const reviewQueue = new Queue("review-orchestrator", {
   connection: redisConnection

@@ -11,7 +11,6 @@ import Rust from "tree-sitter-rust";
 import { prisma } from "../db/client.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
-import { embedText, embedTexts } from "./embeddings.js";
 import { loadEnv } from "../config/env.js";
 import { chunkTextForEmbedding } from "./chunking.js";
 import { enqueueGraphJob } from "../queue/enqueue.js";
@@ -357,8 +356,6 @@ async function indexFile(params: {
     ...symbol,
     hash: hashContent(`${symbol.name}:${symbol.kind}:${symbol.startLine}:${symbol.endLine}`)
   }));
-  const symbolTexts = symbols.map((symbol) => `${symbol.name} ${symbol.signature || ""}`);
-  const symbolVectors = symbolTexts.length > 0 ? await embedTexts(symbolTexts) : [];
   const chunks = chunkTextForEmbedding({
     content: params.content,
     maxChars: CHUNK_MAX_CHARS,
@@ -369,9 +366,6 @@ async function indexFile(params: {
     chunks.length > 0
       ? chunks.map((chunk) => `${params.relativePath}\nL${chunk.startLine}-${chunk.endLine}\n${chunk.text}`)
       : [];
-  const chunkVectors = chunkTexts.length > 0 ? await embedTexts(chunkTexts) : [];
-  const fileEmbeddingText = `${params.relativePath}\n${params.content}`;
-  const fileVector = await embedText(fileEmbeddingText);
 
   return prisma.$transaction(async (tx) => {
     const current = await tx.fileIndex.findUnique({ where: fileKey });
@@ -405,7 +399,7 @@ async function indexFile(params: {
     await tx.embedding.deleteMany({ where: { fileId: fileRecord.id } });
     await tx.symbol.deleteMany({ where: { fileId: fileRecord.id } });
 
-    for (const [idx, symbol] of symbolPayloads.entries()) {
+    for (const symbol of symbolPayloads) {
       const symbolRecord = await tx.symbol.create({
         data: {
           repoId: params.repoId,
@@ -419,14 +413,13 @@ async function indexFile(params: {
           hash: symbol.hash
         }
       });
-      const embeddingVector = symbolVectors[idx] || (await embedText(`${symbol.name} ${symbol.signature || ""}`));
       await tx.embedding.create({
         data: {
           repoId: params.repoId,
           fileId: fileRecord.id,
           symbolId: symbolRecord.id,
           kind: "symbol",
-          vector: embeddingVector,
+          vector: [],
           text: `${symbol.name} ${symbol.signature || ""}`
         }
       });
@@ -446,14 +439,13 @@ async function indexFile(params: {
 
     for (const [idx] of chunks.entries()) {
       const text = chunkTexts[idx];
-      const vector = chunkVectors[idx];
-      if (!text || !vector) continue;
+      if (!text) continue;
       await tx.embedding.create({
         data: {
           repoId: params.repoId,
           fileId: fileRecord.id,
           kind: "chunk",
-          vector,
+          vector: [],
           text: text.slice(0, 6000)
         }
       });
@@ -464,7 +456,7 @@ async function indexFile(params: {
         repoId: params.repoId,
         fileId: fileRecord.id,
         kind: "file",
-        vector: fileVector,
+        vector: [],
         text: `${params.relativePath}\n${params.content.slice(0, 5000)}`
       }
     });

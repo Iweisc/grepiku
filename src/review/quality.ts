@@ -106,6 +106,7 @@ function priorityScore(
     diffIndex: DiffIndex;
     changedPathSet: Set<string>;
     feedbackPolicy?: FeedbackPolicy;
+    repoWeights?: Map<string, number>;
   }
 ): number {
   const confidence = comment.confidence ? confidenceWeight[comment.confidence] : 0.7;
@@ -123,6 +124,16 @@ function priorityScore(
   const evidenceBoost = Math.min(6, Math.floor(comment.evidence.length / 80));
   const placementBoost = inDiff ? 6 : 0;
   const changedPathBoost = inChangedPath ? 4 : 0;
+
+  let weightAdjustment = 0;
+  if (params.repoWeights) {
+    const ruleKey = comment.rule_id
+      ? `${comment.category}:${comment.rule_id}`
+      : null;
+    const w = (ruleKey ? params.repoWeights.get(ruleKey) : undefined) ?? params.repoWeights.get(comment.category) ?? 0;
+    weightAdjustment = w * 20; // scale [-1,1] to [-20,+20]
+  }
+
   return (
     severityWeight[comment.severity] * confidence +
     categoryWeight[comment.category] +
@@ -131,7 +142,8 @@ function priorityScore(
     placementBoost +
     changedPathBoost +
     feedbackBoost -
-    feedbackPenalty
+    feedbackPenalty +
+    weightAdjustment
   );
 }
 
@@ -184,6 +196,7 @@ export function refineReviewComments(params: {
   summaryOnly?: boolean;
   allowedTypes?: Array<"inline" | "summary">;
   feedbackPolicy?: FeedbackPolicy;
+  repoWeights?: Map<string, number>;
 }): {
   comments: ReviewComment[];
   diagnostics: QualityDiagnostics;
@@ -234,7 +247,8 @@ export function refineReviewComments(params: {
       score: priorityScore(comment, {
         diffIndex: params.diffIndex,
         changedPathSet,
-        feedbackPolicy: params.feedbackPolicy
+        feedbackPolicy: params.feedbackPolicy,
+        repoWeights: params.repoWeights
       })
     });
   }

@@ -249,6 +249,124 @@ const GrepikuSchema = z.object({
     })
 });
 
+const ScopedGrepikuSchema = z.object({
+  strictness: z.enum(["low", "medium", "high"]).optional(),
+  commentTypes: z
+    .object({
+      allow: z.array(z.enum(["inline", "summary"]))
+    })
+    .optional(),
+  ignore: z.array(z.string()).optional(),
+  limits: z
+    .object({
+      max_inline_comments: z.number().int().positive().optional(),
+      max_key_concerns: z.number().int().positive().optional()
+    })
+    .optional(),
+  rules: z
+    .array(
+      z.object({
+        id: z.string(),
+        title: z.string(),
+        description: z.string().optional(),
+        severity: z.string().optional(),
+        category: z.string().optional(),
+        pattern: z.string().optional(),
+        scope: z.string().optional(),
+        commentType: z.enum(["inline", "summary"]).optional(),
+        strictness: z.enum(["low", "medium", "high"]).optional(),
+        docs: z.array(z.string()).optional()
+      })
+    )
+    .optional()
+});
+
+type ScopedOverride = z.infer<typeof ScopedGrepikuSchema>;
+
+const SCOPED_KEYS: ReadonlyArray<keyof ScopedOverride> = [
+  "strictness",
+  "commentTypes",
+  "ignore",
+  "limits",
+  "rules"
+];
+
+/** Walk from filePath's directory up to repoPath, collecting .grepiku/config.json paths (deepest first). */
+export function collectScopedConfigPaths(repoPath: string, filePath: string): string[] {
+  const resolved = path.resolve(repoPath);
+  let dir = path.dirname(path.resolve(filePath));
+  const paths: string[] = [];
+
+  while (dir.startsWith(resolved) && dir !== resolved) {
+    paths.push(path.join(dir, ".grepiku", "config.json"));
+    dir = path.dirname(dir);
+  }
+
+  return paths;
+}
+
+/** Merge a scoped override into a base config, only touching allowed fields. */
+export function mergeScopedOverride(base: RepoConfig, override: ScopedOverride): RepoConfig {
+  const merged = { ...base };
+
+  if (override.strictness !== undefined) {
+    merged.strictness = override.strictness;
+  }
+  if (override.commentTypes !== undefined) {
+    merged.commentTypes = override.commentTypes;
+  }
+  if (override.ignore !== undefined) {
+    merged.ignore = override.ignore;
+  }
+  if (override.limits !== undefined) {
+    merged.limits = {
+      max_inline_comments: override.limits.max_inline_comments ?? base.limits.max_inline_comments,
+      max_key_concerns: override.limits.max_key_concerns ?? base.limits.max_key_concerns
+    };
+  }
+  if (override.rules !== undefined) {
+    merged.rules = override.rules;
+  }
+
+  return merged;
+}
+
+export async function loadScopedConfig(params: {
+  repoPath: string;
+  filePath: string;
+  rootConfig: RepoConfig;
+}): Promise<RepoConfig> {
+  const { repoPath, filePath, rootConfig } = params;
+  const configPaths = collectScopedConfigPaths(repoPath, filePath);
+
+  // Read configs deepest-first, collecting valid overrides (deepest = index 0)
+  const overrides: ScopedOverride[] = [];
+  for (const configPath of configPaths) {
+    try {
+      const raw = await fs.readFile(configPath, "utf8");
+      const parsed = JSON.parse(raw);
+      // Strip non-overridable keys before validation
+      const scoped: Record<string, unknown> = {};
+      for (const key of SCOPED_KEYS) {
+        if (key in parsed) scoped[key] = parsed[key];
+      }
+      const result = ScopedGrepikuSchema.safeParse(scoped);
+      if (result.success) overrides.push(result.data);
+    } catch {
+      // missing or unreadable config at this level; skip
+    }
+  }
+
+  if (overrides.length === 0) return rootConfig;
+
+  // Apply shallowest first so deepest (closest to file) wins last
+  let config = rootConfig;
+  for (let i = overrides.length - 1; i >= 0; i--) {
+    config = mergeScopedOverride(config, overrides[i]);
+  }
+  return config;
+}
+
 const defaultConfig: RepoConfig = GrepikuSchema.parse({});
 
 export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoConfig; warnings: string[] }> {

@@ -35,3 +35,19 @@ export async function enqueueGraphJob(data: any) {
 export async function enqueueAnalyticsJob(data: any) {
   await analyticsQueue.add("analytics", data, { removeOnComplete: true, removeOnFail: false });
 }
+
+export async function cancelReviewJobsForPr(pullRequestId: number): Promise<number> {
+  const waiting = await reviewQueue.getJobs(["waiting", "delayed", "prioritized"]);
+  let cancelled = 0;
+  for (const job of waiting) {
+    if (job.data?.pullRequestId === pullRequestId && job.name === "review") {
+      try {
+        await job.remove();
+        cancelled++;
+      } catch {
+        // Job may have started processing between getJobs and remove; ignore.
+      }
+    }
+  }
+  return cancelled;
+}

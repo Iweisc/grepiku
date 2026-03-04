@@ -125,6 +125,7 @@ model Repo {
   analytics     AnalyticsEvent[]
   patternLinks  PatternRepositoryLink[]
   ruleSuggestions RuleSuggestion[]
+  findingWeights  FindingWeight[]
 
   @@unique([providerId, externalId])
 }
@@ -489,6 +490,23 @@ model RuleSuggestion {
   updatedAt DateTime @updatedAt
 
   repo Repo @relation(fields: [repoId], references: [id])
+}
+
+model FindingWeight {
+  id        Int      @id @default(autoincrement())
+  repoId    Int
+  key       String   // "category" or "category:ruleId"
+  weight    Float    @default(0)
+  positive  Int      @default(0)
+  negative  Int      @default(0)
+  addressed Int      @default(0)
+  ignored   Int      @default(0)
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+  repo      Repo     @relation(fields: [repoId], references: [id])
+
+  @@unique([repoId, key])
+  @@index([repoId])
 }
 
 model ToolRun {

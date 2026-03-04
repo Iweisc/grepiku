@@ -3,7 +3,7 @@ import { createInterface } from "readline";
 const tools = [
   {
     name: "retrieve_context",
-    description: "Retrieve relevant files/symbols for this repo using embeddings + graph.",
+    description: "Retrieve relevant files/symbols for this repo using PageIndex + graph.",
     inputSchema: {
       type: "object",
       properties: {

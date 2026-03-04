@@ -1,5 +1,6 @@
 import { prisma } from "../db/client.js";
 import { computeTraversalRunMetrics } from "./traversalMetrics.js";
+import { recalculateWeightsFromReactions } from "./weights.js";
 
 type AnalyticsJob = {
   reviewRunId: number;
@@ -115,4 +116,8 @@ export async function processAnalyticsJob(job: AnalyticsJob) {
       }
     });
   }
+
+  await recalculateWeightsFromReactions(run.pullRequest.repoId).catch((err) =>
+    console.warn(`[run ${run.id}] weight recalculation failed`, err)
+  );
 }

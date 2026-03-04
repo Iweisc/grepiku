@@ -292,6 +292,10 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
       <svg viewBox="0 0 20 20" fill="none" stroke="currentColor"><path d="M3 4h14a1 1 0 011 1v8a1 1 0 01-1 1H7l-4 3V5a1 1 0 011-1z"/><path d="M7 8h6M7 11h3" stroke-linecap="round"/></svg>
       <span>Reviews</span>
     </button>
+    <button class="ni" data-v="findings" onclick="go('findings')">
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor"><circle cx="10" cy="10" r="7"/><path d="M10 7v3M10 13h.01" stroke-linecap="round"/></svg>
+      <span>Findings</span>
+    </button>
     <button class="ni" data-v="rules" onclick="go('rules')">
       <svg viewBox="0 0 20 20" fill="none" stroke="currentColor"><path d="M10 2l7 3v5c0 4-3 6.5-7 8-4-1.5-7-4-7-8V5l7-3z"/><path d="M7.5 10l2 2 3.5-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>Rules</span>
@@ -338,6 +342,15 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
     <div class="cd"><div id="rv-ls"><div class="ld">Loading&#8230;</div></div></div>
   </section>
 
+  <!-- FINDINGS -->
+  <section id="v-findings" class="vw">
+    <div class="vh"><h1 class="vt">Findings</h1><p class="vs">Findings by severity and status</p></div>
+    <div class="g2">
+      <div class="cd"><div class="ch">By Severity</div><div id="fd-sv"><div class="ld">Loading&#8230;</div></div></div>
+      <div class="cd"><div class="ch">By Status</div><div id="fd-st"><div class="ld">Loading&#8230;</div></div></div>
+    </div>
+  </section>
+
   <!-- RULES -->
   <section id="v-rules" class="vw">
     <div class="vh"><h1 class="vt">Rule Suggestions</h1><p class="vs">AI-generated rules from review patterns</p></div>
@@ -352,6 +365,7 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;o
       <div class="cd"><div class="ch">Hot Paths</div><div id="in-hp"><div class="ld">Loading&#8230;</div></div></div>
     </div>
     <div class="cd mt14"><div class="ch">Traversal Quality</div><div id="in-tv"><div class="ld">Loading&#8230;</div></div></div>
+    <div class="cd mt14"><div class="ch">Learning Weights</div><div id="in-wt"><div class="ld">Loading&#8230;</div></div></div>
   </section>
 
 </main>
@@ -383,6 +397,7 @@ function ld(v){
   if(v==='overview')ldOv();
   else if(v==='repos')ldRp();
   else if(v==='reviews')ldRv();
+  else if(v==='findings')ldFd();
   else if(v==='rules')ldRu();
   else if(v==='insights')ldIn();
 }
@@ -406,11 +421,22 @@ function ldOv(){
 function ldRp(){get('/api/repos').then(function(d){rpCards(d.items)}).catch(function(){$('rp-ls').innerHTML='<div class="em">Could not load repos</div>'})}
 function ldRv(){get('/api/reviews/recent?limit=30').then(function(d){rvList('rv-ls',d.items,30)}).catch(function(){$('rv-ls').innerHTML='<div class="em">Could not load reviews</div>'})}
 function ldRu(){get('/api/rules/suggestions').then(function(d){ruList(d.items)}).catch(function(){$('ru-ls').innerHTML='<div class="em">Could not load rules</div>'})}
+function ldFd(){
+  get('/api/analytics/findings-by-severity').then(function(d){
+    var bySev={},bySt={};
+    (d.items||[]).forEach(function(g){
+      bySev[g.severity]=(bySev[g.severity]||0)+g._count;
+      bySt[g.status]=(bySt[g.status]||0)+g._count;
+    });
+    bars('fd-sv',Object.entries(bySev).sort(function(a,b){return b[1]-a[1]}).map(function(e){return{l:e[0],v:e[1]}}));
+    bars('fd-st',Object.entries(bySt).sort(function(a,b){return b[1]-a[1]}).map(function(e){return{l:e[0],v:e[1]}}));
+  }).catch(function(){$('fd-sv').innerHTML='<div class="em">No data</div>';$('fd-st').innerHTML='<div class="em">No data</div>'});
+}
 function ldIn(){
-  Promise.all([get('/api/analytics/insights'),get('/api/analytics/traversal')])
+  Promise.all([get('/api/analytics/insights'),get('/api/analytics/traversal'),get('/api/analytics/weights')])
   .then(function(r){
     bars('in-ct',r[0].topIssues.map(function(x){return{l:x.category,v:x.count}}));
-    hpList(r[0].hotPaths);tvMetrics(r[1]);
+    hpList(r[0].hotPaths);tvMetrics(r[1]);wtChart(r[2].items||[]);
   }).catch(function(){});
 }
 
@@ -499,6 +525,20 @@ function tvMetrics(t){
    +'<div class="mw"><span class="ml">Supported Precision</span><div class="mtr"><div class="mfl '+(hasPrecision?fc(prw):'mfa')+'" style="width:'+prw+'%"></div></div><span class="mn2">'+(hasPrecision?pr+'%':'N/A')+'</span></div>'
    +'<div class="mw"><span class="ml">p95 Latency</span><div class="mtr"><div class="mfl mfa" style="width:'+Math.min(p95/500*100,100)+'%"></div></div><span class="mn2">'+fms(p95)+'</span></div>'
    +'<div class="mw"><span class="ml">p95 Visited Nodes</span><div class="mtr"><div class="mfl mfa" style="width:'+Math.min(nd/200*100,100)+'%"></div></div><span class="mn2">'+nd+'</span></div>';
+}
+function wtChart(items){
+  var el=$('in-wt');
+  if(!items||!items.length){el.innerHTML='<div class="em">No learning weights yet. Weights appear as the system learns from PR outcomes and reactions.</div>';return}
+  var sorted=items.sort(function(a,b){return Math.abs(b.weight)-Math.abs(a.weight)}).slice(0,15);
+  var o='';sorted.forEach(function(w){
+    var pct=Math.abs(w.weight)*50;
+    var isPos=w.weight>=0;
+    var color=isPos?'var(--green)':'var(--red)';
+    var label=w.weight>=0?'+'+w.weight.toFixed(2):w.weight.toFixed(2);
+    o+='<div class="mw"><span class="ml" title="'+h(w.key)+'">'+h(w.key)+'</span>'
+      +'<div class="mtr"><div style="height:100%;border-radius:3px;background:'+color+';width:'+pct+'%;transition:width 1s cubic-bezier(.4,0,.2,1)"></div></div>'
+      +'<span class="mn2" style="color:'+color+'">'+label+'</span></div>';
+  });el.innerHTML=o;
 }
 function ruList(items){
   var el=$('ru-ls');
@@ -1264,6 +1304,30 @@ export function registerDashboard(app: FastifyInstance) {
       return;
     }
     reply.send({ items: events });
+    });
+
+    /* --- Findings by severity --- */
+    dashboardApp.get("/api/analytics/findings-by-severity", async (request, reply) => {
+    const repoId = Number((request.query as any)?.repoId) || undefined;
+    const where = repoId ? { pullRequest: { repoId } } : {};
+    const groups = await prisma.finding.groupBy({
+      by: ["severity", "status"],
+      where,
+      _count: true
+    });
+    reply.send({ items: groups.map(g => ({ severity: g.severity, status: g.status, _count: g._count })) });
+    });
+
+    /* --- Learning weights --- */
+    dashboardApp.get("/api/analytics/weights", async (request, reply) => {
+    const repoId = Number((request.query as any)?.repoId) || undefined;
+    const where = repoId ? { repoId } : {};
+    const weights = await prisma.findingWeight.findMany({
+      where,
+      orderBy: { updatedAt: "desc" },
+      take: 100
+    });
+    reply.send({ items: weights.map(w => ({ key: w.key, weight: w.weight, positive: w.positive, negative: w.negative, addressed: w.addressed, ignored: w.ignored })) });
     });
 
     /* --- Insights --- */

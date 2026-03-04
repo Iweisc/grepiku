@@ -1,5 +1,8 @@
+import fs from "fs/promises";
+import os from "os";
+import path from "path";
+import { execa } from "execa";
 import { prisma } from "../db/client.js";
-import { cosineSimilarity, embedQueryWithCache } from "./embeddings.js";
 
 export type RetrievalResult = {
   kind: "file" | "symbol" | "chunk";
@@ -47,7 +50,7 @@ type EmbeddingRow = {
   fileId: number | null;
   symbolId: number | null;
   kind: string;
-  vector: number[];
+  vector?: number[];
   text: string;
 };
 
@@ -66,7 +69,10 @@ type ScoredRetrievalItem = {
   pathBoost: number;
   patternBoost: number;
   kindBoost: number;
+  directoryAffinity: number;
+  fileAnchor: number;
   rrf: number;
+  baseScore: number;
   score: number;
 };
 
@@ -74,6 +80,23 @@ type RankedRetrievalItem = {
   embedding: { id: number };
   path?: string;
   score: number;
+};
+
+type PageIndexScore = {
+  score: number;
+  semantic: number;
+  lexical: number;
+  pathBoost: number;
+  kindBoost: number;
+  patternBoost: number;
+};
+
+type PageIndexInputItem = {
+  id: number;
+  kind: RetrievalResult["kind"];
+  path?: string;
+  symbol?: string;
+  text: string;
 };
 
 export async function retrieveContext(params: {
@@ -87,18 +110,19 @@ export async function retrieveContext(params: {
   const topK = Math.max(4, Math.min(60, params.topK ?? 28));
   const maxPerPath = Math.max(1, Math.min(12, params.maxPerPath ?? 6));
   const weights = mergeWeights(params.weights);
-  const changedPaths = new Set(
-    (params.changedPaths || [])
-      .map((value) => normalizeRepoPath(value))
-      .filter(Boolean)
+  const changedPathList = Array.from(
+    new Set(
+      (params.changedPaths || [])
+        .map((value) => normalizeRepoPath(value))
+        .filter(Boolean)
+    )
   );
+  const changedPaths = new Set(changedPathList);
   const changedDirectories = new Set(
     Array.from(changedPaths)
       .map((value) => directoryPath(value))
       .filter(Boolean)
   );
-
-  const queryVec = await embedQueryWithCache({ repoId: params.repoId, query: params.query });
   const [files, symbols] = await Promise.all([
     prisma.fileIndex.findMany({ where: { repoId: params.repoId }, select: { id: true, path: true, isPattern: true } }),
     prisma.symbol.findMany({ where: { repoId: params.repoId }, select: { id: true, name: true } })
@@ -118,38 +142,17 @@ export async function retrieveContext(params: {
   const queryPathHints = extractPathHints(params.query);
 
   const scored: ScoredRetrievalItem[] = [];
+  const sourceTextByEmbeddingId = new Map<number, string>();
+
   await forEachRepoEmbeddingBatch({
     repoId: params.repoId,
+    includeVector: false,
     onBatch: (batch) => {
       for (const embedding of batch) {
         const fileMeta = embedding.fileId ? fileMap.get(embedding.fileId) : undefined;
         const path = fileMeta?.path;
         const symbol = embedding.symbolId ? symbolMap.get(embedding.symbolId) : undefined;
-        const semanticRaw = cosineSimilarity(queryVec, embedding.vector);
-        const semantic = normalizeCosine(semanticRaw);
-        const lexical = lexicalSimilarity(
-          queryTokens,
-          tokenize(buildLexicalInput({ path, symbol, text: embedding.text }))
-        );
-        const pathBoost = path
-          ? computePathBoost({
-              path,
-              changedPaths,
-              changedDirectories,
-              queryPathHints,
-              changedPathBoost: weights.changedPathBoost,
-              sameDirectoryBoost: weights.sameDirectoryBoost
-            })
-          : 0;
-        const patternBoost = fileMeta?.isPattern ? weights.patternBoost : 0;
-        const kindBoost =
-          embedding.kind === "symbol"
-            ? weights.symbolBoost
-            : embedding.kind === "chunk"
-              ? weights.chunkBoost
-              : 0;
-
-        scored.push({
+        const item: ScoredRetrievalItem = {
           embedding: {
             id: embedding.id,
             fileId: embedding.fileId,
@@ -159,28 +162,101 @@ export async function retrieveContext(params: {
           path,
           symbol,
           isPattern: fileMeta?.isPattern,
-          semantic,
-          lexical,
-          pathBoost,
-          patternBoost,
-          kindBoost,
+          semantic: 0,
+          lexical: 0,
+          pathBoost: 0,
+          patternBoost: 0,
+          kindBoost: 0,
+          directoryAffinity: 0,
+          fileAnchor: 0,
           rrf: 0,
+          baseScore: 0,
           score: 0
-        });
+        };
+        scored.push(item);
+        sourceTextByEmbeddingId.set(item.embedding.id, embedding.text || "");
       }
     }
   });
 
-  applyRrfScores(scored);
+  const pageIndexScores = await scoreWithPageIndex({
+    query: params.query,
+    topK,
+    changedPaths: changedPathList,
+    items: scored.map((item) => ({
+      id: item.embedding.id,
+      kind: mapEmbeddingKind(item.embedding.kind),
+      path: item.path,
+      symbol: item.symbol,
+      text: sourceTextByEmbeddingId.get(item.embedding.id) || ""
+    })),
+  }).catch(() => new Map<number, PageIndexScore>());
+  const pageIndexAvailable = pageIndexScores.size > 0;
 
+  const anchorByPath = new Map<string, number>();
   for (const item of scored) {
-    item.score =
+    const scriptScore = pageIndexScores.get(item.embedding.id);
+    const sourceText = sourceTextByEmbeddingId.get(item.embedding.id) || "";
+    const semanticFallback = lexicalSimilarity(
+      queryTokens,
+      tokenize(buildNodeTitle({ path: item.path, symbol: item.symbol, text: sourceText }))
+    );
+    const lexicalFallback = lexicalSimilarity(
+      queryTokens,
+      tokenize(buildLexicalInput({ path: item.path, symbol: item.symbol, text: sourceText }))
+    );
+    item.semantic = pageIndexAvailable ? (scriptScore?.semantic ?? 0) : semanticFallback;
+    item.lexical = pageIndexAvailable ? (scriptScore?.lexical ?? 0) : lexicalFallback;
+    item.pathBoost = item.path
+      ? computePathBoost({
+          path: item.path,
+          changedPaths,
+          changedDirectories,
+          queryPathHints,
+          changedPathBoost: weights.changedPathBoost,
+          sameDirectoryBoost: weights.sameDirectoryBoost
+        })
+      : 0;
+    item.patternBoost = item.isPattern ? weights.patternBoost : 0;
+    item.kindBoost =
+      item.embedding.kind === "symbol"
+        ? weights.symbolBoost
+        : item.embedding.kind === "chunk"
+          ? weights.chunkBoost
+          : 0;
+    item.baseScore =
       item.semantic * weights.semanticWeight +
       item.lexical * weights.lexicalWeight +
-      item.rrf * weights.rrfWeight +
       item.pathBoost +
       item.patternBoost +
       item.kindBoost;
+    if (item.path) {
+      const pathAnchor = item.semantic * 0.66 + item.lexical * 0.34 + item.pathBoost;
+      anchorByPath.set(item.path, Math.max(anchorByPath.get(item.path) || 0, pathAnchor));
+    }
+  }
+
+  applyRrfScores(scored);
+  const directoryAnchors = buildDirectoryAnchors(anchorByPath, changedDirectories);
+
+  for (const item of scored) {
+    item.directoryAffinity = item.path
+      ? computeDirectoryAffinity({
+          path: item.path,
+          changedDirectories,
+          directoryAnchors,
+          sameDirectoryBoost: weights.sameDirectoryBoost
+        })
+      : 0;
+    const pathAnchor = item.path ? anchorByPath.get(item.path) || 0 : 0;
+    item.fileAnchor =
+      pathAnchor <= 0
+        ? 0
+        : Math.min(
+            0.18,
+            pathAnchor * (item.embedding.kind === "file" ? 0.07 : item.embedding.kind === "symbol" ? 0.15 : 0.12)
+          );
+    item.score = item.baseScore + item.rrf * weights.rrfWeight + item.directoryAffinity + item.fileAnchor;
   }
 
   scored.sort((a, b) => b.score - a.score);
@@ -223,6 +299,82 @@ export async function retrieveContext(params: {
   }));
 }
 
+async function scoreWithPageIndex(params: {
+  query: string;
+  topK: number;
+  changedPaths: string[];
+  items: PageIndexInputItem[];
+}): Promise<Map<number, PageIndexScore>> {
+  const projectRoot = (process.env.PROJECT_ROOT || process.cwd()).trim() || process.cwd();
+  const scriptPath = path.join(projectRoot, "src", "scripts", "pageindex_retrieve.py");
+  const pageindexRoot = path.join(projectRoot, "PageIndex");
+  const output = new Map<number, PageIndexScore>();
+
+  try {
+    await fs.access(scriptPath);
+    await fs.access(pageindexRoot);
+  } catch {
+    return output;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-pageindex-"));
+  const inputPath = path.join(tempDir, "input.json");
+
+  try {
+    await fs.writeFile(
+      inputPath,
+      JSON.stringify(
+        {
+          query: params.query,
+          top_k: params.topK,
+          changed_paths: params.changedPaths,
+          pageindex_root: pageindexRoot,
+          items: params.items
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const { stdout } = await execa("python3", [scriptPath, "--input", inputPath], {
+      cwd: projectRoot,
+      reject: true
+    });
+    const raw = stdout.trim();
+    if (!raw) return output;
+    const lines = raw.split("\n").map((line) => line.trim()).filter(Boolean);
+    const candidate = lines[lines.length - 1] || raw;
+    const parsed = JSON.parse(candidate) as {
+      results?: Array<{
+        id: number;
+        score: number;
+        semantic: number;
+        lexical: number;
+        pathBoost: number;
+        kindBoost: number;
+        patternBoost: number;
+      }>;
+    };
+    for (const row of parsed.results || []) {
+      if (!Number.isFinite(row?.id)) continue;
+      output.set(Number(row.id), {
+        score: Number(row.score) || 0,
+        semantic: Number(row.semantic) || 0,
+        lexical: Number(row.lexical) || 0,
+        pathBoost: Number(row.pathBoost) || 0,
+        kindBoost: Number(row.kindBoost) || 0,
+        patternBoost: Number(row.patternBoost) || 0
+      });
+    }
+    return output;
+  } catch {
+    return output;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 function mergeWeights(overrides?: Partial<RetrievalWeights>): RetrievalWeights {
   if (!overrides) return DEFAULT_WEIGHTS;
   return {
@@ -247,10 +399,12 @@ async function forEachRepoEmbeddingBatch(params: {
   repoId: number;
   onBatch: (batch: EmbeddingRow[]) => Promise<void> | void;
   maxRows?: number;
+  includeVector?: boolean;
 }) {
   const maxRows = Number.isFinite(params.maxRows) ? Math.max(0, Number(params.maxRows)) : Number.POSITIVE_INFINITY;
   let cursor: number | null = null;
   let loadedRows = 0;
+  const includeVector = Boolean(params.includeVector);
 
   while (loadedRows < maxRows) {
     const remaining = Number.isFinite(maxRows) ? Math.max(0, maxRows - loadedRows) : EMBEDDING_FETCH_BATCH;
@@ -274,8 +428,8 @@ async function forEachRepoEmbeddingBatch(params: {
         fileId: true,
         symbolId: true,
         kind: true,
-        vector: true,
-        text: true
+        text: true,
+        ...(includeVector ? { vector: true } : {})
       }
     })) as EmbeddingRow[];
 
@@ -292,6 +446,7 @@ export async function loadRepoEmbeddings(repoId: number, options?: { maxRows?: n
   await forEachRepoEmbeddingBatch({
     repoId,
     maxRows: options?.maxRows,
+    includeVector: true,
     onBatch: (batch) => {
       rows.push(...batch);
     }
@@ -404,11 +559,6 @@ function applyRrfScores(
   }
 }
 
-function normalizeCosine(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(1, (value + 1) / 2));
-}
-
 function buildLexicalInput(params: {
   path?: string;
   symbol?: string;
@@ -420,6 +570,11 @@ function buildLexicalInput(params: {
   const symbol = params.symbol || "";
   const text = params.text.slice(0, 2200);
   return `${pathParts} ${symbol} ${text}`;
+}
+
+function buildNodeTitle(params: { path?: string; symbol?: string; text: string }): string {
+  const firstLine = params.text.split("\n", 1)[0] || "";
+  return `${params.path || ""} ${params.symbol || ""} ${firstLine.slice(0, 180)}`.trim();
 }
 
 const STOPWORDS = new Set([
@@ -493,6 +648,56 @@ function computePathBoost(params: {
   }
 
   return boost;
+}
+
+function buildDirectoryAnchors(
+  pathAnchors: Map<string, number>,
+  changedDirectories: Set<string>
+): Map<string, number> {
+  const directoryAnchors = new Map<string, number>();
+
+  const upsert = (dir: string, value: number) => {
+    if (!dir) return;
+    directoryAnchors.set(dir, Math.max(directoryAnchors.get(dir) || 0, value));
+  };
+
+  for (const [path, score] of pathAnchors.entries()) {
+    let current = directoryPath(path);
+    let decay = 1;
+    while (current) {
+      upsert(current, score * decay);
+      const idx = current.lastIndexOf("/");
+      if (idx < 0) break;
+      current = current.slice(0, idx);
+      decay *= 0.82;
+    }
+  }
+
+  for (const dir of changedDirectories) {
+    upsert(dir, 0.72);
+    const idx = dir.lastIndexOf("/");
+    if (idx > 0) {
+      upsert(dir.slice(0, idx), 0.54);
+    }
+  }
+
+  return directoryAnchors;
+}
+
+function computeDirectoryAffinity(params: {
+  path: string;
+  changedDirectories: Set<string>;
+  directoryAnchors: Map<string, number>;
+  sameDirectoryBoost: number;
+}): number {
+  const { path, changedDirectories, directoryAnchors, sameDirectoryBoost } = params;
+  const dir = directoryPath(path);
+  if (!dir) return 0;
+  if (changedDirectories.has(dir)) return sameDirectoryBoost;
+
+  const anchor = directoryAnchors.get(dir) || 0;
+  if (anchor <= 0) return 0;
+  return Math.min(sameDirectoryBoost, anchor * 0.12);
 }
 
 function extractPathHints(value: string): string[] {

@@ -1006,28 +1006,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-backend-client"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "codex-backend-openapi-models",
- "codex-core",
- "codex-protocol",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "codex-backend-openapi-models"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "serde_with",
-]
-
-[[package]]
 name = "codex-client"
 version = "0.0.0"
 dependencies = [
@@ -1106,7 +1084,6 @@ dependencies = [
  "codex-utils-pty",
  "codex-utils-readiness",
  "codex-utils-string",
- "codex-windows-sandbox",
  "core-foundation 0.9.4",
  "dirs",
  "dunce",
@@ -1538,14 +1515,6 @@ name = "codex-utils-string"
 version = "0.0.0"
 dependencies = [
  "regex-lite",
-]
-
-[[package]]
-name = "codex-windows-sandbox"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "codex-protocol",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isGeneratedMentionReply, isSelfBotComment, normalizeBotAwareLogin } from "../src/providers/commentGuards.js";
 import { isResolutionReply } from "../src/providers/commentResolution.js";
-import { shouldDeleteClosedBotPrBranch, shouldSkipSelfBotFollowUpPrReview } from "../src/providers/pullRequestGuards.js";
+import { shouldDeleteClosedBotPrBranch, shouldSkipBotAuthoredReview, shouldSkipSelfBotFollowUpPrReview } from "../src/providers/pullRequestGuards.js";
 
 test("normalizeBotAwareLogin strips [bot] suffix", () => {
   assert.equal(normalizeBotAwareLogin("grepiku-dev[bot]"), "grepiku-dev");
@@ -198,6 +198,56 @@ test("shouldSkipSelfBotFollowUpPrReview does not skip non-follow-up or non-bot p
       botLogin: "grepiku-dev",
       pullRequest: {
         headRef: "grepiku/mention-123",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+});
+
+test("shouldSkipBotAuthoredReview skips any PR authored by the bot", () => {
+  assert.equal(
+    shouldSkipBotAuthoredReview({
+      action: "opened",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "feature/some-branch",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    true
+  );
+  assert.equal(
+    shouldSkipBotAuthoredReview({
+      action: "synchronize",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "grepiku-dev[bot]", externalId: "1" }
+      }
+    }),
+    true
+  );
+});
+
+test("shouldSkipBotAuthoredReview does not skip human-authored PRs", () => {
+  assert.equal(
+    shouldSkipBotAuthoredReview({
+      action: "opened",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "feature/refactor",
+        author: { login: "octocat", externalId: "2" }
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldSkipBotAuthoredReview({
+      action: "edited",
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "feature/refactor",
         author: { login: "grepiku-dev[bot]", externalId: "1" }
       }
     }),

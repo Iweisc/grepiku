@@ -1,6 +1,6 @@
 import { prisma } from "../db/client.js";
 import { ensureInstallation, ensureProvider, ensureRepo, ensureRepoInstallation, ensureUser, upsertPullRequest } from "../db/records.js";
-import { enqueueCommentReplyJob, enqueueIndexJob, enqueueReviewJob } from "../queue/enqueue.js";
+import { cancelReviewJobsForPr, enqueueCommentReplyJob, enqueueIndexJob, enqueueReviewJob } from "../queue/enqueue.js";
 import { ProviderWebhookEvent } from "./types.js";
 import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "../review/triggers.js";
 import { getProviderAdapter } from "./registry.js";
@@ -8,7 +8,8 @@ import { resolveGithubBotLogin } from "./github/adapter.js";
 import { rememberRepoInstruction } from "../services/repoMemory.js";
 import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
 import { isResolutionReply } from "./commentResolution.js";
-import { shouldDeleteClosedBotPrBranch, shouldSkipSelfBotFollowUpPrReview } from "./pullRequestGuards.js";
+import { shouldDeleteClosedBotPrBranch, shouldSkipBotAuthoredReview, shouldSkipSelfBotFollowUpPrReview } from "./pullRequestGuards.js";
+import { detectOutcomesOnClose } from "../services/outcomes.js";
 
 function isSuggestionCommitMessage(message: string): boolean {
   const normalized = message.toLowerCase().trim();
@@ -192,10 +193,18 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
 
   if (event.type === "pull_request") {
     if (event.pullRequest.state === "closed") {
+      const cancelled = await cancelReviewJobsForPr(pullRequest.id);
+      if (cancelled > 0) {
+        console.log(
+          `[pr#${event.pullRequest.number}] cancelled ${cancelled} queued review job${cancelled === 1 ? "" : "s"} (PR closed)`
+        );
+      }
       await maybeDeleteClosedBotPrHeadBranch({
         event,
         installationExternalId: installation.externalId
       });
+      await detectOutcomesOnClose({ pullRequestId: pullRequest.id, repoId: repo.id })
+        .catch(err => console.warn(`[pr#${event.pullRequest.number}] outcome detection failed`, err));
       return;
     }
     const botLogin = await resolveGithubBotLogin().catch(() => "");
@@ -206,6 +215,18 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         botLogin
       })
     ) {
+      return;
+    }
+    if (
+      shouldSkipBotAuthoredReview({
+        action: event.action,
+        pullRequest: event.pullRequest,
+        botLogin
+      })
+    ) {
+      console.log(
+        `[pr#${event.pullRequest.number}] skipping review for bot-authored PR (author=${event.pullRequest.author?.login || "unknown"})`
+      );
       return;
     }
     await maybeBootstrapRepoGraph({
@@ -352,6 +373,12 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
     if (!commentTrigger) return;
 
     if (commentTrigger === "review") {
+      if (event.pullRequest.state === "closed") {
+        console.log(
+          `[pr#${event.pullRequest.number}] ignoring /review command on closed PR`
+        );
+        return;
+      }
       await enqueueReviewJob({
         provider: event.provider,
         installationId: installation.externalId,

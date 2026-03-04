@@ -59,3 +59,13 @@ export function shouldSkipSelfBotFollowUpPrReview(params: {
   const authorLogin = params.pullRequest.author?.login || "";
   return isSelfBotComment({ authorLogin, botLogin: params.botLogin });
 }
+
+export function shouldSkipBotAuthoredReview(params: {
+  action: string;
+  pullRequest: PullRequestReviewSkipCandidate;
+  botLogin: string;
+}): boolean {
+  if (!REVIEWABLE_PULL_REQUEST_ACTIONS.has(params.action)) return false;
+  const authorLogin = params.pullRequest.author?.login || "";
+  return isSelfBotComment({ authorLogin, botLogin: params.botLogin });
+}

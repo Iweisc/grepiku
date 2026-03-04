@@ -38,6 +38,7 @@ import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
 import { resolveRules } from "./triggers.js";
 import { buildContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
+import { getRepoWeights } from "../services/weights.js";
 import { refineReviewComments } from "./quality.js";
 import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
@@ -777,6 +778,10 @@ export async function processReviewJob(data: ReviewJobData) {
     pullRequest: providerPull
   });
   const refreshed = await client.fetchPullRequest();
+  if (refreshed.state === "closed") {
+    console.log(`[pr#${prNumber}] PR is closed; skipping review`);
+    return;
+  }
   client = await adapter.createClient({
     installationId: installationId || null,
     repo: providerRepo,
@@ -1028,7 +1033,10 @@ export async function processReviewJob(data: ReviewJobData) {
       .then(() => ({ ok: true as const }))
       .catch((error: unknown) => ({ ok: false as const, error }));
 
-    const feedbackPolicy = await getFeedbackPolicy(repo.id);
+    const [feedbackPolicy, repoWeights] = await Promise.all([
+      getFeedbackPolicy(repo.id),
+      getRepoWeights(repo.id)
+    ]);
     const incrementalHint =
       incrementalReview && incrementalFrom
         ? `\n\nReview only code changes between ${incrementalFrom} and ${refreshed.headSha}. Treat this as a full review of the update and do not mention that this run is incremental.`
@@ -1185,7 +1193,8 @@ export async function processReviewJob(data: ReviewJobData) {
       maxInlineComments: resolvedConfig.limits.max_inline_comments,
       summaryOnly: resolvedConfig.output.summaryOnly,
       allowedTypes: resolvedConfig.commentTypes.allow,
-      feedbackPolicy
+      feedbackPolicy,
+      repoWeights
     });
     finalReview.comments = qualityRefinement.comments;
 
