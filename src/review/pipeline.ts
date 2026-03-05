@@ -31,7 +31,11 @@ import {
 } from "./diff.js";
 import { fingerprintForComment, matchKeyForComment } from "./findings.js";
 import { selectSemanticFindingCandidate } from "./findingMatch.js";
-import { semanticFindingKey, selectFixedFindingCandidates } from "./findingLifecycle.js";
+import {
+  semanticFindingKey,
+  selectFixedFindingCandidates,
+  selectPreferredExactKeyFinding
+} from "./findingLifecycle.js";
 import { generateMermaidDiagram } from "./diagram.js";
 import { ReviewOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
@@ -1174,7 +1178,8 @@ export async function processReviewJob(data: ReviewJobData) {
     const existingBySemanticTitle = new Map<string, Array<typeof existingCandidates[number]>>();
     for (const finding of existingCandidates) {
       const key = `${finding.fingerprint}|${finding.path}|${finding.hunkHash}|${finding.title}`;
-      existingByKey.set(key, finding);
+      const current = existingByKey.get(key);
+      existingByKey.set(key, selectPreferredExactKeyFinding(current, finding));
       const fallbackKey = `${normalizePath(finding.path)}|${finding.hunkHash}|${finding.category}`;
       const bucket = existingByHunkCategory.get(fallbackKey) || [];
       bucket.push(finding);

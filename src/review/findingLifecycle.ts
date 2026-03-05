@@ -11,6 +11,16 @@ export function semanticFindingKey(pathValue: string, category: string, title: s
   return `${normalizePath(pathValue)}|${category}|${normalizeFindingTitle(title)}`;
 }
 
+export function selectPreferredExactKeyFinding<T extends { status: string }>(
+  current: T | undefined,
+  candidate: T
+): T {
+  if (!current || current.status !== "open") {
+    return candidate;
+  }
+  return current;
+}
+
 export type OpenFindingLifecycleState = {
   id: number;
   path: string;

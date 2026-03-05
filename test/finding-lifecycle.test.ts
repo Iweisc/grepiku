@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { selectFixedFindingCandidates } from "../src/review/findingLifecycle.js";
+import { selectFixedFindingCandidates, selectPreferredExactKeyFinding } from "../src/review/findingLifecycle.js";
 
 function finding(overrides: Partial<{
   id: number;
@@ -64,4 +64,13 @@ test("non-incremental mode fixes unmatched findings from older SHAs", () => {
   });
 
   assert.deepEqual(fixed.map((item) => item.id), [5]);
+});
+
+test("exact-key matching keeps open finding over same-key fixed finding", () => {
+  const openFinding = { id: 1, status: "open" };
+  const fixedFinding = { id: 2, status: "fixed" };
+
+  assert.equal(selectPreferredExactKeyFinding(undefined, openFinding), openFinding);
+  assert.equal(selectPreferredExactKeyFinding(openFinding, fixedFinding), openFinding);
+  assert.equal(selectPreferredExactKeyFinding(fixedFinding, openFinding), openFinding);
 });
