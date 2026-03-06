@@ -205,3 +205,33 @@ test("literal escape sequences inside suggested patch stay intact", () => {
   assert.equal(refined.comments.length, 1);
   assert.equal(refined.comments[0].suggested_patch, 'fmt.Println("\\\\n", "\\\\t")');
 });
+
+test("quoted multiline suggestions are unescaped", () => {
+  const refined = refineReviewComments({
+    comments: [
+      {
+        comment_id: "esc-patch-3",
+        comment_key: "esc-patch-3",
+        path: "src/foo.ts",
+        side: "RIGHT",
+        line: 2,
+        severity: "important",
+        category: "bug",
+        title: "Decode quoted multiline patch",
+        body: "Suggestion should render on multiple lines",
+        evidence: "Quoted evidence",
+        suggested_patch: 'const message = "ok";\\nreturn message;',
+        comment_type: "inline",
+        confidence: "high"
+      }
+    ],
+    diffIndex,
+    changedFiles: [{ path: "src/foo.ts" }],
+    maxInlineComments: 5,
+    summaryOnly: false,
+    allowedTypes: ["inline", "summary"]
+  });
+
+  assert.equal(refined.comments.length, 1);
+  assert.equal(refined.comments[0].suggested_patch, 'const message = "ok";\nreturn message;');
+});

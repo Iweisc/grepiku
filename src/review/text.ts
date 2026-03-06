@@ -1,5 +1,5 @@
 const STRUCTURAL_ESCAPED_TAB_RE = /(^|\n|\\n)\\t+/m;
-const QUOTE_CHAR_RE = /["']/;
+const UNESCAPED_NEWLINE_ESCAPE_RE = /(?<!\\)(?:\\r\\n|\\n)/;
 
 function parseJsonStringLiteral(value: string): string | null {
   try {
@@ -76,8 +76,10 @@ export function normalizeSuggestedPatchText(value: string): string {
   const normalized = value.replace(/\r\n/g, "\n");
   const decoded = tryDecodeWrappedSuggestion(normalized) || tryDecodeStructuredSuggestion(normalized);
   if (decoded) return decoded;
-  if (!QUOTE_CHAR_RE.test(normalized) && /\\r\\n|\\n/.test(normalized)) {
-    return normalized.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n");
+  if (UNESCAPED_NEWLINE_ESCAPE_RE.test(normalized)) {
+    return normalized
+      .replace(/(?<!\\)\\r\\n/g, "\n")
+      .replace(/(?<!\\)\\n/g, "\n");
   }
   return normalized;
 }
