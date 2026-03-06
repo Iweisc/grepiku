@@ -28,6 +28,19 @@ test("reviewer prompt enables first-run full-repo static audit guidance", () => 
   assert.match(prompt, /comment_type: "summary"/i);
 });
 
+test("reviewer prompt includes previous review context for incremental runs", () => {
+  const prompt = buildReviewerPrompt(config, paths, {
+    incrementalReview: {
+      fromHeadSha: "oldsha123",
+      toHeadSha: "newsha456"
+    }
+  });
+
+  assert.match(prompt, /previous_review_context\.json/);
+  assert.match(prompt, /Update the summary for the entire PR/i);
+  assert.match(prompt, /do not describe only the latest commit/i);
+});
+
 test("editor prompt allows off-diff summary comments only in full-repo mode", () => {
   const defaultPrompt = buildEditorPrompt("{}", paths);
   assert.match(defaultPrompt, /Only comment on diff lines\./);
@@ -35,4 +48,17 @@ test("editor prompt allows off-diff summary comments only in full-repo mode", ()
   const fullAuditPrompt = buildEditorPrompt("{}", paths, { fullRepoStaticAudit: true });
   assert.match(fullAuditPrompt, /Inline comments must be on diff lines\./);
   assert.match(fullAuditPrompt, /Summary comments may cover issues outside diff\.patch/i);
+});
+
+test("editor prompt keeps incremental summaries whole-PR oriented", () => {
+  const prompt = buildEditorPrompt("{}", paths, {
+    incrementalReview: {
+      fromHeadSha: "oldsha123",
+      toHeadSha: "newsha456"
+    }
+  });
+
+  assert.match(prompt, /previous_review_context\.json/);
+  assert.match(prompt, /Keep the summary whole-PR oriented/i);
+  assert.match(prompt, /Do not add comments for older issues unless they are evidenced by the current diff\.patch/i);
 });
