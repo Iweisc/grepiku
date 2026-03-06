@@ -29,9 +29,10 @@ export async function writeBundleFiles(params: {
   repoConfig: RepoConfig;
   resolvedConfig?: RepoConfig;
   contextPack?: unknown;
+  previousReviewContext?: unknown;
   warnings?: string[];
 }) {
-  const { bundleDir, prMarkdown, diffPatch, changedFiles, repoConfig, resolvedConfig, contextPack, warnings } = params;
+  const { bundleDir, prMarkdown, diffPatch, changedFiles, repoConfig, resolvedConfig, contextPack, previousReviewContext, warnings } = params;
   await fs.writeFile(path.join(bundleDir, "pr.md"), prMarkdown, "utf8");
   await fs.writeFile(path.join(bundleDir, "diff.patch"), diffPatch, "utf8");
   await fs.writeFile(
@@ -74,6 +75,13 @@ export async function writeBundleFiles(params: {
     await fs.writeFile(
       path.join(bundleDir, "context_pack.json"),
       JSON.stringify(contextPack, null, 2),
+      "utf8"
+    );
+  }
+  if (previousReviewContext) {
+    await fs.writeFile(
+      path.join(bundleDir, "previous_review_context.json"),
+      JSON.stringify(previousReviewContext, null, 2),
       "utf8"
     );
   }

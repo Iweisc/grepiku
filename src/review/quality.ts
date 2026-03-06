@@ -2,6 +2,7 @@ import crypto from "crypto";
 import type { FeedbackPolicy } from "../services/feedback.js";
 import { isLineInDiff, normalizePath, type DiffIndex } from "./diff.js";
 import type { ReviewComment } from "./schemas.js";
+import { normalizeSuggestedPatchText, stripEdgeBlankLines } from "./text.js";
 
 export type QualityDiagnostics = {
   droppedEmpty: number;
@@ -71,8 +72,8 @@ function normalizedTitleKey(value: string): string {
 
 function normalizeSuggestedPatch(value?: string): string | undefined {
   if (!value) return undefined;
-  const normalized = normalizeWhitespace(value);
-  return normalized.length > 0 ? normalized : undefined;
+  const normalized = stripEdgeBlankLines(normalizeSuggestedPatchText(value));
+  return normalized.trim().length > 0 ? normalized : undefined;
 }
 
 function normalizeComment(input: ReviewComment): ReviewComment {

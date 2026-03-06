@@ -48,11 +48,13 @@ import { getRepoWeights } from "../services/weights.js";
 import { refineReviewComments } from "./quality.js";
 import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
+import { buildIncrementalReviewContext } from "./incrementalContext.js";
 import {
   buildCoveragePlan,
   mergeSupplementalComments,
   mergeSupplementalSummary
 } from "./coverage.js";
+import { normalizeSuggestedPatchText, stripEdgeBlankLines } from "./text.js";
 
 const env = loadEnv();
 
@@ -142,11 +144,11 @@ function buildFeedbackHint(policy: FeedbackPolicy): string {
 function formatInlineComment(comment: ReviewComment): string {
   const marker = `<!-- grepiku:${comment.comment_id} -->`;
   const normalizeSuggestedPatch = (patch: string) => {
-    let normalized = patch.replace(/\\n/g, "\n");
+    let normalized = normalizeSuggestedPatchText(patch);
     normalized = normalized
       .replace(/^```(?:suggestion|diff)?\n?/i, "")
-      .replace(/```$/, "")
-      .trim();
+      .replace(/```$/, "");
+    normalized = stripEdgeBlankLines(normalized);
     const lines = normalized.split("\n");
     const hasDiffMarkers = lines.some(
       (line) =>
@@ -332,11 +334,11 @@ function buildFixPrompt(comments: ReviewComment[]): string {
       .trimEnd();
 
   const normalizeSuggestedPatch = (patch: string) => {
-    let normalized = patch.replace(/\\n/g, "\n");
+    let normalized = normalizeSuggestedPatchText(patch);
     normalized = normalized
       .replace(/^```(?:suggestion|diff)?\n?/i, "")
-      .replace(/```$/, "")
-      .trim();
+      .replace(/```$/, "");
+    normalized = stripEdgeBlankLines(normalized);
     const lines = normalized.split("\n");
     const hasDiffMarkers = lines.some(
       (line) =>
@@ -882,6 +884,33 @@ export async function processReviewJob(data: ReviewJobData) {
       graph: resolvedConfig.graph
     });
 
+    const incrementalReviewContext =
+      incrementalReview && previousRun
+        ? buildIncrementalReviewContext({
+            previousRun: {
+              id: previousRun.id,
+              headSha: previousRun.headSha,
+              trigger: previousRun.trigger,
+              completedAt: previousRun.completedAt,
+              finalJson: previousRun.finalJson,
+              summaryJson: previousRun.summaryJson
+            },
+            openFindings: await prisma.finding.findMany({
+              where: { pullRequestId: pullRequest.id, status: "open" },
+              select: {
+                path: true,
+                line: true,
+                severity: true,
+                category: true,
+                title: true,
+                body: true,
+                ruleId: true,
+                ruleReason: true
+              }
+            })
+          })
+        : null;
+
     const { bundleDir, outDir, codexHomeDir } = await createRunDirs(env.projectRoot, run.id);
     await writeBundleFiles({
       bundleDir,
@@ -891,6 +920,7 @@ export async function processReviewJob(data: ReviewJobData) {
       repoConfig,
       resolvedConfig,
       contextPack,
+      previousReviewContext: incrementalReviewContext,
       warnings
     });
 
@@ -921,14 +951,20 @@ export async function processReviewJob(data: ReviewJobData) {
       getFeedbackPolicy(repo.id),
       getRepoWeights(repo.id)
     ]);
-    const incrementalHint =
-      incrementalReview && incrementalFrom
-        ? `\n\nReview only code changes between ${incrementalFrom} and ${refreshed.headSha}. Treat this as a full review of the update and do not mention that this run is incremental.`
-        : "";
+    const promptOptions = {
+      fullRepoStaticAudit,
+      ...(incrementalReview && incrementalFrom && incrementalReviewContext
+        ? {
+            incrementalReview: {
+              fromHeadSha: incrementalFrom,
+              toHeadSha: refreshed.headSha
+            }
+          }
+        : {})
+    };
     const reviewerPrompt =
-      buildReviewerPrompt(resolvedConfig, promptPaths, { fullRepoStaticAudit }) +
-      buildFeedbackHint(feedbackPolicy) +
-      incrementalHint;
+      buildReviewerPrompt(resolvedConfig, promptPaths, promptOptions) +
+      buildFeedbackHint(feedbackPolicy);
     await runCodexStage({
       stage: "reviewer",
       repoPath,
@@ -948,7 +984,7 @@ export async function processReviewJob(data: ReviewJobData) {
       "reviewer"
     );
 
-    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, { fullRepoStaticAudit });
+    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, promptOptions);
     await runCodexStage({
       stage: "editor",
       repoPath,

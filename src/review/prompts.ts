@@ -8,6 +8,10 @@ export type PromptPaths = {
 
 export type ReviewPromptOptions = {
   fullRepoStaticAudit?: boolean;
+  incrementalReview?: {
+    fromHeadSha: string;
+    toHeadSha: string;
+  };
 };
 
 function bundlePath(paths: PromptPaths, file: string): string {
@@ -19,6 +23,21 @@ function outPath(paths: PromptPaths, file: string): string {
 }
 
 export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths, options: ReviewPromptOptions = {}): string {
+  const contextFiles = [
+    `- ${bundlePath(paths, "pr.md")}`,
+    `- ${bundlePath(paths, "diff.patch")}`,
+    `- ${bundlePath(paths, "changed_files.json")}`,
+    `- ${bundlePath(paths, "bot_config.json")}`,
+    `- ${bundlePath(paths, "rules.json")}`,
+    `- ${bundlePath(paths, "scopes.json")}`,
+    `- ${bundlePath(paths, "context_pack.json")}`,
+    `- ${bundlePath(paths, "config_warnings.json")}`
+  ];
+  if (options.incrementalReview) {
+    contextFiles.push(
+      `- ${bundlePath(paths, "previous_review_context.json")} (baseline whole-PR context from the last completed review)`
+    );
+  }
   const scopeRules = options.fullRepoStaticAudit
     ? [
         "- This is the first completed review for this PR. Perform a one-time full repository static audit against the current checkout.",
@@ -26,22 +45,24 @@ export function buildReviewerPrompt(config: RepoConfig, paths: PromptPaths, opti
         '- You may include findings outside diff.patch only as `comment_type: "summary"`.'
       ]
     : ["- Only comment on lines that exist in diff.patch."];
+  const incrementalRules = options.incrementalReview
+    ? [
+        `- This review covers only the code changes between ${options.incrementalReview.fromHeadSha} and ${options.incrementalReview.toHeadSha}.`,
+        "- Use previous_review_context.json as the baseline whole-PR understanding from the last completed review.",
+        "- Update the summary for the entire PR after applying this change set; do not describe only the latest commit.",
+        "- Keep still-relevant prior concerns unless the current changes clearly resolve them.",
+        "- Do not mention that this run is incremental."
+      ]
+    : [];
   return `You are a pull request reviewer. You must produce a structured review.
 
 Context files:
-- ${bundlePath(paths, "pr.md")}
-- ${bundlePath(paths, "diff.patch")}
-- ${bundlePath(paths, "changed_files.json")}
-- ${bundlePath(paths, "bot_config.json")}
-- ${bundlePath(paths, "rules.json")}
-- ${bundlePath(paths, "scopes.json")}
-- ${bundlePath(paths, "context_pack.json")}
-- ${bundlePath(paths, "config_warnings.json")}
+${contextFiles.join("\n")}
 - Repo checkout: ${paths.repoPath} (read-only)
 
 Rules:
 ${scopeRules.join("\n")}
-- Default to RIGHT side unless the issue is on removed code.
+${incrementalRules.length > 0 ? `${incrementalRules.join("\n")}\n` : ""}- Default to RIGHT side unless the issue is on removed code.
 - Evidence is required for every comment (quote from diff/context).
 - Do not include evidence quotes in body; put them only in evidence.
 - Avoid formatting/style nits.
@@ -206,25 +227,40 @@ export function buildEditorPrompt(
   paths: PromptPaths,
   options: ReviewPromptOptions = {}
 ): string {
+  const inputs = [
+    "- Draft review JSON (inline):",
+    draftReviewJson,
+    `- Diff patch file: ${bundlePath(paths, "diff.patch")}`,
+    `- Changed files list: ${bundlePath(paths, "changed_files.json")}`,
+    `- Rules: ${bundlePath(paths, "rules.json")}`,
+    `- Context pack: ${bundlePath(paths, "context_pack.json")}`
+  ];
+  if (options.incrementalReview) {
+    inputs.push(`- Previous review context: ${bundlePath(paths, "previous_review_context.json")}`);
+  }
   const placementRules = options.fullRepoStaticAudit
     ? [
         "- Inline comments must be on diff lines.",
         '- Summary comments may cover issues outside diff.patch when they are high-confidence and actionable.'
       ]
     : ["- Only comment on diff lines."];
+  const incrementalRules = options.incrementalReview
+    ? [
+        `- This edit pass is reconciling changes between ${options.incrementalReview.fromHeadSha} and ${options.incrementalReview.toHeadSha}.`,
+        "- Keep the summary whole-PR oriented by reconciling the draft with previous_review_context.json.",
+        "- Preserve still-relevant prior concerns unless the current diff clearly resolves them.",
+        "- Do not add comments for older issues unless they are evidenced by the current diff.patch.",
+        "- Do not mention that this run is incremental."
+      ]
+    : [];
   return `You are the editor pass. Your job is to reduce false positives and enforce all constraints.
 
 Inputs:
-- Draft review JSON (inline):
-${draftReviewJson}
-- Diff patch file: ${bundlePath(paths, "diff.patch")}
-- Changed files list: ${bundlePath(paths, "changed_files.json")}
-- Rules: ${bundlePath(paths, "rules.json")}
-- Context pack: ${bundlePath(paths, "context_pack.json")}
+${inputs.join("\n")}
 
 Rules to enforce:
 ${placementRules.join("\n")}
-- Evidence required.
+${incrementalRules.length > 0 ? `${incrementalRules.join("\n")}\n` : ""}- Evidence required.
 - Do not include evidence quotes in body; keep quotes only in evidence.
 - Blocking requires clear fix/suggested patch.
 - Inline comments must include a suggested_patch or be converted to summary comments.
