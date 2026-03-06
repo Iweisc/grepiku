@@ -1,6 +1,6 @@
 import { prisma } from "../db/client.js";
 import { enqueueIndexJob } from "../queue/enqueue.js";
-import { redisConnection } from "../queue/index.js";
+import { redisClient } from "../queue/index.js";
 
 type Options = {
   dryRun: boolean;
@@ -214,5 +214,5 @@ run()
   })
   .finally(async () => {
     await prisma.$disconnect().catch(() => undefined);
-    await redisConnection.quit().catch(() => undefined);
+    await redisClient.quit().catch(() => undefined);
   });

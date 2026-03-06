@@ -22,6 +22,7 @@ const EnvSchema = z.object({
   CODEX_STAGE_TIMEOUT_MS: z.string().default("900000"),
   PROJECT_ROOT: z.string().min(1),
   CODEX_EXEC_PATH: z.string().default(""),
+  CODEX_STAGE_LOG_OUTPUT: z.string().default("false"),
   INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
   LOG_LEVEL: z.string().default("info")
 });
@@ -47,11 +48,16 @@ export type Env = {
   codexStageTimeoutMs: number;
   projectRoot: string;
   codexExecPath: string;
+  codexStageLogOutput: boolean;
   internalApiUrl: string;
   logLevel: string;
 };
 
 let cached: Env | null = null;
+
+function parseBooleanFlag(value: string): boolean {
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
 
 export function loadEnv(): Env {
   if (cached) return cached;
@@ -99,6 +105,7 @@ export function loadEnv(): Env {
       codexExecPath.length > 0
         ? codexExecPath
         : path.join(parsed.PROJECT_ROOT, "internal_harness", "codex-slim", "target", "release", "codex-exec"),
+    codexStageLogOutput: parseBooleanFlag(parsed.CODEX_STAGE_LOG_OUTPUT),
     internalApiUrl: parsed.INTERNAL_API_URL.trim(),
     logLevel: parsed.LOG_LEVEL
   };

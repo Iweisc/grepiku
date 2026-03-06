@@ -43,6 +43,7 @@ services:
       REDIS_URL: redis://redis:6379
       PROJECT_ROOT: ${PROJECT_ROOT}
       CODEX_EXEC_PATH: /usr/local/bin/codex-exec
+      CODEX_STAGE_LOG_OUTPUT: "true"
       INTERNAL_API_URL: http://web:3000/internal/retrieval
       REVIEW_WORKER_CONCURRENCY: 3
       MENTION_WORKER_CONCURRENCY: 3

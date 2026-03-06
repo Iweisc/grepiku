@@ -300,6 +300,7 @@ Context files:
 - Repo checkout: ${paths.repoPath} (read-only)
 
 Use the inline findings to decide which tools are relevant. If no tool is applicable, mark it "skipped".
+If a tool cannot be run or verification is otherwise blocked, still write checks.json with status "error" for affected tools.
 
 After running the needed tools, write ${outPath(paths, "checks.json")} with this schema:
 {
