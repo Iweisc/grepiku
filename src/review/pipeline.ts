@@ -13,7 +13,7 @@ import {
   buildCoverageReviewerPrompt
 } from "./prompts.js";
 import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
-import { parseAndValidateJson, readAndValidateJson } from "./json.js";
+import { readAndValidateJson, readAndValidateJsonWithFallback } from "./json.js";
 import {
   ReviewSchema,
   VerdictsSchema,
@@ -601,14 +601,8 @@ async function readJsonWithFallback<T>(
   schema: ZodSchema<T>,
   stage: CodexStage
 ): Promise<T> {
-  try {
-    return await readAndValidateJson(filePath, schema);
-  } catch (err: any) {
-    if (err?.code !== "ENOENT") throw err;
-    const fallbackPath = path.join(path.dirname(filePath), `last_message_${stage}.txt`);
-    const raw = await fs.readFile(fallbackPath, "utf8");
-    return parseAndValidateJson(raw, schema);
-  }
+  const fallbackPath = path.join(path.dirname(filePath), `last_message_${stage}.txt`);
+  return readAndValidateJsonWithFallback(filePath, fallbackPath, schema);
 }
 
 export async function processReviewJob(data: ReviewJobData) {
