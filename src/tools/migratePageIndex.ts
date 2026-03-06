@@ -214,5 +214,5 @@ run()
   })
   .finally(async () => {
     await prisma.$disconnect().catch(() => undefined);
-    await redisConnection.quit().catch(() => undefined);
+    await (redisConnection as unknown as import("ioredis").Redis).quit().catch(() => undefined);
   });

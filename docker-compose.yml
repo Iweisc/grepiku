@@ -7,10 +7,8 @@ services:
       POSTGRES_DB: grepiku
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
 
-  redis:
+  grepiku-redis:
     image: redis:7
     ports:
       - "6379:6379"
@@ -21,12 +19,12 @@ services:
     env_file: .env
     depends_on:
       - postgres
-      - redis
+      - grepiku-redis
     environment:
       DATABASE_URL: postgresql://grepiku:grepiku@postgres:5432/grepiku
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://grepiku-redis:6379
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-3005}:${PORT:-3005}"
 
   worker:
     build: .
@@ -35,15 +33,15 @@ services:
     env_file: .env
     depends_on:
       - postgres
-      - redis
+      - grepiku-redis
     volumes:
       - ${PROJECT_ROOT:?err}:${PROJECT_ROOT:?err}
     environment:
       DATABASE_URL: postgresql://grepiku:grepiku@postgres:5432/grepiku
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://grepiku-redis:6379
       PROJECT_ROOT: ${PROJECT_ROOT}
       CODEX_EXEC_PATH: /usr/local/bin/codex-exec
-      INTERNAL_API_URL: http://web:3000/internal/retrieval
+      INTERNAL_API_URL: http://web:${PORT:-3005}/internal/retrieval
       REVIEW_WORKER_CONCURRENCY: 3
       MENTION_WORKER_CONCURRENCY: 3
 

@@ -22,14 +22,14 @@ function isSuggestionCommitMessage(message: string): boolean {
   );
 }
 
-async function isSuggestionCommit(params: {
+async function fetchHeadCommitSkipReason(params: {
   installationId: string | null;
   repo: ProviderWebhookEvent["repo"];
   pullRequest: ProviderWebhookEvent["pullRequest"];
   headSha: string | null | undefined;
   botLogin: string;
-}): Promise<boolean> {
-  if (!params.installationId || !params.headSha) return false;
+}): Promise<string | null> {
+  if (!params.installationId || !params.headSha) return null;
   try {
     const adapter = getProviderAdapter("github");
     const client = await adapter.createClient({
@@ -38,13 +38,12 @@ async function isSuggestionCommit(params: {
       pullRequest: params.pullRequest
     });
     const commit = await client.fetchCommit(params.headSha);
-    if (isSuggestionCommitMessage(commit.message || "")) return true;
-    return isSelfBotComment({
-      authorLogin: commit.authorLogin || "",
-      botLogin: params.botLogin
-    });
+    if (isSuggestionCommitMessage(commit.message || "")) return "suggestion-commit";
+    if (isSelfBotComment({ authorLogin: commit.authorLogin || "", botLogin: params.botLogin })) return "bot-commit";
+    if (commit.parentCount != null && commit.parentCount > 1) return "merge-commit";
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -254,14 +253,19 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
     });
     if (!shouldTrigger) return;
     if (event.action === "synchronize") {
-      const skipSuggestion = await isSuggestionCommit({
+      const skipReason = await fetchHeadCommitSkipReason({
         installationId: installation.externalId,
         repo: event.repo,
         pullRequest: event.pullRequest,
         headSha: event.pullRequest.headSha,
         botLogin
       });
-      if (skipSuggestion) return;
+      if (skipReason) {
+        console.log(
+          `[pr#${event.pullRequest.number}] skipping review for ${skipReason} (sha=${event.pullRequest.headSha})`
+        );
+        return;
+      }
     }
 
     await enqueueReviewJob({
