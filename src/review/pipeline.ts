@@ -53,6 +53,7 @@ import {
   mergeSupplementalComments,
   mergeSupplementalSummary
 } from "./coverage.js";
+import { normalizeSuggestedPatchText, stripEdgeBlankLines } from "./text.js";
 
 const env = loadEnv();
 
@@ -142,11 +143,11 @@ function buildFeedbackHint(policy: FeedbackPolicy): string {
 function formatInlineComment(comment: ReviewComment): string {
   const marker = `<!-- grepiku:${comment.comment_id} -->`;
   const normalizeSuggestedPatch = (patch: string) => {
-    let normalized = patch.replace(/\\n/g, "\n");
+    let normalized = normalizeSuggestedPatchText(patch);
     normalized = normalized
       .replace(/^```(?:suggestion|diff)?\n?/i, "")
-      .replace(/```$/, "")
-      .trim();
+      .replace(/```$/, "");
+    normalized = stripEdgeBlankLines(normalized);
     const lines = normalized.split("\n");
     const hasDiffMarkers = lines.some(
       (line) =>
@@ -332,11 +333,11 @@ function buildFixPrompt(comments: ReviewComment[]): string {
       .trimEnd();
 
   const normalizeSuggestedPatch = (patch: string) => {
-    let normalized = patch.replace(/\\n/g, "\n");
+    let normalized = normalizeSuggestedPatchText(patch);
     normalized = normalized
       .replace(/^```(?:suggestion|diff)?\n?/i, "")
-      .replace(/```$/, "")
-      .trim();
+      .replace(/```$/, "");
+    normalized = stripEdgeBlankLines(normalized);
     const lines = normalized.split("\n");
     const hasDiffMarkers = lines.some(
       (line) =>

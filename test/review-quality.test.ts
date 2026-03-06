@@ -145,3 +145,63 @@ test("escaped newline sequences are normalized in review text fields", () => {
   assert.equal(refined.comments[0].evidence, "Evidence\nQuote");
   assert.equal(refined.comments[0].suggested_patch, "const x = 1;");
 });
+
+test("double-escaped suggestion indentation and quotes are decoded", () => {
+  const refined = refineReviewComments({
+    comments: [
+      {
+        comment_id: "esc-patch-1",
+        comment_key: "esc-patch-1",
+        path: "src/foo.ts",
+        side: "RIGHT",
+        line: 2,
+        severity: "important",
+        category: "bug",
+        title: "Escaped patch",
+        body: "Fix the branch",
+        evidence: "Quoted evidence",
+        suggested_patch: "\\tif value == \\\"\\\" {\n\\t\\treturn false\n\\t}",
+        comment_type: "inline",
+        confidence: "high"
+      }
+    ],
+    diffIndex,
+    changedFiles: [{ path: "src/foo.ts" }],
+    maxInlineComments: 5,
+    summaryOnly: false,
+    allowedTypes: ["inline", "summary"]
+  });
+
+  assert.equal(refined.comments.length, 1);
+  assert.equal(refined.comments[0].suggested_patch, '\tif value == "" {\n\t\treturn false\n\t}');
+});
+
+test("literal escape sequences inside suggested patch stay intact", () => {
+  const refined = refineReviewComments({
+    comments: [
+      {
+        comment_id: "esc-patch-2",
+        comment_key: "esc-patch-2",
+        path: "src/foo.ts",
+        side: "RIGHT",
+        line: 2,
+        severity: "important",
+        category: "bug",
+        title: "Keep literal escapes",
+        body: "String literal should stay escaped",
+        evidence: "Quoted evidence",
+        suggested_patch: 'fmt.Println("\\\\n", "\\\\t")',
+        comment_type: "inline",
+        confidence: "high"
+      }
+    ],
+    diffIndex,
+    changedFiles: [{ path: "src/foo.ts" }],
+    maxInlineComments: 5,
+    summaryOnly: false,
+    allowedTypes: ["inline", "summary"]
+  });
+
+  assert.equal(refined.comments.length, 1);
+  assert.equal(refined.comments[0].suggested_patch, 'fmt.Println("\\\\n", "\\\\t")');
+});
