@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "url";
 import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
@@ -210,6 +211,27 @@ function baseStageEnv(): NodeJS.ProcessEnv {
   return output;
 }
 
+function forwardStageStream(params: {
+  stream: NodeJS.ReadableStream | null | undefined;
+  stageTag: string;
+  channel: "stdout" | "stderr";
+}): Promise<void> {
+  if (!params.stream) return Promise.resolve();
+  const log = params.channel === "stderr" ? console.error : console.log;
+  const rl = createInterface({
+    input: params.stream,
+    crlfDelay: Infinity
+  });
+  rl.on("line", (line) => {
+    if (line.length === 0) return;
+    log(`${params.stageTag} ${params.channel}: ${line}`);
+  });
+  return new Promise((resolve, reject) => {
+    rl.once("close", () => resolve());
+    rl.once("error", reject);
+  });
+}
+
 export async function runCodexStage(params: CodexRunParams): Promise<void> {
   const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}]`;
   const codexExecPath = await resolveCodexExecPath();
@@ -269,19 +291,55 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
   const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
   const startedAt = Date.now();
   const stageCwd = params.stage === "mention" && params.repoPath ? params.repoPath : params.outDir;
+  let forwarders: Promise<void>[] = [];
   console.log(`${stageTag} starting`);
   try {
-    await execa(codexExecPath, codexArgs, {
+    if (!env.codexStageLogOutput) {
+      await execa(codexExecPath, codexArgs, {
+        input: fullPrompt,
+        stdio: ["pipe", "ignore", "inherit"],
+        cwd: stageCwd,
+        env: stageEnv,
+        timeout: env.codexStageTimeoutMs,
+        killSignal: "SIGTERM",
+        forceKillAfterDelay: 10_000
+      });
+      console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
+      return;
+    }
+
+    const subprocess = execa(codexExecPath, codexArgs, {
       input: fullPrompt,
-      stdio: ["pipe", "ignore", "inherit"],
+      stdout: "pipe",
+      stderr: "pipe",
+      buffer: false,
       cwd: stageCwd,
       env: stageEnv,
       timeout: env.codexStageTimeoutMs,
       killSignal: "SIGTERM",
       forceKillAfterDelay: 10_000
     });
+
+    forwarders = [
+      forwardStageStream({
+        stream: subprocess.stdout,
+        stageTag,
+        channel: "stdout"
+      }),
+      forwardStageStream({
+        stream: subprocess.stderr,
+        stageTag,
+        channel: "stderr"
+      })
+    ];
+
+    await subprocess;
+    await Promise.allSettled(forwarders);
     console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
   } catch (err) {
+    if (forwarders.length > 0) {
+      await Promise.allSettled(forwarders);
+    }
     console.error(`${stageTag} failed in ${Date.now() - startedAt}ms`, err);
     throw err;
   }

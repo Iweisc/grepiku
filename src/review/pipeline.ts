@@ -13,11 +13,10 @@ import {
   buildCoverageReviewerPrompt
 } from "./prompts.js";
 import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
-import { readAndValidateJson, readAndValidateJsonWithFallback } from "./json.js";
+import { readAndValidateJsonWithFallback } from "./json.js";
 import {
   ReviewSchema,
   VerdictsSchema,
-  ChecksSchema,
   ReviewComment,
   ReviewCommentSchema,
   ChecksOutput
@@ -49,6 +48,7 @@ import { refineReviewComments } from "./quality.js";
 import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
 import { buildIncrementalReviewContext } from "./incrementalContext.js";
+import { readVerifierChecks } from "./checks.js";
 import {
   buildCoveragePlan,
   mergeSupplementalComments,
@@ -935,8 +935,7 @@ export async function processReviewJob(data: ReviewJobData) {
       headSha: refreshed.headSha,
       repoId: repo.id,
       reviewRunId: run.id,
-      prNumber,
-      captureLastMessage: false
+      prNumber
     })
       .then(() => ({ ok: true as const }))
       .catch((error: unknown) => ({ ok: false as const, error }));
@@ -1170,11 +1169,12 @@ export async function processReviewJob(data: ReviewJobData) {
     }
 
     const verifierResult = await verifierPromise;
-    if (!verifierResult.ok) {
-      throw verifierResult.error;
-    }
-    const checksPath = path.join(outDir, "checks.json");
-    const checks: ChecksOutput = await readAndValidateJson(checksPath, ChecksSchema);
+    const checks: ChecksOutput = await readVerifierChecks({
+      outDir,
+      headSha: refreshed.headSha,
+      stageError: verifierResult.ok ? undefined : verifierResult.error,
+      logPrefix: `[run ${run.id} pr#${prNumber}]`
+    });
 
     const existingOpenOrFixed = await prisma.finding.findMany({
       where: { pullRequestId: pullRequest.id, status: { in: ["open", "fixed"] } }

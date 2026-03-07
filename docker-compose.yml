@@ -21,6 +21,7 @@ services:
       - postgres
       - grepiku-redis
     environment:
+      PORT: ${PORT:-3005}
       DATABASE_URL: postgresql://grepiku:grepiku@postgres:5432/grepiku
       REDIS_URL: redis://grepiku-redis:6379
     ports:
@@ -41,6 +42,7 @@ services:
       REDIS_URL: redis://grepiku-redis:6379
       PROJECT_ROOT: ${PROJECT_ROOT}
       CODEX_EXEC_PATH: /usr/local/bin/codex-exec
+      CODEX_STAGE_LOG_OUTPUT: "true"
       INTERNAL_API_URL: http://web:${PORT:-3005}/internal/retrieval
       REVIEW_WORKER_CONCURRENCY: 3
       MENTION_WORKER_CONCURRENCY: 3
