@@ -68,6 +68,7 @@ export type ProviderCommit = {
   sha: string;
   message: string;
   authorLogin?: string | null;
+  parentCount?: number;
 };
 
 export type ProviderWebhookEvent =

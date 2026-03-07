@@ -339,7 +339,8 @@ function createClient(params: {
       return {
         sha: response.data.sha,
         message: response.data.commit?.message || "",
-        authorLogin: response.data.author?.login || response.data.commit?.author?.name || null
+        authorLogin: response.data.author?.login || response.data.commit?.author?.name || null,
+        parentCount: response.data.parents?.length ?? undefined
       };
     },
     fetchDiffPatch: async () => {
