@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import yaml from "js-yaml";
+import { jsonrepair } from "jsonrepair";
 import { z } from "zod";
 import { prisma } from "../db/client.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
@@ -369,6 +370,14 @@ export async function loadScopedConfig(params: {
 
 const defaultConfig: RepoConfig = GrepikuSchema.parse({});
 
+function parseJsonConfigText(raw: string): { parsed: unknown; repaired: boolean } {
+  try {
+    return { parsed: JSON.parse(raw), repaired: false };
+  } catch {
+    return { parsed: JSON.parse(jsonrepair(raw)), repaired: true };
+  }
+}
+
 export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoConfig; warnings: string[] }> {
   const warnings: string[] = [];
   const candidates = [
@@ -379,11 +388,30 @@ export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoCo
   for (const candidate of candidates) {
     try {
       const raw = await fs.readFile(candidate.path, "utf8");
-      const parsed = JSON.parse(raw);
+      let parsed: unknown;
+      let repaired = false;
+      try {
+        const result = parseJsonConfigText(raw);
+        parsed = result.parsed;
+        repaired = result.repaired;
+      } catch (parseErr: any) {
+        warnings.push(
+          `config: unable to parse ${candidate.name}: ${parseErr?.message || "invalid JSON"}`
+        );
+        continue;
+      }
       const result = GrepikuSchema.safeParse(parsed);
       if (!result.success) {
-        warnings.push(...result.error.errors.map((err) => `config:${err.path.join(".")}: ${err.message}`));
-        return { config: defaultConfig, warnings };
+        warnings.push(
+          ...result.error.errors.map((err) => {
+            const fieldPath = err.path.length > 0 ? err.path.join(".") : "root";
+            return `config:${candidate.name}:${fieldPath}: ${err.message}`;
+          })
+        );
+        continue;
+      }
+      if (repaired) {
+        warnings.push(`config: repaired malformed ${candidate.name}`);
       }
       if (candidate.legacy) {
         warnings.push(`Using legacy ${candidate.name}; migrate to grepiku.json`);
@@ -392,7 +420,6 @@ export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoCo
     } catch (err: any) {
       if (err?.code !== "ENOENT") {
         warnings.push(`config: ${err.message || `Failed to read ${candidate.name}`}`);
-        return { config: defaultConfig, warnings };
       }
     }
   }
