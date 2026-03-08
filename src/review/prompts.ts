@@ -290,6 +290,8 @@ Do not print anything else. Ensure valid JSON files.`;
 
 export function buildVerifierPrompt(headSha: string, paths: PromptPaths): string {
   return `You are the execution verifier. You can call these tools: read_file, search, lint, build, test.
+The direct callable tool names are exactly \`read_file\`, \`search\`, \`lint\`, \`build\`, and \`test\`; call them directly.
+Do not use resource-listing or planning/todo tools unless the prompt explicitly requires it.
 read_file/search let you inspect repo and bundle outputs; lint/build/test run commands configured in ${paths.repoPath}/grepiku.json (or legacy greptile.json / .prreviewer.yml).
 Each lint/build/test tool may be called at most once; repeated calls return cached results.
 
@@ -300,6 +302,7 @@ Context files:
 - Repo checkout: ${paths.repoPath} (read-only)
 
 Use the inline findings to decide which tools are relevant. If no tool is applicable, mark it "skipped".
+Read the inline findings file directly from the exact path above instead of searching parent directories.
 If a tool cannot be run or verification is otherwise blocked, still write checks.json with status "error" for affected tools.
 
 After running the needed tools, write ${outPath(paths, "checks.json")} with this schema:

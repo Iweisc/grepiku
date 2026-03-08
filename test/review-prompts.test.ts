@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { RepoConfig } from "../src/review/config.js";
-import { buildEditorPrompt, buildReviewerPrompt } from "../src/review/prompts.js";
+import { buildEditorPrompt, buildReviewerPrompt, buildVerifierPrompt } from "../src/review/prompts.js";
 
 const config = {
   limits: {
@@ -61,4 +61,13 @@ test("editor prompt keeps incremental summaries whole-PR oriented", () => {
   assert.match(prompt, /previous_review_context\.json/);
   assert.match(prompt, /Keep the summary whole-PR oriented/i);
   assert.match(prompt, /Do not add comments for older issues unless they are evidenced by the current diff\.patch/i);
+});
+
+test("verifier prompt names direct tools and discourages discovery calls", () => {
+  const prompt = buildVerifierPrompt("head123", paths);
+
+  assert.match(prompt, /You can call these tools: read_file, search, lint, build, test\./);
+  assert.match(prompt, /direct callable tool names are exactly/i);
+  assert.match(prompt, /Do not use resource-listing or planning\/todo tools/i);
+  assert.match(prompt, /Read the inline findings file directly from the exact path above/i);
 });

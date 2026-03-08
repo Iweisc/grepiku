@@ -42,9 +42,9 @@ const STAGE_ENV_ALLOWLIST = [
 
 function systemPrompt(stage: CodexStage, roots: string[]): string {
   const toolNote = (() => {
-    if (stage === "verifier") return "Tools available: readonly, verifier.";
-    if (stage === "mention") return "Tools available: readonly, retrieval, shell, apply_patch.";
-    return "Tools available: readonly, retrieval.";
+    if (stage === "verifier") return "Available tool names: read_file, search, lint, build, test.";
+    if (stage === "mention") return "Available tool names: read_file, search, retrieve_context, shell, apply_patch.";
+    return "Available tool names: read_file, search, retrieve_context.";
   })();
   const writeInstruction =
     stage === "mention"
@@ -57,6 +57,8 @@ function systemPrompt(stage: CodexStage, roots: string[]): string {
     toolNote,
     `Allowed file roots: ${allowedRoots}.`,
     "Never access paths outside allowed roots.",
+    "Use the listed tool names directly; do not refer to MCP server names.",
+    "Do not call resource-listing or planning/todo tools unless the prompt explicitly asks for them.",
     "If a tool call fails due to ENOENT or bad path, correct the path and retry.",
     "Never fabricate file contents. Use tools to read files.",
     writeInstruction
@@ -107,15 +109,18 @@ function tomlInlineTable(values: Record<string, string | undefined>): string | n
 function mcpServerBlock(
   name: string,
   scriptName: string,
-  serverEnv: Record<string, string | undefined>
+  serverEnv: Record<string, string | undefined>,
+  options?: { startupTimeoutSec?: number; toolTimeoutSec?: number }
 ): string {
+  const startupTimeoutSec = options?.startupTimeoutSec ?? 10;
+  const toolTimeoutSec = options?.toolTimeoutSec ?? 10;
   const envInline = tomlInlineTable(serverEnv);
   const lines = [
     `[mcp_servers.${name}]`,
     `command = ${tomlString("node")}`,
     `args = [${tomlString(mcpScriptPath(scriptName))}]`,
-    "startup_timeout_sec = 10",
-    "tool_timeout_sec = 10"
+    `startup_timeout_sec = ${startupTimeoutSec}`,
+    `tool_timeout_sec = ${toolTimeoutSec}`
   ];
   if (envInline) {
     lines.push(`env = ${envInline}`);
@@ -174,6 +179,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
   }
   if (stage === "verifier") {
     const base = baseConfig();
+    const verifierToolTimeoutSec = Math.max(30, Math.ceil(env.codexStageTimeoutMs / 1000));
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -182,7 +188,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
         WORK_OUT_ROOT: params.outDir,
         DATABASE_URL: env.databaseUrl,
         REVIEW_RUN_ID: String(params.reviewRunId)
-      })
+      }, { toolTimeoutSec: verifierToolTimeoutSec })
     );
   }
   if (stage === "mention") {

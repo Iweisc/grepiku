@@ -3,6 +3,7 @@ import { spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
 import yaml from "js-yaml";
+import { jsonrepair } from "jsonrepair";
 import pg from "pg";
 
 const repoRoot = path.resolve(process.env.WORK_REPO_ROOT || "/work/repo");
@@ -12,17 +13,17 @@ const repoRw = path.join(outRoot, "repo_rw");
 const tools = [
   {
     name: "lint",
-    description: "Run lint command configured in .prreviewer.yml",
+    description: "Run lint command configured in grepiku.json or legacy repo config",
     inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
     name: "build",
-    description: "Run build command configured in .prreviewer.yml",
+    description: "Run build command configured in grepiku.json or legacy repo config",
     inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
     name: "test",
-    description: "Run test command configured in .prreviewer.yml",
+    description: "Run test command configured in grepiku.json or legacy repo config",
     inputSchema: { type: "object", properties: {}, required: [] }
   }
 ];
@@ -41,24 +42,29 @@ function asText(text) {
   return { content: [{ type: "text", text }] };
 }
 
+function parseJsonConfig(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return JSON.parse(jsonrepair(raw));
+  }
+}
+
 async function loadRepoConfig() {
   const candidates = ["grepiku.json", "greptile.json"];
   for (const name of candidates) {
     try {
       const raw = await fs.readFile(path.join(repoRoot, name), "utf8");
-      const parsed = JSON.parse(raw);
-      return parsed;
+      return parseJsonConfig(raw);
     } catch (err) {
-      if (err?.code && err.code !== "ENOENT") {
-        return {};
-      }
+      if (err?.code === "ENOENT") continue;
     }
   }
   try {
     const legacyPath = path.join(repoRoot, ".prreviewer.yml");
     const raw = await fs.readFile(legacyPath, "utf8");
-    const parsed = (yaml.load(raw) || {}) as any;
-    return parsed;
+    const parsed = yaml.load(raw) || {};
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }

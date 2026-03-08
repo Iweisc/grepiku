@@ -923,22 +923,7 @@ export async function processReviewJob(data: ReviewJobData) {
       bundleDir,
       outDir
     };
-
-    const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
-    const verifierPromise = runCodexStage({
-      stage: "verifier",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: checksPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
-    })
-      .then(() => ({ ok: true as const }))
-      .catch((error: unknown) => ({ ok: false as const, error }));
+    let verifierPromise!: Promise<{ ok: true } | { ok: false; error: unknown }>;
 
     const [feedbackPolicy, repoWeights] = await Promise.all([
       getFeedbackPolicy(repo.id),
@@ -1141,6 +1126,22 @@ export async function processReviewJob(data: ReviewJobData) {
       JSON.stringify(inlineContext, null, 2),
       "utf8"
     );
+
+    const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
+    verifierPromise = runCodexStage({
+      stage: "verifier",
+      repoPath,
+      bundleDir,
+      outDir,
+      codexHomeDir,
+      prompt: checksPrompt,
+      headSha: refreshed.headSha,
+      repoId: repo.id,
+      reviewRunId: run.id,
+      prNumber
+    })
+      .then(() => ({ ok: true as const }))
+      .catch((error: unknown) => ({ ok: false as const, error }));
 
     const patternMatches = contextPack.retrieved
       .filter((item) => item.isPattern)
