@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractMentionDoTask } from "../src/review/triggers.js";
+import { detectCommentTrigger, extractMentionDoTask } from "../src/review/triggers.js";
 import type { RepoConfig } from "../src/review/config.js";
 
 const baseConfig: RepoConfig = {
@@ -67,4 +67,34 @@ test("extractMentionDoTask captures multiline command body", () => {
 test("extractMentionDoTask ignores plain mentions without do prefix", () => {
   const task = extractMentionDoTask("@grepiku what changed in this PR?", baseConfig);
   assert.equal(task, null);
+});
+
+test("extractMentionDoTask requires standalone mention tokens", () => {
+  assert.equal(
+    extractMentionDoTask("Contact dev@grepiku do: add tests", baseConfig),
+    null
+  );
+  assert.equal(
+    extractMentionDoTask("The path /tmp/@grepiku do: add tests is not a command", baseConfig),
+    null
+  );
+});
+
+test("detectCommentTrigger requires standalone trigger tokens", () => {
+  assert.equal(
+    detectCommentTrigger("The failing path is /reviewer/index.ts", baseConfig),
+    null
+  );
+  assert.equal(
+    detectCommentTrigger("Contact dev@grepiku.com for logs", baseConfig),
+    null
+  );
+  assert.equal(
+    detectCommentTrigger("Please run /review on this branch", baseConfig),
+    "review"
+  );
+  assert.equal(
+    detectCommentTrigger("Can @grepiku summarize the latest diff?", baseConfig),
+    "mention"
+  );
 });

@@ -105,6 +105,14 @@ test("collectScopedConfigPaths handles deeply nested paths", () => {
   assert.equal(paths[3], path.join("/repo/a", ".grepiku", "config.json"));
 });
 
+test("collectScopedConfigPaths does not walk sibling directories that only share a string prefix", () => {
+  const repoPath = "/repo";
+  const filePath = "/repo-copy/src/file.ts";
+  const paths = collectScopedConfigPaths(repoPath, filePath);
+
+  assert.deepEqual(paths, []);
+});
+
 // --- mergeScopedOverride ---
 
 test("mergeScopedOverride overrides strictness", () => {

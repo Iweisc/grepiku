@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   buildVerifierErrorChecks,
+  buildVerifierSkippedChecks,
   readVerifierChecks
 } from "../src/review/checks.js";
 
@@ -20,6 +21,22 @@ test("buildVerifierErrorChecks marks all tools as error", () => {
     status: "error",
     summary: "verifier failed",
     top_errors: ["boom"]
+  });
+  assert.deepEqual(checks.checks.build, checks.checks.lint);
+  assert.deepEqual(checks.checks.test, checks.checks.lint);
+});
+
+test("buildVerifierSkippedChecks marks all tools as skipped", () => {
+  const checks = buildVerifierSkippedChecks({
+    headSha: "fork123",
+    summary: "skipped for fork pull request"
+  });
+
+  assert.equal(checks.head_sha, "fork123");
+  assert.deepEqual(checks.checks.lint, {
+    status: "skipped",
+    summary: "skipped for fork pull request",
+    top_errors: []
   });
   assert.deepEqual(checks.checks.build, checks.checks.lint);
   assert.deepEqual(checks.checks.test, checks.checks.lint);
