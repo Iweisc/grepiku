@@ -5,53 +5,51 @@ import { resolveWebhookEvent } from "./providers/webhookRouter.js";
 import { handleWebhookEvent } from "./providers/webhookHandler.js";
 import { registerInternalApi } from "./server/internal.js";
 import { registerDashboard } from "./server/dashboard.js";
+import { registerWebhookRoute } from "./server/webhookRoute.js";
 
 const env = loadEnv();
 
-const app = Fastify({
-  logger: {
-    level: env.logLevel
-  }
-});
+export function buildApp() {
+  const app = Fastify({
+    logger: {
+      level: env.logLevel
+    }
+  });
 
-app.addContentTypeParser("application/json", { parseAs: "buffer" }, (req, body, done) => {
-  if (req.url === "/webhooks") {
-    done(null, body);
-    return;
-  }
-  try {
-    const parsed = JSON.parse(body.toString("utf8"));
-    done(null, parsed);
-  } catch (err) {
-    done(err as Error, undefined);
-  }
-});
-
-app.post("/webhooks", async (request, reply) => {
-  const payload = (request.body as Buffer).toString("utf8");
-  try {
-    const event = await resolveWebhookEvent({
-      headers: request.headers as Record<string, string | string[] | undefined>,
-      body: payload
-    });
-    if (!event) {
-      reply.code(400).send({ error: "Unsupported webhook event" });
+  app.addContentTypeParser("application/json", { parseAs: "buffer" }, (req, body, done) => {
+    if (req.url === "/webhooks") {
+      done(null, body);
       return;
     }
-    await handleWebhookEvent(event);
-    reply.code(200).send({ ok: true });
-  } catch (err) {
-    request.log.error({ err }, "Webhook handling failed");
-    reply.code(401).send({ error: "Invalid webhook signature" });
-  }
-});
+    try {
+      const parsed = JSON.parse(body.toString("utf8"));
+      done(null, parsed);
+    } catch (err) {
+      done(err as Error, undefined);
+    }
+  });
 
-registerInternalApi(app);
-registerDashboard(app);
+  registerWebhookRoute(app, {
+    resolveWebhookEvent,
+    handleWebhookEvent
+  });
 
-app.get("/healthz", async () => ({ ok: true }));
+  registerInternalApi(app);
+  registerDashboard(app);
 
-app.listen({ port: env.port, host: "0.0.0.0" }).catch((err) => {
-  app.log.error(err, "Failed to start server");
-  process.exit(1);
-});
+  app.get("/healthz", async () => ({ ok: true }));
+  return app;
+}
+
+const isEntryPoint =
+  import.meta.url === `file://${process.argv[1]}` ||
+  process.argv[1]?.endsWith("server.ts") ||
+  process.argv[1]?.endsWith("server.js");
+
+if (isEntryPoint) {
+  const app = buildApp();
+  app.listen({ port: env.port, host: "0.0.0.0" }).catch((err) => {
+    app.log.error(err, "Failed to start server");
+    process.exit(1);
+  });
+}

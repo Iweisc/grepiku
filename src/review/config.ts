@@ -3,8 +3,11 @@ import path from "path";
 import yaml from "js-yaml";
 import { jsonrepair } from "jsonrepair";
 import { z } from "zod";
+import { execa } from "execa";
 import { prisma } from "../db/client.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
+import { sanitizePatternRepositories } from "./patternRepositories.js";
+import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
 
 export type ToolConfig = {
   cmd: string;
@@ -298,7 +301,11 @@ export function collectScopedConfigPaths(repoPath: string, filePath: string): st
   let dir = path.dirname(path.resolve(filePath));
   const paths: string[] = [];
 
-  while (dir.startsWith(resolved) && dir !== resolved) {
+  while (dir !== resolved) {
+    const relative = path.relative(resolved, dir);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      break;
+    }
     paths.push(path.join(dir, ".grepiku", "config.json"));
     dir = path.dirname(dir);
   }
@@ -344,7 +351,7 @@ export async function loadScopedConfig(params: {
   const overrides: ScopedOverride[] = [];
   for (const configPath of configPaths) {
     try {
-      const raw = await fs.readFile(configPath, "utf8");
+      const raw = await readConfigFileWithinLimit(configPath, MAX_REPO_CONFIG_BYTES);
       const parsed = JSON.parse(raw);
       // Strip non-overridable keys before validation
       const scoped: Record<string, unknown> = {};
@@ -369,6 +376,15 @@ export async function loadScopedConfig(params: {
 }
 
 const defaultConfig: RepoConfig = GrepikuSchema.parse({});
+const MAX_REPO_CONFIG_BYTES = 1_000_000;
+const JSON_CONFIG_CANDIDATES = [
+  { repoRelativePath: "grepiku.json", name: "grepiku.json", legacy: false },
+  { repoRelativePath: "greptile.json", name: "greptile.json", legacy: true }
+] as const;
+const LEGACY_YAML_CONFIG = {
+  repoRelativePath: ".prreviewer.yml",
+  name: ".prreviewer.yml"
+} as const;
 
 function parseJsonConfigText(raw: string): { parsed: unknown; repaired: boolean } {
   try {
@@ -378,45 +394,147 @@ function parseJsonConfigText(raw: string): { parsed: unknown; repaired: boolean 
   }
 }
 
+function configFileLimitError(filePath: string, maxBytes: number): Error {
+  return new Error(`config file exceeded byte limit (${maxBytes} bytes): ${filePath}`);
+}
+
+async function readConfigFileWithinLimit(filePath: string, maxBytes: number): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size > maxBytes) {
+      throw configFileLimitError(filePath, maxBytes);
+    }
+    const buffer = Buffer.alloc(Math.max(0, Number(stat.size)));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseStructuredConfigCandidate(params: {
+  raw: string;
+  name: string;
+  legacy: boolean;
+  warnings: string[];
+}): RepoConfig | null {
+  let parsed: unknown;
+  let repaired = false;
+  try {
+    const result = parseJsonConfigText(params.raw);
+    parsed = result.parsed;
+    repaired = result.repaired;
+  } catch (parseErr: any) {
+    params.warnings.push(
+      `config: unable to parse ${params.name}: ${parseErr?.message || "invalid JSON"}`
+    );
+    return null;
+  }
+
+  const result = GrepikuSchema.safeParse(parsed);
+  if (!result.success) {
+    params.warnings.push(
+      ...result.error.errors.map((err) => {
+        const fieldPath = err.path.length > 0 ? err.path.join(".") : "root";
+        return `config:${params.name}:${fieldPath}: ${err.message}`;
+      })
+    );
+    return null;
+  }
+
+  if (repaired) {
+    params.warnings.push(`config: repaired malformed ${params.name}`);
+  }
+  if (params.legacy) {
+    params.warnings.push(`Using legacy ${params.name}; migrate to grepiku.json`);
+  }
+  return {
+    ...result.data,
+    patternRepositories: sanitizePatternRepositories(result.data.patternRepositories, {
+      warnings: params.warnings,
+      warningPrefix: `config:${params.name}`
+    })
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function buildLegacyYamlConfig(raw: string, warnings: string[]): RepoConfig | null {
+  const parsed = (yaml.load(raw, { schema: yaml.JSON_SCHEMA }) || {}) as Record<string, unknown>;
+  warnings.push("Using legacy .prreviewer.yml; migrate to grepiku.json");
+
+  const legacyCandidate: Record<string, unknown> = {};
+  if ("ignore" in parsed) {
+    legacyCandidate.ignore = parsed.ignore;
+  }
+  if (isRecord(parsed.graph)) {
+    legacyCandidate.graph = {};
+    if ("exclude_dirs" in parsed.graph) {
+      (legacyCandidate.graph as Record<string, unknown>).exclude_dirs = parsed.graph.exclude_dirs;
+    }
+    if ("traversal" in parsed.graph) {
+      (legacyCandidate.graph as Record<string, unknown>).traversal = parsed.graph.traversal;
+    }
+  }
+  if ("tools" in parsed) {
+    legacyCandidate.tools = parsed.tools;
+  }
+  if ("limits" in parsed) {
+    legacyCandidate.limits = parsed.limits;
+  }
+
+  const result = GrepikuSchema.safeParse(legacyCandidate);
+  if (!result.success) {
+    warnings.push(
+      ...result.error.errors.map((err) => {
+        const fieldPath = err.path.length > 0 ? err.path.join(".") : "root";
+        return `config:${LEGACY_YAML_CONFIG.name}:${fieldPath}: ${err.message}`;
+      })
+    );
+    return null;
+  }
+
+  return result.data;
+}
+
+async function readGitFileAtRef(
+  repoPath: string,
+  ref: string,
+  repoRelativePath: string
+): Promise<string | null> {
+  try {
+    const { stdout } = await execa(
+      "git",
+      ["-C", repoPath, "show", `${ref}:${repoRelativePath}`],
+      { stdio: ["ignore", "pipe", "ignore"], env: gitCheckoutSafetyEnv(), maxBuffer: 1024 * 1024 * 5 }
+    );
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
 export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoConfig; warnings: string[] }> {
   const warnings: string[] = [];
-  const candidates = [
-    { path: path.join(repoPath, "grepiku.json"), name: "grepiku.json", legacy: false },
-    { path: path.join(repoPath, "greptile.json"), name: "greptile.json", legacy: true }
-  ];
 
-  for (const candidate of candidates) {
+  for (const candidate of JSON_CONFIG_CANDIDATES) {
     try {
-      const raw = await fs.readFile(candidate.path, "utf8");
-      let parsed: unknown;
-      let repaired = false;
-      try {
-        const result = parseJsonConfigText(raw);
-        parsed = result.parsed;
-        repaired = result.repaired;
-      } catch (parseErr: any) {
-        warnings.push(
-          `config: unable to parse ${candidate.name}: ${parseErr?.message || "invalid JSON"}`
-        );
-        continue;
+      const raw = await readConfigFileWithinLimit(
+        path.join(repoPath, candidate.repoRelativePath),
+        MAX_REPO_CONFIG_BYTES
+      );
+      const parsed = parseStructuredConfigCandidate({
+        raw,
+        name: candidate.name,
+        legacy: candidate.legacy,
+        warnings
+      });
+      if (parsed) {
+        return { config: parsed, warnings };
       }
-      const result = GrepikuSchema.safeParse(parsed);
-      if (!result.success) {
-        warnings.push(
-          ...result.error.errors.map((err) => {
-            const fieldPath = err.path.length > 0 ? err.path.join(".") : "root";
-            return `config:${candidate.name}:${fieldPath}: ${err.message}`;
-          })
-        );
-        continue;
-      }
-      if (repaired) {
-        warnings.push(`config: repaired malformed ${candidate.name}`);
-      }
-      if (candidate.legacy) {
-        warnings.push(`Using legacy ${candidate.name}; migrate to grepiku.json`);
-      }
-      return { config: result.data, warnings };
     } catch (err: any) {
       if (err?.code !== "ENOENT") {
         warnings.push(`config: ${err.message || `Failed to read ${candidate.name}`}`);
@@ -425,47 +543,73 @@ export async function loadRepoConfig(repoPath: string): Promise<{ config: RepoCo
   }
 
   // fallback to legacy .prreviewer.yml if present
-  const legacyPath = path.join(repoPath, ".prreviewer.yml");
   try {
-    const raw = await fs.readFile(legacyPath, "utf8");
-    const parsed = (yaml.load(raw) || {}) as any;
-    const legacy: RepoConfig = {
-      ...defaultConfig,
-      ignore: Array.isArray(parsed.ignore) ? parsed.ignore : defaultConfig.ignore,
-      graph: {
-        exclude_dirs: Array.isArray(parsed.graph?.exclude_dirs)
-          ? parsed.graph.exclude_dirs
-          : defaultConfig.graph.exclude_dirs,
-        traversal: {
-          ...defaultConfig.graph.traversal,
-          ...(typeof parsed.graph?.traversal === "object" && parsed.graph?.traversal
-            ? parsed.graph.traversal
-            : {})
-        }
-      },
-      tools: {
-        lint: parsed.tools?.lint,
-        build: parsed.tools?.build,
-        test: parsed.tools?.test
-      },
-      limits: {
-        max_inline_comments:
-          parsed.limits?.max_inline_comments ?? defaultConfig.limits.max_inline_comments,
-        max_key_concerns:
-          parsed.limits?.max_key_concerns ?? defaultConfig.limits.max_key_concerns
-      }
-    };
-    warnings.push("Using legacy .prreviewer.yml; migrate to grepiku.json");
-    return { config: legacy, warnings };
-  } catch {
+    const raw = await readConfigFileWithinLimit(
+      path.join(repoPath, LEGACY_YAML_CONFIG.repoRelativePath),
+      MAX_REPO_CONFIG_BYTES
+    );
+    const parsed = buildLegacyYamlConfig(raw, warnings);
+    if (parsed) {
+      return { config: parsed, warnings };
+    }
+    return { config: defaultConfig, warnings };
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      warnings.push(`config: ${err.message || `Failed to read ${LEGACY_YAML_CONFIG.name}`}`);
+    }
     return { config: defaultConfig, warnings };
   }
+}
+
+export async function loadRepoConfigAtGitRef(
+  repoPath: string,
+  ref: string | null | undefined
+): Promise<{ config: RepoConfig; warnings: string[] }> {
+  const normalizedRef = ref?.trim();
+  if (!normalizedRef) {
+    return { config: defaultConfig, warnings: [] };
+  }
+
+  const warnings: string[] = [];
+
+  for (const candidate of JSON_CONFIG_CANDIDATES) {
+    const raw = await readGitFileAtRef(repoPath, normalizedRef, candidate.repoRelativePath);
+    if (raw == null) continue;
+    const parsed = parseStructuredConfigCandidate({
+      raw,
+      name: candidate.name,
+      legacy: candidate.legacy,
+      warnings
+    });
+    if (parsed) {
+      return { config: parsed, warnings };
+    }
+  }
+
+  const legacyRaw = await readGitFileAtRef(repoPath, normalizedRef, LEGACY_YAML_CONFIG.repoRelativePath);
+  if (legacyRaw != null) {
+    try {
+      const parsed = buildLegacyYamlConfig(legacyRaw, warnings);
+      if (parsed) {
+        return { config: parsed, warnings };
+      }
+    } catch (err: any) {
+      warnings.push(`config: ${err?.message || `Failed to parse ${LEGACY_YAML_CONFIG.name}`}`);
+    }
+  }
+
+  return { config: defaultConfig, warnings };
 }
 
 export async function resolveRepoConfig(repoId: number, providerKind?: string): Promise<RepoConfig> {
   const existing = await prisma.repoConfig.findFirst({ where: { repoId } });
   const parsed = GrepikuSchema.safeParse(existing?.configJson ?? {});
-  let config = parsed.success ? parsed.data : defaultConfig;
+  let config = parsed.success
+    ? {
+        ...parsed.data,
+        patternRepositories: sanitizePatternRepositories(parsed.data.patternRepositories)
+      }
+    : defaultConfig;
   const triggerSetting = await prisma.triggerSetting.findFirst({ where: { repoId } });
   if (triggerSetting?.configJson) {
     config = { ...config, triggers: triggerSetting.configJson as RepoConfig["triggers"] };

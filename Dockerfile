@@ -14,8 +14,13 @@ RUN cargo build -p codex-exec --release --locked
 
 FROM node:20-bookworm AS deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM node:20-bookworm AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 FROM node:20-bookworm AS build
 WORKDIR /app
@@ -32,7 +37,9 @@ RUN apt-get update \
   && apt-get install -y ripgrep git ca-certificates libcap2 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=codex-build /opt/codex/target/release/codex-exec /usr/local/bin/codex-exec
-COPY --from=build /app/node_modules ./node_modules
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
 COPY docker/codex-runner/tools ./docker/codex-runner/tools

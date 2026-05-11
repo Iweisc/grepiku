@@ -206,7 +206,7 @@ function canTraverseDirection(edgeType: string, direction: "out" | "in"): boolea
 }
 
 function normalizeGraphPath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/");
+  return value.replace(/^\.\//, "").replace(/\/+/g, "/");
 }
 
 function normalizeContextPath(value: string): string {

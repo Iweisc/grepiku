@@ -3,6 +3,7 @@ import { Worker } from "bullmq";
 import { mentionQueue, redisConnection } from "../queue/index.js";
 import { processCommentReplyJob } from "../review/mentions.js";
 import { loadEnv } from "../config/env.js";
+import { sanitizeGithubGitAuthError } from "../github/gitAuth.js";
 
 const env = loadEnv();
 
@@ -18,7 +19,7 @@ const worker = new Worker(
 );
 
 worker.on("failed", (job, err) => {
-  console.error(`Mention reply job ${job?.id} failed`, err);
+  console.error(`Mention reply job ${job?.id} failed`, sanitizeGithubGitAuthError(err));
 });
 
 worker.on("completed", (job) => {

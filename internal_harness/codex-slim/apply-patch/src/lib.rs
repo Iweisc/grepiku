@@ -274,6 +274,43 @@ pub struct AffectedPaths {
     pub deleted: Vec<PathBuf>,
 }
 
+fn ensure_no_symlink_components(path: &Path, allow_final_symlink: bool) -> anyhow::Result<()> {
+    let components: Vec<_> = path.components().collect();
+    let last_index = components.len().saturating_sub(1);
+    let mut current = PathBuf::new();
+
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::RootDir => {
+                current.push(Path::new("/"));
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                current.pop();
+                continue;
+            }
+            _ => current.push(component.as_os_str()),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if allow_final_symlink && index == last_index {
+                    continue;
+                }
+                anyhow::bail!("Refusing to apply patch through symlink path {}", current.display());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect {}", current.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Apply the hunks to the filesystem, returning which files were added, modified, or deleted.
 /// Returns an error if the patch could not be applied.
 fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
@@ -287,6 +324,7 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
     for hunk in hunks {
         match hunk {
             Hunk::AddFile { path, contents } => {
+                ensure_no_symlink_components(path, false)?;
                 if let Some(parent) = path.parent()
                     && !parent.as_os_str().is_empty()
                 {
@@ -299,6 +337,7 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
                 added.push(path.clone());
             }
             Hunk::DeleteFile { path } => {
+                ensure_no_symlink_components(path, true)?;
                 std::fs::remove_file(path)
                     .with_context(|| format!("Failed to delete file {}", path.display()))?;
                 deleted.push(path.clone());
@@ -308,9 +347,11 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
                 move_path,
                 chunks,
             } => {
+                ensure_no_symlink_components(path, false)?;
                 let AppliedPatch { new_contents, .. } =
                     derive_new_contents_from_chunks(path, chunks)?;
                 if let Some(dest) = move_path {
+                    ensure_no_symlink_components(dest, false)?;
                     if let Some(parent) = dest.parent()
                         && !parent.as_os_str().is_empty()
                     {
@@ -669,6 +710,57 @@ mod tests {
         assert!(!src.exists());
         let contents = fs::read_to_string(&dest).unwrap();
         assert_eq!(contents, "line2\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_file_hunk_rejects_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        fs::write(&target, "before\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let patch = wrap_patch(&format!(
+            r#"*** Update File: {}
+@@
+-before
++after"#,
+            link.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let err = apply_patch(&patch, &mut stdout, &mut stderr).unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_add_file_hunk_rejects_symlink_parent_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let link_dir = dir.path().join("linkdir");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &link_dir).unwrap();
+
+        let new_file = link_dir.join("escape.txt");
+        let patch = wrap_patch(&format!(
+            r#"*** Add File: {}
++escape"#,
+            new_file.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let err = apply_patch(&patch, &mut stdout, &mut stderr).unwrap_err();
+
+        assert!(err.to_string().contains("symlink"));
+        assert!(!outside.join("escape.txt").exists());
     }
 
     /// Verify that a single `Update File` hunk with multiple change chunks can update different

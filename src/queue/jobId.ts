@@ -28,3 +28,20 @@ export function buildReviewJobId(data: any): string {
   const mode = data?.force ? "force" : "auto";
   return `review_${repoId}_${pullRequestId}_${headSha}_${mode}`;
 }
+
+export function buildCommentReplyJobId(data: any): string {
+  const provider = sanitizeJobToken(String(data?.provider ?? "unknown"), 24) || "unknown";
+  const pullRequestId = sanitizeJobToken(String(data?.pullRequestId ?? "unknown"), 24) || "unknown";
+  const commentId = sanitizeJobToken(String(data?.commentId ?? "unknown"), 48) || "unknown";
+  return `comment_${provider}_${pullRequestId}_${commentId}`;
+}
+
+export function buildGraphJobId(data: any): string {
+  const repoId = sanitizeJobToken(String(data?.repoId ?? "unknown"), 24) || "unknown";
+  return `graph_${repoId}`;
+}
+
+export function buildAnalyticsJobId(data: any): string {
+  const reviewRunId = sanitizeJobToken(String(data?.reviewRunId ?? "unknown"), 24) || "unknown";
+  return `analytics_${reviewRunId}`;
+}

@@ -2,6 +2,17 @@ import { createInterface } from "readline";
 import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
+import { resolveAllowedPath } from "./path_guard.js";
+import {
+  buildReadonlySearchArgs,
+  createReadonlySearchCollector,
+  normalizeReadonlyReadBytes,
+  normalizeReadonlySearchMaxResults
+} from "./readonly_args.js";
+import {
+  buildSensitiveReadonlySearchGlobs,
+  shouldBlockSensitiveRepoPath
+} from "./readonly_sensitive_paths.js";
 
 const repoRoot = path.resolve(process.env.WORK_REPO_ROOT || "/work/repo");
 const bundleRoot = path.resolve(process.env.WORK_BUNDLE_ROOT || "/work/bundle");
@@ -52,19 +63,24 @@ function asText(text) {
   return { content: [{ type: "text", text }] };
 }
 
-function resolveAllowedPath(inputPath, roots) {
-  const resolved = path.isAbsolute(inputPath)
-    ? path.resolve(inputPath)
-    : path.resolve(repoRoot, inputPath);
-  const isAllowed = roots.some((root) => resolved.startsWith(root));
-  if (!isAllowed) {
-    throw new Error("Path escapes allowed roots");
+function isWithinRoot(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function repoRelativePathForTarget(target) {
+  if (!isWithinRoot(repoRoot, target)) {
+    return null;
   }
-  return resolved;
+  return path.relative(repoRoot, target).replace(/\\/g, "/");
 }
 
 async function handleReadFile(args) {
-  const target = resolveAllowedPath(args.path, readRoots);
+  const target = await resolveAllowedPath(args.path, { baseRoot: repoRoot, roots: readRoots });
+  const repoRelativePath = repoRelativePathForTarget(target);
+  if (repoRelativePath && shouldBlockSensitiveRepoPath(repoRelativePath)) {
+    throw new Error("Path not allowed in repo");
+  }
   if (target.startsWith(outRoot)) {
     const isAllowedOutput =
       target.endsWith(".json") || target.endsWith(".txt");
@@ -72,40 +88,80 @@ async function handleReadFile(args) {
       throw new Error("Path not allowed in output dir");
     }
   }
-  const maxBytes = Number.isInteger(args.max_bytes) ? args.max_bytes : 20000;
-  const data = await fs.readFile(target);
-  const sliced = data.slice(0, maxBytes).toString("utf8");
-  return asText(sliced);
+  const maxBytes = normalizeReadonlyReadBytes(args.max_bytes);
+  const handle = await fs.open(target, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return asText(buffer.subarray(0, bytesRead).toString("utf8"));
+  } finally {
+    await handle.close();
+  }
 }
 
 async function runRipgrep(args) {
   const query = args.query;
-  const maxResults = Number.isInteger(args.max_results) ? args.max_results : 50;
-  const searchRoot = args.path ? resolveAllowedPath(args.path, searchRoots) : repoRoot;
-
-  const rgArgs = ["--no-heading", "--line-number", "--color", "never", query, searchRoot];
-  if (args.glob) {
-    rgArgs.splice(0, 0, "--glob", args.glob);
+  const maxResults = normalizeReadonlySearchMaxResults(args.max_results);
+  const searchRoot = args.path
+    ? await resolveAllowedPath(args.path, { baseRoot: repoRoot, roots: searchRoots })
+    : repoRoot;
+  const repoRelativeSearchRoot = repoRelativePathForTarget(searchRoot);
+  if (
+    repoRelativeSearchRoot &&
+    repoRelativeSearchRoot.length > 0 &&
+    shouldBlockSensitiveRepoPath(repoRelativeSearchRoot)
+  ) {
+    return asText("No matches");
   }
+  const searchRootStat = await fs.stat(searchRoot).catch(() => null);
+  const searchBasePath =
+    searchRootStat?.isDirectory() === true ? searchRoot : path.dirname(searchRoot);
+
+  const rgArgs = buildReadonlySearchArgs({
+    query,
+    glob: args.glob,
+    searchRoot,
+    maxResults,
+    extraGlobs: repoRelativeSearchRoot !== null ? buildSensitiveReadonlySearchGlobs() : []
+  });
 
   const proc = spawn("rg", rgArgs, { stdio: ["ignore", "pipe", "pipe"] });
-  let stdout = "";
+  const collector = createReadonlySearchCollector({
+    maxResults,
+    includeMatch: ({ path: matchPath }) => {
+      if (repoRelativeSearchRoot === null) {
+        return true;
+      }
+      const absolutePath = path.isAbsolute(matchPath)
+        ? path.resolve(matchPath)
+        : path.resolve(searchBasePath, matchPath);
+      const repoRelativePath = repoRelativePathForTarget(absolutePath);
+      if (!repoRelativePath) {
+        return true;
+      }
+      return !shouldBlockSensitiveRepoPath(repoRelativePath);
+    }
+  });
   let stderr = "";
+  let stoppedEarly = false;
 
   proc.stdout.on("data", (d) => {
-    stdout += d.toString("utf8");
+    if (collector.pushChunk(d) && !stoppedEarly) {
+      stoppedEarly = true;
+      proc.kill("SIGKILL");
+    }
   });
   proc.stderr.on("data", (d) => {
     stderr += d.toString("utf8");
   });
 
   const code = await new Promise((resolve) => proc.on("close", resolve));
-  if (code !== 0 && stdout.trim().length === 0) {
+  const stdout = collector.finish().trim();
+  if (!stoppedEarly && code !== 0 && stdout.length === 0) {
     return asText(stderr.trim() || "No matches");
   }
 
-  const lines = stdout.trim().split("\n").filter(Boolean).slice(0, maxResults);
-  return asText(lines.join("\n"));
+  return asText(stdout);
 }
 
 const rl = createInterface({ input: process.stdin });

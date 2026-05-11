@@ -2,21 +2,20 @@ import "dotenv/config";
 import { Worker } from "bullmq";
 import { redisConnection, reviewQueue } from "../queue/index.js";
 import { processReviewJob } from "../review/pipeline.js";
-import { enqueueCommentReplyJob } from "../queue/enqueue.js";
 import { loadEnv } from "../config/env.js";
+import { sanitizeGithubGitAuthError } from "../github/gitAuth.js";
 
 const env = loadEnv();
 
 process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled rejection in review worker", reason);
+  console.error("Unhandled rejection in review worker", sanitizeGithubGitAuthError(reason));
 });
 
 const worker = new Worker(
   reviewQueue.name,
   async (job) => {
-    if (job.name === "comment-reply") {
-      console.warn(`Review queue received legacy comment-reply job ${job.id}; forwarding to mention queue`);
-      await enqueueCommentReplyJob(job.data);
+    if (job.name !== "review") {
+      console.warn(`Review queue received unexpected legacy job ${job.name} (${job.id}); dropping`);
       return;
     }
     await processReviewJob(job.data);
@@ -28,7 +27,7 @@ const worker = new Worker(
 );
 
 worker.on("failed", (job, err) => {
-  console.error(`Review job ${job?.id} failed`, err);
+  console.error(`Review job ${job?.id} failed`, sanitizeGithubGitAuthError(err));
 });
 
 worker.on("completed", (job) => {

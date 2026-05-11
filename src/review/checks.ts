@@ -32,6 +32,25 @@ export function buildVerifierErrorChecks(params: {
   };
 }
 
+export function buildVerifierSkippedChecks(params: {
+  headSha: string;
+  summary: string;
+}): ChecksOutput {
+  const result = {
+    status: "skipped" as const,
+    summary: params.summary,
+    top_errors: []
+  };
+  return {
+    head_sha: params.headSha,
+    checks: {
+      lint: { ...result },
+      build: { ...result },
+      test: { ...result }
+    }
+  };
+}
+
 export async function readVerifierChecks(params: {
   outDir: string;
   headSha: string;

@@ -26,7 +26,6 @@ let resolvedCodexExecPath: string | null = null;
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const STAGE_ENV_ALLOWLIST = [
   "PATH",
-  "HOME",
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
@@ -40,15 +39,27 @@ const STAGE_ENV_ALLOWLIST = [
   "TZ"
 ] as const;
 
+function applyIsolatedHomeEnv(output: NodeJS.ProcessEnv, homeDir: string): NodeJS.ProcessEnv {
+  output.HOME = homeDir;
+  output.XDG_CONFIG_HOME = path.join(homeDir, ".config");
+  output.XDG_CACHE_HOME = path.join(homeDir, ".cache");
+  output.XDG_STATE_HOME = path.join(homeDir, ".state");
+  const tempDir = path.join(homeDir, ".tmp");
+  output.TMPDIR = tempDir;
+  output.TMP = tempDir;
+  output.TEMP = tempDir;
+  return output;
+}
+
 function systemPrompt(stage: CodexStage, roots: string[]): string {
   const toolNote = (() => {
     if (stage === "verifier") return "Available tool names: read_file, search, lint, build, test.";
-    if (stage === "mention") return "Available tool names: read_file, search, retrieve_context, shell, apply_patch.";
+    if (stage === "mention") return "Available tool names: read_file, search, retrieve_context, apply_patch.";
     return "Available tool names: read_file, search, retrieve_context.";
   })();
   const writeInstruction =
     stage === "mention"
-      ? "You may modify files under the repo root and write required outputs to the output root."
+      ? `You may modify files under the repo root and write required outputs to the output root. The current working directory is not the repo checkout; when editing repository files, target absolute paths under ${roots[0]}.`
       : `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt.`;
   const allowedRoots = roots.join(", ");
   return [
@@ -71,7 +82,7 @@ async function writeAuthFile(codexHomeDir: string): Promise<void> {
   await fs.writeFile(codexAuthPath, authPayload, { encoding: "utf8", mode: 0o600 });
 }
 
-async function resolveCodexExecPath(): Promise<string> {
+export async function resolveCodexExecPath(): Promise<string> {
   if (resolvedCodexExecPath) return resolvedCodexExecPath;
   const candidates = Array.from(new Set([env.codexExecPath, "codex-exec"]));
   for (const candidate of candidates) {
@@ -137,12 +148,16 @@ function baseConfig(params?: { shellTool?: boolean; applyPatchFreeform?: boolean
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
     `model_reasoning_effort = "high"`,
+    `project_doc_max_bytes = 0`,
     "",
     "[features]",
     `shell_tool = ${shellTool ? "true" : "false"}`,
     `apply_patch_freeform = ${applyPatchFreeform ? "true" : "false"}`,
     "web_search_request = false",
     "web_search_cached = false",
+    "",
+    "[tools]",
+    "view_image = false",
     ""
   ].join("\n");
 }
@@ -185,6 +200,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
       mcpServerBlock("verifier", "verifier_mcp.js", {
         WORK_REPO_ROOT: params.repoPath,
+        WORK_BUNDLE_ROOT: params.bundleDir,
         WORK_OUT_ROOT: params.outDir,
         DATABASE_URL: env.databaseUrl,
         REVIEW_RUN_ID: String(params.reviewRunId)
@@ -192,7 +208,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "mention") {
-    const base = baseConfig({ shellTool: true, applyPatchFreeform: true });
+    const base = baseConfig({ applyPatchFreeform: true });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -215,6 +231,62 @@ function baseStageEnv(): NodeJS.ProcessEnv {
     }
   }
   return output;
+}
+
+function buildStageEnv(params: CodexRunParams, stageHomeDir: string): NodeJS.ProcessEnv {
+  return applyIsolatedHomeEnv({
+    ...baseStageEnv(),
+    OPENAI_BASE_URL: env.openaiBaseUrl,
+    OPENAI_TIMEOUT_MS: String(env.openaiTimeoutMs),
+    OPENAI_MAX_RETRIES: String(env.openaiMaxRetries),
+    CODEX_HOME: stageHomeDir,
+    CODEX_DISABLE_PROJECT_DOC: "1",
+    CODEX_QUIET_MODE: "1"
+  }, stageHomeDir);
+}
+
+function buildStageLaunch(params: CodexRunParams): {
+  codexArgs: string[];
+  fullPrompt: string;
+  stageCwd: string;
+} {
+  const stageCwd = params.outDir;
+  const codexArgs = [
+    "--json",
+    "--sandbox",
+    "workspace-write",
+    "--skip-git-repo-check",
+    "--model",
+    env.openaiModel
+  ];
+
+  if (params.stage === "mention") {
+    const extraReadableWritableRoots = Array.from(
+      new Set(
+        [params.repoPath, params.bundleDir]
+          .filter((dir): dir is string => Boolean(dir && dir !== stageCwd))
+      )
+    );
+    for (const dir of extraReadableWritableRoots) {
+      codexArgs.push("--add-dir", dir);
+    }
+  }
+
+  if (params.captureLastMessage !== false) {
+    codexArgs.push("--output-last-message", path.join(params.outDir, `last_message_${params.stage}.txt`));
+  }
+  codexArgs.push("-");
+
+  const roots = [params.repoPath, params.bundleDir, params.outDir].filter(
+    (value): value is string => Boolean(value)
+  );
+  const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
+
+  return {
+    codexArgs,
+    fullPrompt,
+    stageCwd
+  };
 }
 
 function forwardStageStream(params: {
@@ -243,60 +315,14 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
   const codexExecPath = await resolveCodexExecPath();
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
+  await fs.mkdir(path.join(stageHomeDir, ".tmp"), { recursive: true });
   await writeAuthFile(stageHomeDir);
   const configToml = configForStage(params.stage, params);
   const configPath = path.join(stageHomeDir, "config.toml");
   await fs.writeFile(configPath, configToml, "utf8");
-  const codexArgs = [
-    "--json",
-    "--sandbox",
-    "workspace-write",
-    "--skip-git-repo-check",
-    "--model",
-    env.openaiModel
-  ];
-  if (params.stage === "mention" && params.repoPath) {
-    codexArgs.push("--cd", params.repoPath);
-    const extraWritableRoots = Array.from(
-      new Set([params.bundleDir, params.outDir].filter((dir) => dir && dir !== params.repoPath))
-    );
-    for (const dir of extraWritableRoots) {
-      codexArgs.push("--add-dir", dir);
-    }
-  }
-  if (params.captureLastMessage !== false) {
-    codexArgs.push("--output-last-message", path.join(params.outDir, `last_message_${params.stage}.txt`));
-  }
-  codexArgs.push("-");
-
-  const stageEnv: NodeJS.ProcessEnv = {
-    ...baseStageEnv(),
-    OPENAI_BASE_URL: env.openaiBaseUrl,
-    OPENAI_TIMEOUT_MS: String(env.openaiTimeoutMs),
-    OPENAI_MAX_RETRIES: String(env.openaiMaxRetries),
-    CODEX_HOME: stageHomeDir,
-    CODEX_DISABLE_PROJECT_DOC: "1",
-    CODEX_QUIET_MODE: "1",
-    DATABASE_URL: env.databaseUrl,
-    REVIEW_RUN_ID: String(params.reviewRunId),
-    REVIEW_REPO_ID: String(params.repoId),
-    TOOLRUN_PR_NUMBER: String(params.prNumber),
-    TOOLRUN_HEAD_SHA: params.headSha,
-    INTERNAL_API_URL: env.internalApiUrl,
-    INTERNAL_API_KEY: env.internalApiKey,
-    WORK_BUNDLE_ROOT: params.bundleDir,
-    WORK_OUT_ROOT: params.outDir
-  };
-  if (params.repoPath) {
-    stageEnv.WORK_REPO_ROOT = params.repoPath;
-  }
-
-  const roots = [params.repoPath, params.bundleDir, params.outDir].filter(
-    (value): value is string => Boolean(value)
-  );
-  const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
+  const stageEnv = buildStageEnv(params, stageHomeDir);
+  const { codexArgs, fullPrompt, stageCwd } = buildStageLaunch(params);
   const startedAt = Date.now();
-  const stageCwd = params.stage === "mention" && params.repoPath ? params.repoPath : params.outDir;
   let forwarders: Promise<void>[] = [];
   console.log(`${stageTag} starting`);
   try {
@@ -350,3 +376,9 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     throw err;
   }
 }
+
+export const __codexRunnerInternals = {
+  buildStageEnv,
+  configForStage,
+  buildStageLaunch
+};

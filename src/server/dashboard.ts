@@ -7,15 +7,57 @@ import {
   summarizeTraversalMetrics,
   type TraversalRunMetrics
 } from "../services/traversalMetrics.js";
+import { summarizeTrackedTrustedFeedback } from "../services/feedbackMetrics.js";
 
 const env = loadEnv();
 const DASHBOARD_AUTH_REALM = "Grepiku Dashboard";
 const MAX_GRAPH_EDGES = 20_000;
+const DASHBOARD_SUMMARY_MAX_LATENCY_RUNS = 5_000;
+const DASHBOARD_SUMMARY_MAX_FEEDBACK_ROWS = 10_000;
+const DASHBOARD_INSIGHTS_MAX_FINDINGS = 20_000;
+const DASHBOARD_EXPORT_MAX_EVENTS = 50_000;
 
 function parseBoundedInt(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function parsePositiveRouteInt(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function parseOptionalPositiveQueryInt(value: unknown): number | null | undefined {
+  if (value == null) return undefined;
+  const normalized = String(value).trim();
+  if (!normalized) return undefined;
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function ruleIdentity(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.id === "string" && value.id.trim().length > 0) {
+    return `id:${value.id.trim()}`;
+  }
+  try {
+    return `json:${JSON.stringify(value)}`;
+  } catch {
+    return null;
+  }
+}
+
+function csvCell(value: unknown): string {
+  const raw = value == null ? "" : String(value);
+  const safe = /^[\t\r\n ]*[=+\-@]/.test(raw) ? `'${raw}` : raw;
+  return `"${safe.replace(/"/g, '""')}"`;
 }
 
 function parseBasicAuthToken(value: string): string | null {
@@ -82,9 +124,14 @@ function isSameOriginRequest(request: any): boolean {
   return Boolean(expectedOrigin && requestOrigin === expectedOrigin);
 }
 
+function hasBrowserOriginHeaders(request: any): boolean {
+  return Boolean(firstHeaderValue(request.headers?.origin) || firstHeaderValue(request.headers?.referer));
+}
+
 function canMutateRuleSuggestion(request: any): boolean {
-  // Origin/Referer checks can help CSRF posture but are not authentication.
-  return authorize(request);
+  if (!authorize(request)) return false;
+  if (!hasBrowserOriginHeaders(request)) return true;
+  return isSameOriginRequest(request);
 }
 
 function sendDashboardUnauthorized(reply: any): void {
@@ -101,9 +148,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Grepiku</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -114,8 +158,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   --green:#6BC46B;--green-d:rgba(107,196,107,.12);
   --yellow:#E8B44A;--yellow-d:rgba(232,180,74,.12);
   --red:#E85A4A;--red-d:rgba(232,90,74,.12);
-  --f:"DM Sans",system-ui,sans-serif;
-  --fm:"JetBrains Mono",monospace;
+  --f:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --fm:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
   --sw:240px;--r:14px;--rs:10px
 }
 html{font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
@@ -570,9 +614,6 @@ const REPO_PAGE_HTML = `<!DOCTYPE html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Grepiku - Repository</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -580,7 +621,7 @@ const REPO_PAGE_HTML = `<!DOCTYPE html>
   --accent:#E8734A;--accent-soft:#F4A87D;--accent-dim:rgba(232,115,74,.15);--accent-glow:rgba(232,115,74,.08);
   --border:rgba(232,115,74,.1);--border-hi:rgba(232,115,74,.22);
   --text:#F0E6DC;--text-2:#9B8A7A;--text-3:#5E5047;
-  --f:"DM Sans",system-ui,sans-serif;--fm:"JetBrains Mono",monospace;
+  --f:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;--fm:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
   --r:14px;--rs:10px
 }
 html,body{height:100%}
@@ -1138,8 +1179,29 @@ export function registerDashboard(app: FastifyInstance) {
 
     /* --- Analytics summary (null acceptance when no feedback) --- */
     dashboardApp.get("/api/analytics/summary", async (_request, reply) => {
-    const runs = await prisma.reviewRun.findMany();
-    const completed = runs.filter((run) => run.completedAt && run.startedAt);
+    const [runCount, completed, feedback] = await Promise.all([
+      prisma.reviewRun.count(),
+      prisma.reviewRun.findMany({
+        where: {
+          startedAt: { not: null },
+          completedAt: { not: null }
+        },
+        orderBy: { createdAt: "desc" },
+        take: DASHBOARD_SUMMARY_MAX_LATENCY_RUNS,
+        select: { startedAt: true, completedAt: true }
+      }),
+      prisma.feedback.findMany({
+        orderBy: { createdAt: "desc" },
+        take: DASHBOARD_SUMMARY_MAX_FEEDBACK_ROWS,
+        select: {
+          type: true,
+          sentiment: true,
+          action: true,
+          commentId: true,
+          metadata: true
+        }
+      })
+    ]);
     const avgLatencyMs =
       completed.length > 0
         ? Math.round(
@@ -1149,15 +1211,10 @@ export function registerDashboard(app: FastifyInstance) {
             ) / completed.length
           )
         : 0;
-    const feedback = await prisma.feedback.findMany();
-    const positive = feedback.filter(
-      (item) => item.sentiment === "thumbs_up" || item.action === "resolved"
-    ).length;
-    const negative = feedback.filter((item) => item.sentiment === "thumbs_down").length;
-    const acceptanceRate =
-      positive + negative > 0 ? Math.round((positive / (positive + negative)) * 100) : null;
+    const feedbackSummary = await summarizeTrackedTrustedFeedback(feedback);
+    const acceptanceRate = feedbackSummary.acceptanceRate;
     const avgMergeTimeHours = 0;
-    reply.send({ runCount: runs.length, avgLatencyMs, acceptanceRate, avgMergeTimeHours });
+    reply.send({ runCount, avgLatencyMs, acceptanceRate, avgMergeTimeHours });
     });
 
     /* --- Rule suggestions --- */
@@ -1179,7 +1236,11 @@ export function registerDashboard(app: FastifyInstance) {
     /* --- Traversal analytics (null when no data) --- */
     dashboardApp.get("/api/analytics/traversal", async (request, reply) => {
     const limit = parseBoundedInt((request.query as any)?.limit, 500, 20, 5000);
-    const repoIdFilter = Number((request.query as any)?.repoId || 0) || undefined;
+    const repoIdFilter = parseOptionalPositiveQueryInt((request.query as any)?.repoId);
+    if (repoIdFilter === null) {
+      reply.code(400).send({ error: "Invalid repo id" });
+      return;
+    }
     const events = await prisma.analyticsEvent.findMany({
       where: {
         kind: "traversal_run",
@@ -1250,7 +1311,11 @@ export function registerDashboard(app: FastifyInstance) {
       reply.code(401).send({ error: "Unauthorized" });
       return;
     }
-    const id = Number((request.params as any).id);
+    const id = parsePositiveRouteInt((request.params as any).id);
+    if (!id) {
+      reply.code(400).send({ error: "Invalid rule suggestion id" });
+      return;
+    }
     const suggestion = await prisma.ruleSuggestion.findFirst({ where: { id } });
     if (!suggestion) {
       reply.code(404).send({ error: "Not found" });
@@ -1261,8 +1326,16 @@ export function registerDashboard(app: FastifyInstance) {
       where: { repoId: suggestion.repoId }
     });
     if (repoConfig) {
-      const config = repoConfig.configJson as any;
-      config.rules = [...(config.rules || []), suggestion.ruleJson];
+      const config = isRecord(repoConfig.configJson) ? { ...repoConfig.configJson } : {};
+      const rules = Array.isArray(config.rules) ? [...config.rules] : [];
+      const candidateIdentity = ruleIdentity(suggestion.ruleJson);
+      const exists =
+        candidateIdentity !== null &&
+        rules.some((rule) => ruleIdentity(rule) === candidateIdentity);
+      if (!exists) {
+        rules.push(suggestion.ruleJson);
+      }
+      config.rules = rules;
       await prisma.repoConfig.update({
         where: { id: repoConfig.id },
         data: { configJson: config }
@@ -1277,7 +1350,16 @@ export function registerDashboard(app: FastifyInstance) {
       reply.code(401).send({ error: "Unauthorized" });
       return;
     }
-    const id = Number((request.params as any).id);
+    const id = parsePositiveRouteInt((request.params as any).id);
+    if (!id) {
+      reply.code(400).send({ error: "Invalid rule suggestion id" });
+      return;
+    }
+    const suggestion = await prisma.ruleSuggestion.findFirst({ where: { id } });
+    if (!suggestion) {
+      reply.code(404).send({ error: "Not found" });
+      return;
+    }
     await prisma.ruleSuggestion.update({ where: { id }, data: { status: "rejected" } });
     reply.send({ ok: true });
     });
@@ -1285,18 +1367,29 @@ export function registerDashboard(app: FastifyInstance) {
     /* --- Export --- */
     dashboardApp.get("/api/analytics/export", async (request, reply) => {
     const format = (request.query as any)?.format || "json";
-    const events = await prisma.analyticsEvent.findMany({ orderBy: { createdAt: "desc" } });
+    const events = await prisma.analyticsEvent.findMany({
+      orderBy: { createdAt: "desc" },
+      take: DASHBOARD_EXPORT_MAX_EVENTS,
+      select: {
+        id: true,
+        repoId: true,
+        runId: true,
+        kind: true,
+        createdAt: true,
+        payload: true
+      }
+    });
     if (format === "csv") {
       const lines = ["id,repoId,runId,kind,createdAt,payload"];
       for (const event of events) {
         lines.push(
           [
-            event.id,
-            event.repoId,
-            event.runId || "",
-            event.kind,
-            event.createdAt.toISOString(),
-            JSON.stringify(event.payload || {}).replace(/"/g, '""')
+            csvCell(event.id),
+            csvCell(event.repoId),
+            csvCell(event.runId || ""),
+            csvCell(event.kind),
+            csvCell(event.createdAt.toISOString()),
+            csvCell(JSON.stringify(event.payload || {}))
           ].join(",")
         );
       }
@@ -1308,7 +1401,11 @@ export function registerDashboard(app: FastifyInstance) {
 
     /* --- Findings by severity --- */
     dashboardApp.get("/api/analytics/findings-by-severity", async (request, reply) => {
-    const repoId = Number((request.query as any)?.repoId) || undefined;
+    const repoId = parseOptionalPositiveQueryInt((request.query as any)?.repoId);
+    if (repoId === null) {
+      reply.code(400).send({ error: "Invalid repo id" });
+      return;
+    }
     const where = repoId ? { pullRequest: { repoId } } : {};
     const groups = await prisma.finding.groupBy({
       by: ["severity", "status"],
@@ -1320,7 +1417,11 @@ export function registerDashboard(app: FastifyInstance) {
 
     /* --- Learning weights --- */
     dashboardApp.get("/api/analytics/weights", async (request, reply) => {
-    const repoId = Number((request.query as any)?.repoId) || undefined;
+    const repoId = parseOptionalPositiveQueryInt((request.query as any)?.repoId);
+    if (repoId === null) {
+      reply.code(400).send({ error: "Invalid repo id" });
+      return;
+    }
     const where = repoId ? { repoId } : {};
     const weights = await prisma.findingWeight.findMany({
       where,
@@ -1332,7 +1433,11 @@ export function registerDashboard(app: FastifyInstance) {
 
     /* --- Insights --- */
     dashboardApp.get("/api/analytics/insights", async (_request, reply) => {
-    const findings = await prisma.finding.findMany();
+    const findings = await prisma.finding.findMany({
+      orderBy: { createdAt: "desc" },
+      take: DASHBOARD_INSIGHTS_MAX_FINDINGS,
+      select: { category: true, path: true }
+    });
     const byCategory: Record<string, number> = {};
     const byPath: Record<string, number> = {};
     for (const finding of findings) {
@@ -1354,6 +1459,7 @@ export function registerDashboard(app: FastifyInstance) {
 
 export const __dashboardInternals = {
   authorize,
+  csvCell,
   isSameOriginRequest,
   parseBasicAuthToken
 };

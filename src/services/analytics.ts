@@ -1,6 +1,7 @@
 import { prisma } from "../db/client.js";
 import { computeTraversalRunMetrics } from "./traversalMetrics.js";
 import { recalculateWeightsFromReactions } from "./weights.js";
+import { isTrustedFeedbackMetadata } from "./feedbackTrust.js";
 
 type AnalyticsJob = {
   reviewRunId: number;
@@ -72,6 +73,7 @@ export async function processAnalyticsJob(job: AnalyticsJob) {
 
   const feedbackByFinding = new Map<string, { pos: number; neg: number }>();
   for (const feedback of run.feedback) {
+    if (!isTrustedFeedbackMetadata(feedback.metadata)) continue;
     if (!feedback.commentId) continue;
     const entry = feedbackByFinding.get(feedback.commentId) || { pos: 0, neg: 0 };
     if (feedback.type === "reaction" && feedback.sentiment) {

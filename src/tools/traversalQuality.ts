@@ -34,6 +34,9 @@ type ReplayBundle = {
   }>;
 };
 
+const MAX_REPLAY_DIFF_PATCH_BYTES = 10 * 1024 * 1024;
+const MAX_REPLAY_CHANGED_FILES_BYTES = 5 * 1024 * 1024;
+
 function parseFinite(value: string): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
@@ -119,6 +122,25 @@ function asPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+function replayBundleFileLimitError(filePath: string, maxBytes: number): Error {
+  return new Error(`replay bundle file exceeded byte limit (${maxBytes} bytes): ${filePath}`);
+}
+
+async function readTextFileWithinLimit(filePath: string, maxBytes: number): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size > maxBytes) {
+      throw replayBundleFileLimitError(filePath, maxBytes);
+    }
+    const buffer = Buffer.alloc(Math.max(0, Number(stat.size)));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 async function loadRuns(options: Options) {
   const where: any = { status: "completed" };
   if (options.repoId) {
@@ -140,11 +162,17 @@ async function loadRuns(options: Options) {
   });
 }
 
-async function readReplayBundle(runId: number): Promise<ReplayBundle | null> {
-  const bundleDir = path.join(process.cwd(), "var", "runs", String(runId), "bundle");
+async function readReplayBundle(projectRoot: string, runId: number): Promise<ReplayBundle | null> {
+  const bundleDir = path.join(projectRoot, "var", "runs", String(runId), "bundle");
   const [diffPatch, changedRaw] = await Promise.all([
-    fs.readFile(path.join(bundleDir, "diff.patch"), "utf8").catch(() => null),
-    fs.readFile(path.join(bundleDir, "changed_files.json"), "utf8").catch(() => null)
+    readTextFileWithinLimit(
+      path.join(bundleDir, "diff.patch"),
+      MAX_REPLAY_DIFF_PATCH_BYTES
+    ).catch(() => null),
+    readTextFileWithinLimit(
+      path.join(bundleDir, "changed_files.json"),
+      MAX_REPLAY_CHANGED_FILES_BYTES
+    ).catch(() => null)
   ]);
   if (!diffPatch || !changedRaw) return null;
 
@@ -176,7 +204,7 @@ async function mapWithConcurrency<T, R>(items: T[], concurrency: number, fn: (it
 }
 
 async function buildReplayContext(run: ReviewRunRow, repoConfigCache: Map<number, Awaited<ReturnType<typeof resolveRepoConfig>>>) {
-  const bundle = await readReplayBundle(run.id);
+  const bundle = await readReplayBundle(process.cwd(), run.id);
   if (!bundle) return null;
 
   let repoConfig = repoConfigCache.get(run.pullRequest.repoId);
@@ -272,7 +300,8 @@ async function main() {
 
 export const __traversalQualityInternals = {
   parseArgs,
-  parseFinite
+  parseFinite,
+  readReplayBundle
 };
 
 const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";

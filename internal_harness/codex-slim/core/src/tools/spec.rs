@@ -37,6 +37,7 @@ pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
     pub allow_login_shell: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
+    pub view_image_enabled: bool,
     pub web_search_mode: Option<WebSearchMode>,
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
     pub search_tool: bool,
@@ -99,6 +100,7 @@ impl ToolsConfig {
             shell_type,
             allow_login_shell: true,
             apply_patch_tool_type,
+            view_image_enabled: true,
             web_search_mode: *web_search_mode,
             agent_roles: BTreeMap::new(),
             search_tool: include_search_tool,
@@ -117,6 +119,11 @@ impl ToolsConfig {
 
     pub fn with_allow_login_shell(mut self, allow_login_shell: bool) -> Self {
         self.allow_login_shell = allow_login_shell;
+        self
+    }
+
+    pub fn with_view_image_enabled(mut self, view_image_enabled: bool) -> Self {
+        self.view_image_enabled = view_image_enabled;
         self
     }
 }
@@ -1594,8 +1601,10 @@ pub(crate) fn build_specs(
         Some(WebSearchMode::Disabled) | None => {}
     }
 
-    builder.push_spec_with_parallel_support(create_view_image_tool(), true);
-    builder.register_handler("view_image", view_image_handler);
+    if config.view_image_enabled {
+        builder.push_spec_with_parallel_support(create_view_image_tool(), true);
+        builder.register_handler("view_image", view_image_handler);
+    }
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
@@ -2019,6 +2028,28 @@ mod tests {
             ToolSpec::WebSearch {
                 external_web_access: Some(true),
             }
+        );
+    }
+
+    #[test]
+    fn view_image_can_be_disabled_in_tools_config() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::CollaborationModes);
+
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        })
+        .with_view_image_enabled(false);
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert!(
+            !tools.iter().any(|tool| tool.spec.name() == "view_image"),
+            "view_image should be omitted when disabled by config"
         );
     }
 

@@ -12,8 +12,20 @@ import { prisma } from "../db/client.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { loadEnv } from "../config/env.js";
+import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
 import { chunkTextForEmbedding } from "./chunking.js";
 import { enqueueGraphJob } from "../queue/enqueue.js";
+import {
+  normalizePatternRepositoryUrl,
+  patternRepositoryDirName,
+  patternRepositoryGitConfigArgs,
+  resolvePatternRepositoryCheckoutCommit,
+  withPatternRepositoryLock
+} from "../review/patternRepositories.js";
+import { shouldSkipSensitivePath } from "./indexerPathPolicy.js";
+import { buildIndexedFilePath, buildPruneIndexedFilesWhere, type IndexedPatternRepo } from "./indexerScope.js";
+import { readIndexCandidateFile } from "./indexerFileRead.js";
+import { walkIndexableFiles } from "./indexerWalk.js";
 
 const env = loadEnv();
 const MAX_INDEX_BYTES = 1_000_000;
@@ -101,6 +113,7 @@ function hashContent(text: string): string {
 
 function shouldIndexAsText(params: { relativePath: string; raw: Buffer; languageKnown: boolean }): boolean {
   const { relativePath, raw, languageKnown } = params;
+  if (shouldSkipSensitivePath(relativePath)) return false;
   if (languageKnown) return true;
   const ext = path.extname(relativePath).toLowerCase();
   const base = path.basename(relativePath).toLowerCase();
@@ -233,19 +246,6 @@ function extractImportReferences(params: {
   return refs;
 }
 
-
-async function walk(dir: string, ignoreDirs: Set<string>, files: string[] = []): Promise<string[]> {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      if (ignoreDirs.has(entry.name)) continue;
-      await walk(path.join(dir, entry.name), ignoreDirs, files);
-    } else if (entry.isFile()) {
-      files.push(path.join(dir, entry.name));
-    }
-  }
-  return files;
-}
 
 function extractSymbols(language: string, tree: Parser.Tree, content: string) {
   const symbols: Array<{
@@ -469,13 +469,10 @@ async function pruneStaleIndexedFiles(params: {
   repoId: number;
   isPattern: boolean;
   keepFileIds: number[];
+  patternRepo?: IndexedPatternRepo | null;
 }) {
   const stale = await prisma.fileIndex.findMany({
-    where: {
-      repoId: params.repoId,
-      isPattern: params.isPattern,
-      id: params.keepFileIds.length > 0 ? { notIn: params.keepFileIds } : undefined
-    },
+    where: buildPruneIndexedFilesWhere(params),
     select: { id: true }
   });
   const staleIds = stale.map((item) => item.id);
@@ -485,6 +482,45 @@ async function pruneStaleIndexedFiles(params: {
   await prisma.embedding.deleteMany({ where: { fileId: { in: staleIds } } });
   await prisma.symbol.deleteMany({ where: { fileId: { in: staleIds } } });
   await prisma.fileIndex.deleteMany({ where: { id: { in: staleIds } } });
+}
+
+async function indexResolvedRepoPath(params: {
+  repoId: number;
+  repoPath: string;
+  force: boolean;
+  patternRepo?: IndexedPatternRepo | null;
+}) {
+  const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var"]);
+  const indexedFileIds = new Set<number>();
+
+  for await (const filePath of walkIndexableFiles(params.repoPath, ignoreDirs)) {
+    const relativePath = path.relative(params.repoPath, filePath);
+    const indexedPath = buildIndexedFilePath(relativePath, params.patternRepo);
+    const ext = path.extname(filePath).toLowerCase();
+    const languageConfig = languageMap[ext];
+    const raw = await readIndexCandidateFile(filePath, MAX_INDEX_BYTES);
+    if (!raw) continue;
+    if (raw.includes(0)) continue;
+    if (!shouldIndexAsText({ relativePath, raw, languageKnown: Boolean(languageConfig) })) continue;
+    const content = raw.toString("utf8");
+    const fileId = await indexFile({
+      repoId: params.repoId,
+      filePath,
+      relativePath: indexedPath,
+      content,
+      language: inferredLanguageName(relativePath, languageConfig?.name),
+      force: params.force,
+      isPattern: Boolean(params.patternRepo)
+    });
+    indexedFileIds.add(fileId);
+  }
+
+  await pruneStaleIndexedFiles({
+    repoId: params.repoId,
+    isPattern: Boolean(params.patternRepo),
+    keepFileIds: Array.from(indexedFileIds),
+    patternRepo: params.patternRepo
+  });
 }
 
 export async function processIndexJob(job: IndexJob) {
@@ -504,7 +540,8 @@ export async function processIndexJob(job: IndexJob) {
   try {
     let repoPath: string | null = null;
     const targetSha = job.headSha || "HEAD";
-    if (!job.patternRepo) {
+    const patternRepo = job.patternRepo;
+    if (!patternRepo) {
       const adapter = getProviderAdapter("github");
       const providerRepo: ProviderRepo = {
         externalId: repo.externalId,
@@ -531,68 +568,83 @@ export async function processIndexJob(job: IndexJob) {
         pullRequest: dummyPr
       });
       repoPath = await client.ensureRepoCheckout({ headSha: targetSha });
+      await indexResolvedRepoPath({
+        repoId: repo.id,
+        repoPath,
+        force: Boolean(job.force)
+      });
     } else {
-      const rawName = job.patternRepo.name || "pattern-repo";
-      const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, "_") || "pattern-repo";
+      const rawName = patternRepo.name || "pattern-repo";
+      const normalizedUrl = normalizePatternRepositoryUrl(patternRepo.url);
+      if (!normalizedUrl) {
+        throw new Error(`Unsafe pattern repository URL: ${patternRepo.url}`);
+      }
       const basePatternsDir = path.join(env.projectRoot, "var", "patterns");
-      const patternDir = path.join(basePatternsDir, safeName);
+      const patternDir = path.join(
+        basePatternsDir,
+        patternRepositoryDirName({
+          name: rawName,
+          url: normalizedUrl,
+          ref: patternRepo.ref
+        })
+      );
       const resolvedBase = path.resolve(basePatternsDir);
       const resolvedPattern = path.resolve(patternDir);
-      if (!resolvedPattern.startsWith(resolvedBase + path.sep)) {
+      const relativePatternDir = path.relative(resolvedBase, resolvedPattern);
+      if (
+        relativePatternDir.startsWith("..") ||
+        path.isAbsolute(relativePatternDir) ||
+        relativePatternDir.length === 0
+      ) {
         throw new Error(`Invalid pattern repo name: ${rawName}`);
       }
-      const gitDir = path.join(patternDir, ".git");
-      await fs.mkdir(patternDir, { recursive: true });
-      const exists = await fs
-        .stat(gitDir)
-        .then(() => true)
-        .catch(() => false);
-      if (!exists) {
-        await execa("git", ["clone", job.patternRepo.url, patternDir], { stdio: "inherit" });
-      } else {
-        await execa("git", ["-C", patternDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
-      }
-      if (job.patternRepo.ref) {
-        await execa("git", ["-C", patternDir, "checkout", "--detach", "--", job.patternRepo.ref], {
-          stdio: "inherit"
+      await withPatternRepositoryLock(resolvedPattern, async () => {
+        const gitDir = path.join(patternDir, ".git");
+        await fs.mkdir(basePatternsDir, { recursive: true });
+        const exists = await fs
+          .stat(gitDir)
+          .then(() => true)
+          .catch(() => false);
+        if (!exists) {
+          await execa("git", [...patternRepositoryGitConfigArgs(), "clone", normalizedUrl, patternDir], {
+            stdio: "inherit",
+            env: gitCheckoutSafetyEnv()
+          });
+        } else {
+          await execa("git", [...patternRepositoryGitConfigArgs(), "-C", patternDir, "remote", "set-url", "origin", normalizedUrl], {
+            stdio: "inherit",
+            env: gitCheckoutSafetyEnv()
+          });
+          await execa("git", [...patternRepositoryGitConfigArgs(), "-C", patternDir, "fetch", "--all", "--prune"], {
+            stdio: "inherit",
+            env: gitCheckoutSafetyEnv()
+          });
+        }
+        await execa("git", ["-C", patternDir, "remote", "set-head", "origin", "-a"], {
+          stdio: ["ignore", "ignore", "ignore"],
+          env: gitCheckoutSafetyEnv()
+        }).catch(() => undefined);
+        const checkoutCommit = await resolvePatternRepositoryCheckoutCommit({
+          repoPath: patternDir,
+          ref: patternRepo.ref
         });
-      }
+        await execa("git", ["-C", patternDir, "checkout", "--quiet", "--detach", checkoutCommit], {
+          stdio: "inherit",
+          env: gitCheckoutSafetyEnv()
+        });
+        await indexResolvedRepoPath({
+          repoId: repo.id,
+          repoPath: patternDir,
+          force: Boolean(job.force),
+          patternRepo
+        });
+      });
       repoPath = patternDir;
     }
 
     if (!repoPath) {
       throw new Error("Unable to resolve repo path for indexing");
     }
-
-    const ignoreDirs = new Set([".git", "node_modules", "dist", "build", "var"]);
-    const files = await walk(repoPath, ignoreDirs);
-    const indexedFileIds = new Set<number>();
-    for (const filePath of files) {
-      const relativePath = path.relative(repoPath, filePath);
-      const ext = path.extname(filePath).toLowerCase();
-      const languageConfig = languageMap[ext];
-      const raw = await fs.readFile(filePath);
-      if (raw.length > MAX_INDEX_BYTES) continue;
-      if (raw.includes(0)) continue;
-      if (!shouldIndexAsText({ relativePath, raw, languageKnown: Boolean(languageConfig) })) continue;
-      const content = raw.toString("utf8");
-      const fileId = await indexFile({
-        repoId: repo.id,
-        filePath,
-        relativePath,
-        content,
-        language: inferredLanguageName(relativePath, languageConfig?.name),
-        force: Boolean(job.force),
-        isPattern: Boolean(job.patternRepo)
-      });
-      indexedFileIds.add(fileId);
-    }
-
-    await pruneStaleIndexedFiles({
-      repoId: repo.id,
-      isPattern: Boolean(job.patternRepo),
-      keepFileIds: Array.from(indexedFileIds)
-    });
 
     await prisma.indexRun.update({
       where: { id: indexRun.id },

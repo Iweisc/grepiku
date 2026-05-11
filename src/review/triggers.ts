@@ -1,6 +1,7 @@
 import { minimatch } from "minimatch";
 import { RepoConfig, RuleConfig, resolveRepoConfig as loadCachedConfig } from "./config.js";
 import { ProviderPullRequest } from "../providers/types.js";
+import { sanitizePatternRepositories } from "./patternRepositories.js";
 
 export type RulesOverride = {
   orgDefaults?: Partial<RepoConfig>;
@@ -23,10 +24,10 @@ export function resolveRules(config: RepoConfig, overrides?: RulesOverride | nul
       ...(overrides?.uiRules || [])
     ],
     scopes: [...(orgDefaults?.scopes || []), ...(config.scopes || [])],
-    patternRepositories: [
+    patternRepositories: sanitizePatternRepositories([
       ...(orgDefaults?.patternRepositories || []),
       ...(config.patternRepositories || [])
-    ],
+    ]),
     strictness: overrides?.strictness || config.strictness,
     commentTypes: overrides?.commentTypes || config.commentTypes,
     output: overrides?.output || config.output,
@@ -57,17 +58,26 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function containsStandaloneTrigger(text: string, token: string): boolean {
+  const normalizedToken = token.trim();
+  if (!normalizedToken) return false;
+  const pattern = new RegExp(
+    `(^|[\\s([<{,;])${escapeRegExp(normalizedToken)}(?=$|[\\s:;,.!?)}\\]>])`,
+    "i"
+  );
+  return pattern.test(text);
+}
+
 export function detectCommentTrigger(text: string, config: RepoConfig): CommentTrigger | null {
   if (!text) return null;
-  const lower = text.toLowerCase();
   const tokens = config.triggers.commentTriggers || [];
   const reviewTokens = tokens.filter((token) => token.trim().startsWith("/"));
   const mentionTokens = tokens.filter((token) => !token.trim().startsWith("/"));
 
-  if (reviewTokens.some((token) => lower.includes(token.toLowerCase()))) {
+  if (reviewTokens.some((token) => containsStandaloneTrigger(text, token))) {
     return "review";
   }
-  if (mentionTokens.some((token) => lower.includes(token.toLowerCase()))) {
+  if (mentionTokens.some((token) => containsStandaloneTrigger(text, token))) {
     return "mention";
   }
   return null;
@@ -80,10 +90,13 @@ export function extractMentionDoTask(text: string, config: RepoConfig): string |
   for (const rawToken of mentionTokens) {
     const token = rawToken.trim();
     if (!token) continue;
-    const pattern = new RegExp(`${escapeRegExp(token)}\\s*[,:-]?\\s*do\\s*:\\s*([\\s\\S]+)$`, "i");
+    const pattern = new RegExp(
+      `(^|[\\s([<{,;])${escapeRegExp(token)}(?:\\s|[,:;-])*do\\s*:\\s*([\\s\\S]+)$`,
+      "i"
+    );
     const match = text.match(pattern);
     if (!match) continue;
-    const task = (match[1] || "").trim();
+    const task = (match[2] || "").trim();
     if (task.length > 0) return task;
   }
   return null;

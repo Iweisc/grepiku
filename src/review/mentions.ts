@@ -3,10 +3,16 @@ import path from "path";
 import { execa } from "execa";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
-import { loadRepoConfig, saveRepoConfig, type RepoConfig, type ToolConfig } from "./config.js";
+import {
+  loadRepoConfigAtGitRef,
+  resolveRepoConfig as loadSavedRepoConfig,
+  saveRepoConfig,
+  type RepoConfig,
+  type ToolConfig
+} from "./config.js";
 import { writeBundleFiles } from "./bundle.js";
 import { buildMentionImplementPrompt, buildMentionPrompt } from "./prompts.js";
-import { runCodexStage } from "../runner/codexRunner.js";
+import { resolveCodexExecPath, runCodexStage } from "../runner/codexRunner.js";
 import { readAndValidateJson } from "./json.js";
 import { MentionActionSchema, MentionChecksOutput, ReplySchema } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
@@ -14,6 +20,10 @@ import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { buildContextPack } from "./context.js";
 import { extractMentionDoTask } from "./triggers.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
+import {
+  assertWorkspaceHasNoExternalSymlinks,
+  createRepoCommandWorkspace
+} from "./repoCommandWorkspace.js";
 import {
   changedPaths,
   commitWorkingTree,
@@ -25,53 +35,243 @@ import {
   resolveFollowUpPrBaseBranch
 } from "./mentionGit.js";
 import { resolveGithubBotLogin } from "../providers/github/adapter.js";
+import { isTrustedCommentAuthorAssociation } from "../providers/commentGuards.js";
+import { shouldRunVerifierForPullRequest } from "../providers/pullRequestGuards.js";
+import {
+  buildLocalChangedFiles,
+  buildLocalDiffPatch,
+  resolveDiffPatchAfterLocalCompareFailure
+} from "./localCompare.js";
+import { renderPrMarkdown } from "./prMarkdown.js";
+import { sanitizeModelVisibleReviewData } from "./sensitiveReviewData.js";
+import {
+  neutralizeGitHubClosingKeywords,
+  neutralizeGitHubIssueReferences,
+  neutralizeGitHubMentions,
+  sanitizeGitHubMarkdownText
+} from "./githubMarkdown.js";
+import { mergeStoredPullRequestState } from "./pullRequestState.js";
 
 const env = loadEnv();
+const SAFE_TOOL_ENV_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "TERM",
+  "TZ"
+] as const;
 
 type MentionToolResult = MentionChecksOutput["checks"]["lint"];
+type SandboxedToolCommand = {
+  command: string;
+  args: string[];
+  options: {
+    argv0: string;
+    cwd: string;
+    env?: NodeJS.ProcessEnv;
+    shell: false;
+  };
+};
 
-function topErrorsFromStderr(stderr: string): string[] {
-  return stderr
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .slice(0, 10);
+type MentionToolExecaOptions = {
+  stdout: "ignore";
+  stderr: "pipe";
+  buffer: false;
+  reject: false;
+  timeout: number;
+};
+
+const SUPPRESSED_STDERR_MESSAGE = "stderr output suppressed for security";
+const NON_LINUX_MENTION_TOOL_SUMMARY =
+  "blocked: mention verification requires Linux sandbox support";
+const GIT_METADATA_TAMPER_SUMMARY =
+  "blocked: mention task modified worktree git metadata";
+const MAX_REPO_GIT_METADATA_BYTES = 16 * 1024;
+const MAX_FOLLOW_UP_COMMIT_MESSAGE_CHARS = 500;
+const MAX_FOLLOW_UP_PR_TITLE_CHARS = 200;
+
+function buildToolCommandEnv(
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+  homeDir?: string
+): NodeJS.ProcessEnv {
+  const output: NodeJS.ProcessEnv = { CI: "1" };
+  for (const key of SAFE_TOOL_ENV_KEYS) {
+    const value = sourceEnv[key];
+    if (value && value.trim().length > 0) {
+      output[key] = value;
+    }
+  }
+  if (homeDir && homeDir.trim().length > 0) {
+    output.HOME = homeDir;
+    output.XDG_CONFIG_HOME = path.join(homeDir, ".config");
+    output.XDG_CACHE_HOME = path.join(homeDir, ".cache");
+    output.XDG_STATE_HOME = path.join(homeDir, ".state");
+    const tempDir = path.join(homeDir, ".tmp");
+    output.TMPDIR = tempDir;
+    output.TMP = tempDir;
+    output.TEMP = tempDir;
+  }
+  return output;
+}
+
+function buildSandboxedToolCommand(params: {
+  codexExecPath: string;
+  repoPath: string;
+  homeDir?: string;
+  command: string;
+  env?: NodeJS.ProcessEnv;
+}): SandboxedToolCommand {
+  const writableRoots = Array.from(
+    new Set([params.repoPath, params.homeDir].filter((value): value is string => Boolean(value?.trim())))
+  );
+  const sandboxPolicy = JSON.stringify({
+    type: "workspace-write",
+    writable_roots: writableRoots,
+    read_only_access: {
+      type: "restricted",
+      include_platform_defaults: true,
+      readable_roots: []
+    },
+    network_access: false,
+    exclude_tmpdir_env_var: true,
+    exclude_slash_tmp: true
+  });
+  return {
+    command: params.codexExecPath,
+    args: [
+      "--sandbox-policy-cwd",
+      params.repoPath,
+      "--sandbox-policy",
+      sandboxPolicy,
+      "--use-bwrap-sandbox",
+      "--",
+      "/bin/sh",
+      "-lc",
+      params.command
+    ],
+    options: {
+      argv0: "codex-linux-sandbox",
+      cwd: params.repoPath,
+      env: params.env,
+      shell: false
+    }
+  };
+}
+
+function buildMentionToolResult(params: {
+  exitCode?: number | null;
+  stderr?: string;
+  timedOut: boolean;
+  timeoutSec: number;
+}): MentionToolResult {
+  const hadStderr = Boolean(params.stderr && params.stderr.trim().length > 0);
+  const topErrors =
+    hadStderr && (params.timedOut || (params.exitCode ?? 1) !== 0)
+      ? [SUPPRESSED_STDERR_MESSAGE]
+      : [];
+
+  if (params.timedOut) {
+    return {
+      status: "timeout",
+      summary: `timed out after ${params.timeoutSec}s`,
+      top_errors: topErrors
+    };
+  }
+
+  const exitCode = Number.isInteger(params.exitCode) ? params.exitCode : 1;
+  if (exitCode === 0) {
+    return { status: "pass", summary: "success", top_errors: [] };
+  }
+
+  return {
+    status: "fail",
+    summary: `exited with ${exitCode}`,
+    top_errors: topErrors
+  };
+}
+
+function buildMentionToolExecaOptions(params: {
+  timeoutSec: number;
+}): MentionToolExecaOptions {
+  return {
+    stdout: "ignore",
+    stderr: "pipe",
+    buffer: false,
+    reject: false,
+    timeout: params.timeoutSec * 1000
+  };
 }
 
 async function runMentionTool(params: {
   repoPath: string;
   toolName: "lint" | "build" | "test";
   toolConfig?: ToolConfig;
+  homeDir?: string;
+  platform?: NodeJS.Platform;
 }): Promise<MentionToolResult> {
-  const { repoPath, toolConfig } = params;
+  const { repoPath, toolConfig, homeDir } = params;
   if (!toolConfig?.cmd) {
     return { status: "skipped", summary: "not configured", top_errors: [] };
   }
+  const platform = params.platform || process.platform;
+  if (platform !== "linux") {
+    return {
+      status: "error",
+      summary: NON_LINUX_MENTION_TOOL_SUMMARY,
+      top_errors: []
+    };
+  }
 
   const timeoutSec = Math.max(1, Math.floor(toolConfig.timeout_sec || 600));
+  let hadStderr = false;
   try {
-    const result = await execa(toolConfig.cmd, {
-      shell: true,
-      cwd: repoPath,
-      timeout: timeoutSec * 1000,
-      reject: false
-    });
-    const topErrors = topErrorsFromStderr(result.stderr || "");
-    if (result.exitCode === 0) {
-      return { status: "pass", summary: "success", top_errors: topErrors };
+    await assertWorkspaceHasNoExternalSymlinks(repoPath);
+    const childEnv = buildToolCommandEnv(process.env, homeDir);
+    if (homeDir) {
+      await fs.mkdir(homeDir, { recursive: true });
+      if (childEnv.TMPDIR) {
+        await fs.mkdir(childEnv.TMPDIR, { recursive: true });
+      }
+      await assertWorkspaceHasNoExternalSymlinks(homeDir);
     }
-    return {
-      status: "fail",
-      summary: `exited with ${result.exitCode ?? "unknown"}`,
-      top_errors: topErrors
-    };
+    const result = await (async () => {
+      const codexExecPath = await resolveCodexExecPath();
+      const invocation = buildSandboxedToolCommand({
+        codexExecPath,
+        repoPath,
+        homeDir,
+        command: toolConfig.cmd,
+        env: childEnv
+      });
+      const subprocess = execa(invocation.command, invocation.args, {
+        ...invocation.options,
+        ...buildMentionToolExecaOptions({
+          timeoutSec
+        })
+      });
+      subprocess.stderr?.on("data", () => {
+        hadStderr = true;
+      });
+      return subprocess;
+    })();
+    return buildMentionToolResult({
+      exitCode: result.exitCode,
+      stderr: hadStderr ? SUPPRESSED_STDERR_MESSAGE : "",
+      timedOut: false,
+      timeoutSec
+    });
   } catch (err: any) {
     if (err?.timedOut) {
-      return {
-        status: "timeout",
-        summary: `timed out after ${timeoutSec}s`,
-        top_errors: topErrorsFromStderr(String(err?.stderr || ""))
-      };
+      return buildMentionToolResult({
+        exitCode: err?.exitCode,
+        stderr: hadStderr ? SUPPRESSED_STDERR_MESSAGE : "",
+        timedOut: true,
+        timeoutSec
+      });
     }
     const message = err instanceof Error ? err.message : "tool execution error";
     return { status: "error", summary: message, top_errors: [] };
@@ -81,68 +281,87 @@ async function runMentionTool(params: {
 async function runMentionChecks(params: {
   repoPath: string;
   tools: RepoConfig["tools"];
+  homeDir?: string;
 }): Promise<MentionChecksOutput> {
   const lint = await runMentionTool({
     repoPath: params.repoPath,
     toolName: "lint",
-    toolConfig: params.tools.lint
+    toolConfig: params.tools.lint,
+    homeDir: params.homeDir
   });
   const build = await runMentionTool({
     repoPath: params.repoPath,
     toolName: "build",
-    toolConfig: params.tools.build
+    toolConfig: params.tools.build,
+    homeDir: params.homeDir
   });
   const test = await runMentionTool({
     repoPath: params.repoPath,
     toolName: "test",
-    toolConfig: params.tools.test
+    toolConfig: params.tools.test,
+    homeDir: params.homeDir
   });
   return { checks: { lint, build, test } };
 }
 
-async function buildLocalDiffPatch(params: {
-  repoPath: string;
-  baseSha: string | null | undefined;
-  headSha: string;
-}): Promise<string> {
-  const { repoPath, baseSha, headSha } = params;
-  if (!baseSha) return "";
-  const { stdout } = await execa(
-    "git",
-    ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
-    { maxBuffer: 1024 * 1024 * 200 }
-  );
-  return stdout;
+function buildMentionSkippedChecks(summary: string): MentionChecksOutput {
+  const result = {
+    status: "skipped" as const,
+    summary,
+    top_errors: []
+  };
+  return {
+    checks: {
+      lint: { ...result },
+      build: { ...result },
+      test: { ...result }
+    }
+  };
 }
 
-async function buildLocalChangedFiles(params: {
-  repoPath: string;
-  baseSha: string | null | undefined;
-  headSha: string;
-}): Promise<Array<{ path: string; status?: string }>> {
-  const { repoPath, baseSha, headSha } = params;
-  if (!baseSha) return [];
-  const { stdout } = await execa(
-    "git",
-    ["-C", repoPath, "diff", "--name-status", `${baseSha}...${headSha}`],
-    { maxBuffer: 1024 * 1024 * 20 }
-  );
-  const items = stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line): { path: string; status?: string } | null => {
-      const parts = line.split(/\t+/).filter(Boolean);
-      if (parts.length < 2) return null;
-      const status = parts[0];
-      const filePath = parts[parts.length - 1];
-      if (!filePath) return null;
-      return {
-        path: filePath,
-        status
-      };
-    });
-  return items.filter((value): value is { path: string; status?: string } => value !== null);
+function planMentionChecks(params: {
+  repoFullName: string;
+  pullRequest: Pick<ProviderPullRequest, "headRepoFullName" | "headSha">;
+}): { shouldRun: boolean; skippedSummary: string | null } {
+  const shouldRun = shouldRunVerifierForPullRequest({
+    repoFullName: params.repoFullName,
+    pullRequest: params.pullRequest
+  });
+  return shouldRun
+    ? { shouldRun: true, skippedSummary: null }
+    : { shouldRun: false, skippedSummary: "skipped for untrusted fork pull request" };
+}
+
+function planMentionImplementation(params: {
+  repoFullName: string;
+  pullRequest: Pick<ProviderPullRequest, "headRepoFullName" | "headSha">;
+}): { shouldRun: boolean; deniedSummary: string | null } {
+  const shouldRun = shouldRunVerifierForPullRequest({
+    repoFullName: params.repoFullName,
+    pullRequest: params.pullRequest
+  });
+  return shouldRun
+    ? { shouldRun: true, deniedSummary: null }
+    : { shouldRun: false, deniedSummary: "blocked for untrusted fork pull request" };
+}
+
+function resolveMentionExecutionMode(params: {
+  mentionTask: string | null;
+  commentAuthorAssociation?: string | null;
+  repoFullName: string;
+  pullRequest: Pick<ProviderPullRequest, "headRepoFullName" | "headSha">;
+}): "answer" | "deny_untrusted_commenter" | "deny_untrusted_fork" | "implement" {
+  if (!params.mentionTask) {
+    return "answer";
+  }
+  if (!isTrustedCommentAuthorAssociation(params.commentAuthorAssociation)) {
+    return "deny_untrusted_commenter";
+  }
+  const implementationPlan = planMentionImplementation({
+    repoFullName: params.repoFullName,
+    pullRequest: params.pullRequest
+  });
+  return implementationPlan.shouldRun ? "implement" : "deny_untrusted_fork";
 }
 
 export type CommentReplyJobData = {
@@ -154,8 +373,10 @@ export type CommentReplyJobData = {
   commentId: string;
   commentBody: string;
   commentAuthor: string;
+  commentAuthorAssociation?: string | null;
   commentUrl?: string;
   replyInThread?: boolean;
+  denyImplementation?: boolean;
 };
 
 async function postMentionReply(params: {
@@ -201,6 +422,65 @@ async function createReplyDirs(root: string, commentId: string) {
   return { runDir, bundleDir, outDir, codexHomeDir };
 }
 
+async function resetReplyRunState(params: {
+  bundleDir: string;
+  outDir: string;
+  codexHomeDir: string;
+}): Promise<void> {
+  await Promise.all([
+    fs.rm(params.bundleDir, { recursive: true, force: true }),
+    fs.rm(params.outDir, { recursive: true, force: true }),
+    fs.rm(params.codexHomeDir, { recursive: true, force: true })
+  ]);
+  await fs.mkdir(params.bundleDir, { recursive: true });
+  await fs.mkdir(params.outDir, { recursive: true });
+  await fs.mkdir(params.codexHomeDir, { recursive: true });
+  await fs.mkdir(path.join(params.bundleDir, "repo_hints"), { recursive: true });
+}
+
+type RepoGitMetadataState = {
+  gitFilePath: string;
+  content: string;
+};
+
+async function readRepoGitMetadataFile(filePath: string): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size > MAX_REPO_GIT_METADATA_BYTES) {
+      throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+    }
+    const buffer = Buffer.alloc(MAX_REPO_GIT_METADATA_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_REPO_GIT_METADATA_BYTES) {
+      throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+    }
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function captureRepoGitMetadataState(repoPath: string): Promise<RepoGitMetadataState> {
+  const gitFilePath = path.join(repoPath, ".git");
+  const stat = await fs.lstat(gitFilePath);
+  if (!stat.isFile()) {
+    throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+  }
+  const content = await readRepoGitMetadataFile(gitFilePath);
+  return { gitFilePath, content };
+}
+
+async function assertRepoGitMetadataUnchanged(
+  repoPath: string,
+  expected: RepoGitMetadataState
+): Promise<void> {
+  const current = await captureRepoGitMetadataState(repoPath);
+  if (current.gitFilePath !== expected.gitFilePath || current.content !== expected.content) {
+    throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+  }
+}
+
 function normalizeReplyBody(body: string): string {
   return body
     .replace(/\r\n/g, "\n")
@@ -229,6 +509,27 @@ function permissionDeniedReply(author: string): string {
   );
 }
 
+function untrustedMentionDoReply(author: string): string {
+  return ensureMentionPrefix(
+    "Only repository collaborators can use `@grepiku do:` to request code changes or a follow-up PR. Maintainers can still use `@grepiku` for questions without write actions.",
+    author
+  );
+}
+
+function untrustedForkMentionDoReply(author: string): string {
+  return ensureMentionPrefix(
+    "I can't open a follow-up PR from an untrusted fork pull request. Ask a collaborator to branch from this repository first, or use `@grepiku` for a read-only answer instead.",
+    author
+  );
+}
+
+function gitMetadataTamperReply(author: string): string {
+  return ensureMentionPrefix(
+    "I couldn't continue because the task modified `.git` metadata, which is blocked for safety. Please request source-file changes only.",
+    author
+  );
+}
+
 function defaultCommitMessage(task: string): string {
   const firstLine = task
     .replace(/\s+/g, " ")
@@ -238,10 +539,15 @@ function defaultCommitMessage(task: string): string {
   return `chore: ${firstLine}`;
 }
 
+function sanitizeGitHubNotificationText(value: string): string {
+  return neutralizeGitHubIssueReferences(
+    neutralizeGitHubClosingKeywords(neutralizeGitHubMentions(value.replace(/\r\n/g, "\n")))
+  );
+}
+
 function sanitizeCommitMessage(value: string | undefined, task: string): string {
   const fallback = defaultCommitMessage(task);
-  if (!value) return fallback;
-  const normalized = value
+  const normalized = (value || fallback)
     .replace(/\r\n/g, "\n")
     .split("\n")
     .map((line) => line.trimEnd())
@@ -249,7 +555,9 @@ function sanitizeCommitMessage(value: string | undefined, task: string): string 
     .slice(0, 6)
     .join("\n")
     .trim();
-  return normalized || fallback;
+  const bounded = normalized.slice(0, MAX_FOLLOW_UP_COMMIT_MESSAGE_CHARS).trim();
+  const safe = sanitizeGitHubNotificationText(bounded);
+  return safe || sanitizeGitHubNotificationText(fallback);
 }
 
 function defaultPrTitle(task: string): string {
@@ -261,8 +569,23 @@ function defaultPrTitle(task: string): string {
   return `Grepiku: ${summary}`;
 }
 
+function sanitizePrTitle(value: string | undefined, task: string): string {
+  const fallback = defaultPrTitle(task);
+  const normalized = (value || fallback)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const bounded = normalized.slice(0, MAX_FOLLOW_UP_PR_TITLE_CHARS).trim();
+  const safe = sanitizeGitHubNotificationText(bounded);
+  return safe || sanitizeGitHubNotificationText(fallback);
+}
+
 function formatCheckLine(result: { status: string; summary: string }): string {
-  return `${result.status} - ${result.summary}`;
+  return `${result.status} - ${sanitizeGitHubMarkdownText(result.summary)}`;
 }
 
 function checksMarkdown(checks: MentionChecksOutput): string {
@@ -298,16 +621,18 @@ function renderPrBody(params: {
 }): string {
   const changedSection =
     params.changedFiles.length > 0
-      ? params.changedFiles.map((item) => `- ${item}`).join("\n")
+      ? params.changedFiles
+          .map((item) => `- ${sanitizeGitHubMarkdownText(item)}`)
+          .join("\n")
       : "- (no tracked file paths)";
   const bodyHint = params.prBodyHint?.trim();
   return [
-    bodyHint || "",
+    bodyHint ? sanitizeGitHubMarkdownText(bodyHint) : "",
     "## Request",
-    params.task,
+    sanitizeGitHubMarkdownText(params.task),
     "",
     "## Grepiku Summary",
-    params.summary,
+    sanitizeGitHubMarkdownText(params.summary),
     "",
     "## Changed Files",
     changedSection,
@@ -378,7 +703,7 @@ async function runAnswerOnlyPath(params: {
 
   const reply = await readAndValidateJson(path.join(params.outDir, "reply.json"), ReplySchema);
   const body = withMentionMarker(
-    ensureMentionPrefix(reply.body, params.commentAuthor),
+    ensureMentionPrefix(sanitizeGitHubMarkdownText(reply.body), params.commentAuthor),
     params.commentId
   );
   await postMentionReply({
@@ -410,8 +735,10 @@ async function runImplementPath(params: {
       draft?: boolean;
     }) => Promise<ProviderPullRequest>;
     findOpenPullRequestByHead?: (params: { head: string; base?: string }) => Promise<ProviderPullRequest | null>;
+    pushBranch?: (params: { repoPath: string; branchName: string }) => Promise<void>;
   };
   refreshed: ProviderPullRequest;
+  repoFullName: string;
   pullRequestBaseRef: string | null;
   pullRequestHeadRef: string | null;
   repoDefaultBranch: string | null;
@@ -443,6 +770,7 @@ async function runImplementPath(params: {
     gitUserName: `${botSlug}[bot]`,
     gitUserEmail: `${botSlug}@users.noreply.github.com`
   });
+  const initialGitMetadata = await captureRepoGitMetadataState(params.repoPath);
 
   const implementPrompt = buildMentionImplementPrompt({
     commentBody: params.commentBody,
@@ -468,16 +796,11 @@ async function runImplementPath(params: {
     captureLastMessage: false
   });
 
-  const action = await readAndValidateJson(
-    path.join(params.outDir, "mention_action.json"),
-    MentionActionSchema
-  );
-
-  const hasChanges = await hasWorkingTreeChanges(params.repoPath);
-  if (!hasChanges || action.action !== "changed") {
-    const fallback = action.action === "cannot_complete" ? action.reply : "No code changes were required for that request.";
+  try {
+    await assertRepoGitMetadataUnchanged(params.repoPath, initialGitMetadata);
+  } catch {
     const replyBody = withMentionMarker(
-      ensureMentionPrefix(action.reply || fallback, params.commentAuthor),
+      gitMetadataTamperReply(params.commentAuthor),
       params.commentId
     );
     await postMentionReply({
@@ -489,19 +812,61 @@ async function runImplementPath(params: {
     return { mode: "answer" };
   }
 
-  const checks = await runMentionChecks({
-    repoPath: params.repoPath,
-    tools: params.repoTools
-  }).catch((err) => {
-    const message = err instanceof Error ? err.message : "mention verification failed";
-    return {
-      checks: {
-        lint: { status: "error", summary: message, top_errors: [] },
-        build: { status: "error", summary: message, top_errors: [] },
-        test: { status: "error", summary: message, top_errors: [] }
-      }
-    } as MentionChecksOutput;
+  const action = await readAndValidateJson(
+    path.join(params.outDir, "mention_action.json"),
+    MentionActionSchema
+  );
+
+  const hasChanges = await hasWorkingTreeChanges(params.repoPath);
+  if (!hasChanges || action.action !== "changed") {
+    const fallback = action.action === "cannot_complete" ? action.reply : "No code changes were required for that request.";
+    const replyBody = withMentionMarker(
+      ensureMentionPrefix(
+        sanitizeGitHubMarkdownText(action.reply || fallback),
+        params.commentAuthor
+      ),
+      params.commentId
+    );
+    await postMentionReply({
+      client: params.client,
+      commentId: params.commentId,
+      body: replyBody,
+      replyInThread: params.replyInThread
+    });
+    return { mode: "answer" };
+  }
+
+  const checksPlan = planMentionChecks({
+    repoFullName: params.repoFullName,
+    pullRequest: params.refreshed
   });
+  const checks = checksPlan.shouldRun
+    ? await (async () => {
+        const workspace = await createRepoCommandWorkspace({
+          sourceRepoPath: params.repoPath,
+          baseDir: path.join(env.projectRoot, "var", "mention-checks"),
+          label: params.commentId
+        });
+        try {
+          return await runMentionChecks({
+            repoPath: workspace.repoPath,
+            tools: params.repoTools,
+            homeDir: workspace.homeDir
+          });
+        } finally {
+          await workspace.cleanup().catch(() => undefined);
+        }
+      })().catch((err) => {
+        const message = err instanceof Error ? err.message : "mention verification failed";
+        return {
+          checks: {
+            lint: { status: "error", summary: message, top_errors: [] },
+            build: { status: "error", summary: message, top_errors: [] },
+            test: { status: "error", summary: message, top_errors: [] }
+          }
+        } as MentionChecksOutput;
+      })
+    : buildMentionSkippedChecks(checksPlan.skippedSummary || "skipped");
 
   const commitMessage = sanitizeCommitMessage(action.commit_message, params.mentionTask);
   const changedFiles = await changedPaths(params.repoPath);
@@ -509,7 +874,11 @@ async function runImplementPath(params: {
     repoPath: params.repoPath,
     message: commitMessage
   });
-  await pushBranch({ repoPath: params.repoPath, branchName });
+  if (params.client.pushBranch) {
+    await params.client.pushBranch({ repoPath: params.repoPath, branchName });
+  } else {
+    await pushBranch({ repoPath: params.repoPath, branchName });
+  }
 
   const baseBranch = resolveFollowUpPrBaseBranch({
     pullRequestHeadRef: params.pullRequestHeadRef,
@@ -519,7 +888,7 @@ async function runImplementPath(params: {
     repoDefaultBranch: params.repoDefaultBranch
   });
 
-  const prTitle = action.pr_title?.trim() || defaultPrTitle(params.mentionTask);
+  const prTitle = sanitizePrTitle(action.pr_title, params.mentionTask);
   const prBody = renderPrBody({
     summary: action.summary,
     prBodyHint: action.pr_body,
@@ -551,7 +920,7 @@ async function runImplementPath(params: {
   const prUrl = followUpPr.url || "";
   const prLink = prUrl ? prUrl : `#${followUpPr.number}`;
   const replyParts = [
-    ensureMentionPrefix(action.reply, params.commentAuthor),
+    ensureMentionPrefix(sanitizeGitHubMarkdownText(action.reply), params.commentAuthor),
     `Opened follow-up PR: ${prLink}`,
     formatChecksForComment(checks)
   ];
@@ -580,8 +949,10 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
     commentId,
     commentBody,
     commentAuthor,
+    commentAuthorAssociation,
     commentUrl,
-    replyInThread
+    replyInThread,
+    denyImplementation
   } =
     data;
   const repo = await prisma.repo.findFirst({ where: { id: repoId } });
@@ -612,16 +983,101 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
     repo: providerRepo,
     pullRequest: providerPull
   });
+
+  if (denyImplementation) {
+    const { runDir } = await createReplyDirs(env.projectRoot, commentId);
+    if (await isCompleted(runDir)) {
+      console.log(`[mention ${commentId}] already completed; skipping`);
+      return;
+    }
+
+    const body = withMentionMarker(untrustedMentionDoReply(commentAuthor), commentId);
+    await postMentionReply({
+      client,
+      commentId,
+      body,
+      replyInThread
+    });
+    await markCompleted(runDir, {
+      mode: "answer",
+      denied: true,
+      reason: "untrusted_commenter",
+      finishedAt: new Date().toISOString()
+    });
+    return;
+  }
+
   const refreshed = await client.fetchPullRequest();
+  const refreshedPullRequestState = mergeStoredPullRequestState(
+    {
+      title: pullRequest.title,
+      body: pullRequest.body,
+      url: pullRequest.url,
+      state: pullRequest.state,
+      baseRef: pullRequest.baseRef,
+      headRef: pullRequest.headRef,
+      baseSha: pullRequest.baseSha,
+      headSha: pullRequest.headSha,
+      draft: pullRequest.draft
+    },
+    refreshed
+  );
+  await prisma.pullRequest.update({
+    where: { id: pullRequest.id },
+    data: {
+      title: refreshedPullRequestState.title,
+      body: refreshedPullRequestState.body,
+      url: refreshedPullRequestState.url,
+      state: refreshedPullRequestState.state,
+      baseRef: refreshedPullRequestState.baseRef,
+      headRef: refreshedPullRequestState.headRef,
+      baseSha: refreshedPullRequestState.baseSha,
+      headSha: refreshedPullRequestState.headSha,
+      draft: refreshedPullRequestState.draft
+    }
+  });
+  const savedRepoConfig = await loadSavedRepoConfig(repo.id);
+  const queuedMentionTask = extractMentionDoTask(commentBody, savedRepoConfig);
+  const implementationPlan = queuedMentionTask
+    ? planMentionImplementation({
+        repoFullName: repo.fullName,
+        pullRequest: refreshed
+      })
+    : null;
+  if (queuedMentionTask && implementationPlan && !implementationPlan.shouldRun) {
+    const { runDir } = await createReplyDirs(env.projectRoot, commentId);
+    if (await isCompleted(runDir)) {
+      console.log(`[mention ${commentId}] already completed; skipping`);
+      return;
+    }
+
+    const body = withMentionMarker(untrustedForkMentionDoReply(commentAuthor), commentId);
+    await postMentionReply({
+      client,
+      commentId,
+      body,
+      replyInThread
+    });
+    await markCompleted(runDir, {
+      mode: "answer",
+      denied: true,
+      reason: "untrusted_fork_pull_request",
+      finishedAt: new Date().toISOString()
+    });
+    return;
+  }
 
   const repoPath = await client.ensureRepoCheckout({ headSha: refreshed.headSha });
-  const { config: fileRepoConfig, warnings } = await loadRepoConfig(repoPath);
-  await saveRepoConfig(repo.id, fileRepoConfig, warnings);
+  const { config: trustedRepoConfig, warnings } = await loadRepoConfigAtGitRef(
+    repoPath,
+    refreshed.baseSha || pullRequest.baseSha || null
+  );
+  await saveRepoConfig(repo.id, trustedRepoConfig, warnings);
   const memoryRules = await loadAcceptedRepoMemoryRules(repo.id);
   const repoConfig =
     memoryRules.length > 0
-      ? { ...fileRepoConfig, rules: mergeRulesWithRepoMemory(fileRepoConfig.rules, memoryRules) }
-      : fileRepoConfig;
+      ? { ...trustedRepoConfig, rules: mergeRulesWithRepoMemory(trustedRepoConfig.rules, memoryRules) }
+      : trustedRepoConfig;
 
   let diffPatch = "";
   let changedFiles: Array<{ path?: string; status?: string; additions?: number; deletions?: number; patch?: string | null }> = [];
@@ -651,16 +1107,28 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   }
 
   if (!localCompareSucceeded) {
-    try {
-      diffPatch = await client.fetchDiffPatch();
-    } catch {
-      diffPatch = await buildLocalDiffPatch({
-        repoPath,
-        baseSha: refreshed.baseSha,
-        headSha: refreshed.headSha
-      });
-    }
+    diffPatch = await resolveDiffPatchAfterLocalCompareFailure({
+      fetchProviderDiff: () => client.fetchDiffPatch(),
+      buildLocalDiff: () =>
+        buildLocalDiffPatch({
+          repoPath,
+          baseSha: refreshed.baseSha,
+          headSha: refreshed.headSha
+        })
+    });
     changedFiles = await client.listChangedFiles();
+  }
+
+  const modelVisibleReviewData = sanitizeModelVisibleReviewData({
+    diffPatch,
+    changedFiles
+  });
+  diffPatch = modelVisibleReviewData.diffPatch;
+  changedFiles = modelVisibleReviewData.changedFiles;
+  if (modelVisibleReviewData.sensitivePaths.length > 0) {
+    console.log(
+      `[mention ${commentId}] withheld ${modelVisibleReviewData.sensitivePaths.length} sensitive changed path(s) from model-visible context`
+    );
   }
 
   const contextPack = await buildContextPack({
@@ -673,29 +1141,30 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
       additions?: number;
       deletions?: number;
     }>,
-    prTitle: refreshed.title || pullRequest.title,
-    prBody: refreshed.body || pullRequest.body,
+    prTitle: refreshedPullRequestState.title,
+    prBody: refreshedPullRequestState.body,
     retrieval: repoConfig.retrieval,
     graph: repoConfig.graph
   });
 
-  const prMarkdown = `# PR #${prNumber}: ${refreshed.title || pullRequest.title || "Untitled"}
-
-Author: ${refreshed.author?.login || "unknown"}
-Base: ${refreshed.baseRef || ""}
-Head: ${refreshed.headRef || ""}
-Head SHA: ${refreshed.headSha}
-URL: ${refreshed.url || ""}
-
-## Description
-${refreshed.body || pullRequest.body || "(no description)"}
-`;
+  const prMarkdown = renderPrMarkdown({
+    title: refreshedPullRequestState.title || "Untitled",
+    number: prNumber,
+    author: refreshed.author?.login || "unknown",
+    body: refreshedPullRequestState.body,
+    baseRef: refreshedPullRequestState.baseRef,
+    headRef: refreshedPullRequestState.headRef,
+    headSha: refreshedPullRequestState.headSha,
+    url: refreshedPullRequestState.url,
+    sensitivePathsWithheld: modelVisibleReviewData.sensitivePaths
+  });
 
   const { runDir, bundleDir, outDir, codexHomeDir } = await createReplyDirs(env.projectRoot, commentId);
   if (await isCompleted(runDir)) {
     console.log(`[mention ${commentId}] already completed; skipping`);
     return;
   }
+  await resetReplyRunState({ bundleDir, outDir, codexHomeDir });
 
   await writeBundleFiles({
     bundleDir,
@@ -709,8 +1178,48 @@ ${refreshed.body || pullRequest.body || "(no description)"}
   });
 
   const mentionTask = extractMentionDoTask(commentBody, repoConfig);
+  const mentionExecutionMode = resolveMentionExecutionMode({
+    mentionTask,
+    commentAuthorAssociation,
+    repoFullName: repo.fullName,
+    pullRequest: refreshed
+  });
 
-  if (!mentionTask) {
+  if (mentionExecutionMode === "deny_untrusted_commenter") {
+    const body = withMentionMarker(untrustedMentionDoReply(commentAuthor), commentId);
+    await postMentionReply({
+      client,
+      commentId,
+      body,
+      replyInThread
+    });
+    await markCompleted(runDir, {
+      mode: "answer",
+      denied: true,
+      reason: "untrusted_commenter",
+      finishedAt: new Date().toISOString()
+    });
+    return;
+  }
+
+  if (mentionExecutionMode === "deny_untrusted_fork") {
+    const body = withMentionMarker(untrustedForkMentionDoReply(commentAuthor), commentId);
+    await postMentionReply({
+      client,
+      commentId,
+      body,
+      replyInThread
+    });
+    await markCompleted(runDir, {
+      mode: "answer",
+      denied: true,
+      reason: "untrusted_fork_pull_request",
+      finishedAt: new Date().toISOString()
+    });
+    return;
+  }
+
+  if (mentionExecutionMode === "answer") {
     await runAnswerOnlyPath({
       repoPath,
       bundleDir,
@@ -730,6 +1239,10 @@ ${refreshed.body || pullRequest.body || "(no description)"}
     return;
   }
 
+  if (!mentionTask) {
+    throw new Error("mention task missing after trusted execution planning");
+  }
+
   try {
     const result = await runImplementPath({
       repoPath,
@@ -743,6 +1256,7 @@ ${refreshed.body || pullRequest.body || "(no description)"}
       mentionTask,
       client,
       refreshed,
+      repoFullName: repo.fullName,
       pullRequestBaseRef: pullRequest.baseRef || null,
       pullRequestHeadRef: pullRequest.headRef || null,
       repoDefaultBranch: repo.defaultBranch || null,
@@ -777,5 +1291,19 @@ ${refreshed.body || pullRequest.body || "(no description)"}
 }
 
 export const __mentionInternals = {
-  postMentionReply
+  renderPrBody,
+  postMentionReply,
+  planMentionChecks,
+  planMentionImplementation,
+  resolveMentionExecutionMode,
+  sanitizeCommitMessage,
+  sanitizePrTitle,
+  buildToolCommandEnv,
+  buildSandboxedToolCommand,
+  buildMentionToolExecaOptions,
+  buildMentionToolResult,
+  runMentionTool,
+  resetReplyRunState,
+  captureRepoGitMetadataState,
+  assertRepoGitMetadataUnchanged
 };

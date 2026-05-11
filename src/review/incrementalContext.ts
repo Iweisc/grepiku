@@ -26,14 +26,16 @@ export type IncrementalReviewContext = {
     head_sha: string;
     trigger: string;
     completed_at: string | null;
-    summary: unknown;
+    summary: {
+      risk: string | null;
+      confidence: number | null;
+      file_paths: string[];
+    } | null;
     comments: Array<{
       path: string;
       line: number;
       severity: string;
       category: string;
-      title: string;
-      body: string;
       comment_type: string;
       confidence?: string;
     }>;
@@ -43,10 +45,6 @@ export type IncrementalReviewContext = {
     line: number;
     severity: string;
     category: string;
-    title: string;
-    body: string;
-    rule_id?: string;
-    rule_reason?: string;
   }>;
 };
 
@@ -60,30 +58,60 @@ function severityRank(value: string): number {
   return severityOrder.get(value) ?? 9;
 }
 
+const MAX_INCREMENTAL_PATH_CHARS = 240;
+
+function sanitizeHistoricalPath(value: string): string {
+  return value
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_INCREMENTAL_PATH_CHARS)
+    .trim();
+}
+
+function summarizePreviousSummary(value: unknown): IncrementalReviewContext["previous_run"]["summary"] {
+  const parsedSummary = ReviewSchema.shape.summary.safeParse(value);
+  if (!parsedSummary.success) {
+    return null;
+  }
+
+  const filePaths = Array.from(
+    new Set(
+      (parsedSummary.data.file_breakdown || [])
+        .map((item) => sanitizeHistoricalPath(item.path))
+        .filter((item) => item.length > 0)
+    )
+  ).slice(0, 40);
+
+  return {
+    risk: parsedSummary.data.risk,
+    confidence:
+      typeof parsedSummary.data.confidence === "number" ? parsedSummary.data.confidence : null,
+    file_paths: filePaths
+  };
+}
+
 function parsePreviousRun(previousRun: PreviousRunSnapshot): {
-  summary: unknown;
+  summary: IncrementalReviewContext["previous_run"]["summary"];
   comments: IncrementalReviewContext["previous_run"]["comments"];
 } {
   const parsedFinal = ReviewSchema.safeParse(previousRun.finalJson);
   if (parsedFinal.success) {
     return {
-      summary: parsedFinal.data.summary,
+      summary: summarizePreviousSummary(parsedFinal.data.summary),
       comments: parsedFinal.data.comments.slice(0, 60).map((comment) => ({
-        path: comment.path,
+        path: sanitizeHistoricalPath(comment.path),
         line: comment.line,
         severity: comment.severity,
         category: comment.category,
-        title: comment.title,
-        body: comment.body,
         comment_type: comment.comment_type || "inline",
         confidence: comment.confidence
-      }))
+      })).filter((comment) => comment.path.length > 0)
     };
   }
 
-  const parsedSummary = ReviewSchema.shape.summary.safeParse(previousRun.summaryJson);
   return {
-    summary: parsedSummary.success ? parsedSummary.data : null,
+    summary: summarizePreviousSummary(previousRun.summaryJson),
     comments: []
   };
 }
@@ -100,22 +128,19 @@ export function buildIncrementalReviewContext(params: {
     .sort((a, b) => {
       const severityDiff = severityRank(a.severity) - severityRank(b.severity);
       if (severityDiff !== 0) return severityDiff;
-      const pathDiff = a.path.localeCompare(b.path);
+      const pathDiff = sanitizeHistoricalPath(a.path).localeCompare(sanitizeHistoricalPath(b.path));
       if (pathDiff !== 0) return pathDiff;
       if (a.line !== b.line) return a.line - b.line;
-      return a.title.localeCompare(b.title);
+      return a.category.localeCompare(b.category);
     })
     .slice(0, 80)
     .map((finding) => ({
-      path: finding.path,
+      path: sanitizeHistoricalPath(finding.path),
       line: finding.line,
       severity: finding.severity,
-      category: finding.category,
-      title: finding.title,
-      body: finding.body,
-      ...(finding.ruleId ? { rule_id: finding.ruleId } : {}),
-      ...(finding.ruleReason ? { rule_reason: finding.ruleReason } : {})
-    }));
+      category: finding.category
+    }))
+    .filter((finding) => finding.path.length > 0);
 
   return {
     previous_run: {

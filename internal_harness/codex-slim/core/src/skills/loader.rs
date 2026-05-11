@@ -153,6 +153,7 @@ fn load_skills_with_home_dir(config: &Config, home_dir: Option<&Path>) -> SkillL
 pub(crate) struct SkillRoot {
     pub(crate) path: PathBuf,
     pub(crate) scope: SkillScope,
+    pub(crate) boundary: Option<PathBuf>,
 }
 
 pub(crate) fn load_skills_from_roots<I>(roots: I) -> SkillLoadOutcome
@@ -161,7 +162,7 @@ where
 {
     let mut outcome = SkillLoadOutcome::default();
     for root in roots {
-        discover_skills_under_root(&root.path, root.scope, &mut outcome);
+        discover_skills_under_root(&root, &mut outcome);
     }
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -204,9 +205,15 @@ fn skill_roots_from_layer_stack_inner(
 
         match &layer.name {
             ConfigLayerSource::Project { .. } => {
+                let boundary = config_folder
+                    .as_path()
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .or_else(|| Some(config_folder.as_path().to_path_buf()));
                 roots.push(SkillRoot {
                     path: config_folder.as_path().join(SKILLS_DIR_NAME),
                     scope: SkillScope::Repo,
+                    boundary,
                 });
             }
             ConfigLayerSource::User { .. } => {
@@ -215,6 +222,7 @@ fn skill_roots_from_layer_stack_inner(
                 roots.push(SkillRoot {
                     path: config_folder.as_path().join(SKILLS_DIR_NAME),
                     scope: SkillScope::User,
+                    boundary: None,
                 });
 
                 // `$HOME/.agents/skills` (user-installed skills).
@@ -222,6 +230,7 @@ fn skill_roots_from_layer_stack_inner(
                     roots.push(SkillRoot {
                         path: home_dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
                         scope: SkillScope::User,
+                        boundary: None,
                     });
                 }
 
@@ -230,6 +239,7 @@ fn skill_roots_from_layer_stack_inner(
                 roots.push(SkillRoot {
                     path: system_cache_root_dir(config_folder.as_path()),
                     scope: SkillScope::System,
+                    boundary: None,
                 });
             }
             ConfigLayerSource::System { .. } => {
@@ -238,6 +248,7 @@ fn skill_roots_from_layer_stack_inner(
                 roots.push(SkillRoot {
                     path: config_folder.as_path().join(SKILLS_DIR_NAME),
                     scope: SkillScope::Admin,
+                    boundary: None,
                 });
             }
             ConfigLayerSource::Mdm { .. }
@@ -289,6 +300,7 @@ fn repo_agents_skill_roots(config_layer_stack: &ConfigLayerStack, cwd: &Path) ->
             roots.push(SkillRoot {
                 path: agents_skills,
                 scope: SkillScope::Repo,
+                boundary: Some(project_root.clone()),
             });
         }
     }
@@ -351,12 +363,26 @@ fn dirs_between_project_root_and_cwd(cwd: &Path, project_root: &Path) -> Vec<Pat
     dirs
 }
 
-fn discover_skills_under_root(root: &Path, scope: SkillScope, outcome: &mut SkillLoadOutcome) {
-    let Ok(root) = canonicalize_path(root) else {
+fn is_path_within_root(root: &Path, candidate: &Path) -> bool {
+    candidate.strip_prefix(root).is_ok()
+}
+
+fn discover_skills_under_root(root: &SkillRoot, outcome: &mut SkillLoadOutcome) {
+    let allowed_boundary = root
+        .boundary
+        .as_ref()
+        .and_then(|boundary| canonicalize_path(boundary).ok());
+    let Ok(root_dir) = canonicalize_path(&root.path) else {
         return;
     };
 
-    if !root.is_dir() {
+    if let Some(boundary) = allowed_boundary.as_ref() {
+        if !is_path_within_root(boundary, &root_dir) {
+            return;
+        }
+    }
+
+    if !root_dir.is_dir() {
         return;
     }
 
@@ -381,14 +407,14 @@ fn discover_skills_under_root(root: &Path, scope: SkillScope, outcome: &mut Skil
 
     // Follow symlinked directories for user, admin, and repo skills. System skills are written by Codex itself.
     let follow_symlinks = matches!(
-        scope,
+        root.scope,
         SkillScope::Repo | SkillScope::User | SkillScope::Admin
     );
 
     let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
-    visited_dirs.insert(root.clone());
+    visited_dirs.insert(root_dir.clone());
 
-    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::from([(root.clone(), 0)]);
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::from([(root_dir.clone(), 0)]);
     let mut truncated_by_dir_limit = false;
 
     while let Some((dir, depth)) = queue.pop_front() {
@@ -436,6 +462,11 @@ fn discover_skills_under_root(root: &Path, scope: SkillScope, outcome: &mut Skil
                     let Ok(resolved_dir) = canonicalize_path(&path) else {
                         continue;
                     };
+                    if let Some(boundary) = allowed_boundary.as_ref() {
+                        if !is_path_within_root(boundary, &resolved_dir) {
+                            continue;
+                        }
+                    }
                     enqueue_dir(
                         &mut queue,
                         &mut visited_dirs,
@@ -464,12 +495,12 @@ fn discover_skills_under_root(root: &Path, scope: SkillScope, outcome: &mut Skil
             }
 
             if file_type.is_file() && file_name == SKILLS_FILENAME {
-                match parse_skill_file(&path, scope) {
+                match parse_skill_file(&path, root.scope) {
                     Ok(skill) => {
                         outcome.skills.push(skill);
                     }
                     Err(err) => {
-                        if scope != SkillScope::System {
+                        if root.scope != SkillScope::System {
                             outcome.errors.push(SkillError {
                                 path,
                                 message: err.to_string(),
@@ -485,7 +516,7 @@ fn discover_skills_under_root(root: &Path, scope: SkillScope, outcome: &mut Skil
         tracing::warn!(
             "skills scan truncated after {} directories (root: {})",
             MAX_SKILLS_DIRS_PER_ROOT,
-            root.display()
+            root.path.display()
         );
     }
 }
@@ -1850,6 +1881,7 @@ permissions:
         let outcome = load_skills_from_roots([SkillRoot {
             path: admin_root.path().to_path_buf(),
             scope: SkillScope::Admin,
+            boundary: None,
         }]);
 
         assert!(
@@ -1879,16 +1911,16 @@ permissions:
         let codex_home = tempfile::tempdir().expect("tempdir");
         let repo_dir = tempfile::tempdir().expect("tempdir");
         mark_as_git_repo(repo_dir.path());
-        let shared = tempfile::tempdir().expect("tempdir");
-
-        let linked_skill_path =
-            write_skill_at(shared.path(), "demo", "repo-linked-skill", "from link");
         let repo_skills_root = repo_dir
             .path()
             .join(REPO_ROOT_CONFIG_DIR_NAME)
             .join(SKILLS_DIR_NAME);
         fs::create_dir_all(&repo_skills_root).unwrap();
-        symlink_dir(shared.path(), &repo_skills_root.join("shared"));
+        let shared = repo_skills_root.join("shared-src");
+        fs::create_dir_all(&shared).unwrap();
+
+        let linked_skill_path = write_skill_at(&shared, "demo", "repo-linked-skill", "from link");
+        symlink_dir(&shared, &repo_skills_root.join("shared"));
 
         let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
         let outcome = load_skills_for_test(&cfg);
@@ -1916,6 +1948,64 @@ permissions:
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn ignores_repo_symlinked_subdir_that_escapes_repo_skills_root() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        mark_as_git_repo(repo_dir.path());
+        let shared = tempfile::tempdir().expect("tempdir");
+
+        write_skill_at(shared.path(), "demo", "repo-escaped-skill", "from link");
+
+        let repo_skills_root = repo_dir
+            .path()
+            .join(REPO_ROOT_CONFIG_DIR_NAME)
+            .join(SKILLS_DIR_NAME);
+        fs::create_dir_all(&repo_skills_root).unwrap();
+        symlink_dir(shared.path(), &repo_skills_root.join("shared"));
+
+        let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
+        let outcome = load_skills_for_test(&cfg);
+
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills, Vec::new());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ignores_repo_skills_root_symlink_that_escapes_repo_root() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        mark_as_git_repo(repo_dir.path());
+        let shared = tempfile::tempdir().expect("tempdir");
+
+        write_skill_at(
+            shared.path(),
+            "demo",
+            "repo-root-escaped-skill",
+            "from link",
+        );
+
+        let repo_config_root = repo_dir.path().join(REPO_ROOT_CONFIG_DIR_NAME);
+        fs::create_dir_all(&repo_config_root).unwrap();
+        symlink_dir(shared.path(), &repo_config_root.join(SKILLS_DIR_NAME));
+
+        let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
+        let outcome = load_skills_for_test(&cfg);
+
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills, Vec::new());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn system_scope_ignores_symlinked_subdir() {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let shared = tempfile::tempdir().expect("tempdir");
@@ -1929,6 +2019,7 @@ permissions:
         let outcome = load_skills_from_roots([SkillRoot {
             path: system_root,
             scope: SkillScope::System,
+            boundary: None,
         }]);
         assert!(
             outcome.errors.is_empty(),
@@ -1959,6 +2050,7 @@ permissions:
         let outcome = load_skills_from_roots([SkillRoot {
             path: skills_root,
             scope: SkillScope::User,
+            boundary: None,
         }]);
 
         assert!(
@@ -2306,10 +2398,12 @@ permissions:
             SkillRoot {
                 path: root.path().to_path_buf(),
                 scope: SkillScope::Repo,
+                boundary: None,
             },
             SkillRoot {
                 path: root.path().to_path_buf(),
                 scope: SkillScope::User,
+                boundary: None,
             },
         ]);
 

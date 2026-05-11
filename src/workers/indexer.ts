@@ -3,6 +3,7 @@ import { Worker } from "bullmq";
 import { indexQueue, redisConnection } from "../queue/index.js";
 import { loadEnv } from "../config/env.js";
 import { processIndexJob } from "../services/indexer.js";
+import { sanitizeGithubGitAuthError } from "../github/gitAuth.js";
 
 const env = loadEnv();
 
@@ -15,7 +16,7 @@ const worker = new Worker(
 );
 
 worker.on("failed", (job, err) => {
-  console.error(`Index job ${job?.id} failed`, err);
+  console.error(`Index job ${job?.id} failed`, sanitizeGithubGitAuthError(err));
 });
 
 worker.on("completed", (job) => {

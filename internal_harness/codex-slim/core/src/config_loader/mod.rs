@@ -766,6 +766,19 @@ async fn find_project_root(
     Ok(cwd.clone())
 }
 
+fn is_path_within_root(root: &Path, candidate: &Path) -> bool {
+    candidate.strip_prefix(root).is_ok()
+}
+
+fn canonicalize_path_within_root(root: &Path, candidate: &Path) -> Option<std::path::PathBuf> {
+    let resolved = normalize_path(candidate).ok()?;
+    if is_path_within_root(root, &resolved) {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
 /// Return the appropriate list of layers (each with
 /// [ConfigLayerSource::Project] as the source) between `cwd` and
 /// `project_root`, inclusive. The list is ordered in _increasing_ precdence,
@@ -780,6 +793,8 @@ async fn load_project_layers(
     let codex_home_abs = AbsolutePathBuf::from_absolute_path(codex_home)?;
     let codex_home_normalized =
         normalize_path(codex_home_abs.as_path()).unwrap_or_else(|_| codex_home_abs.to_path_buf());
+    let project_root_normalized = normalize_path(project_root.as_path())
+        .unwrap_or_else(|_| project_root.as_path().to_path_buf());
     let mut dirs = cwd
         .as_path()
         .ancestors()
@@ -799,11 +814,34 @@ async fn load_project_layers(
     let mut layers = Vec::new();
     for dir in dirs {
         let dot_codex = dir.join(".codex");
-        if !tokio::fs::metadata(&dot_codex)
-            .await
-            .map(|meta| meta.is_dir())
-            .unwrap_or(false)
-        {
+        let dot_codex_meta = match tokio::fs::symlink_metadata(&dot_codex).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!(
+                        "Failed to inspect project config directory {}: {err}",
+                        dot_codex.display()
+                    ),
+                ));
+            }
+        };
+        let dot_codex_is_dir = if dot_codex_meta.file_type().is_symlink() {
+            match canonicalize_path_within_root(&project_root_normalized, &dot_codex) {
+                Some(resolved) if resolved.is_dir() => true,
+                _ => {
+                    tracing::warn!(
+                        "Ignoring project config directory symlink `{}` because it resolves outside the project root.",
+                        dot_codex.display()
+                    );
+                    continue;
+                }
+            }
+        } else {
+            dot_codex_meta.is_dir()
+        };
+        if !dot_codex_is_dir {
             continue;
         }
 
@@ -816,55 +854,88 @@ async fn load_project_layers(
             continue;
         }
         let config_file = dot_codex_abs.join(CONFIG_TOML_FILE)?;
-        match tokio::fs::read_to_string(&config_file).await {
-            Ok(contents) => {
-                let config: TomlValue = match toml::from_str(&contents) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        if decision.is_trusted() {
-                            let config_file_display = config_file.as_path().display();
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "Error parsing project config file {config_file_display}: {e}"
-                                ),
-                            ));
+        let resolved_config_file = match tokio::fs::symlink_metadata(config_file.as_path()).await {
+            Ok(meta) => {
+                match canonicalize_path_within_root(&project_root_normalized, config_file.as_path())
+                {
+                    Some(resolved) if resolved.is_file() => Some(resolved),
+                    _ => {
+                        if meta.file_type().is_symlink() {
+                            tracing::warn!(
+                                "Ignoring project config file symlink `{}` because it resolves outside the project root.",
+                                config_file.as_path().display()
+                            );
                         }
-                        layers.push(project_layer_entry(
-                            trust_context,
-                            &dot_codex_abs,
-                            &layer_dir,
-                            TomlValue::Table(toml::map::Map::new()),
-                            true,
-                        ));
-                        continue;
+                        None
                     }
-                };
-                let config =
-                    resolve_relative_paths_in_config_toml(config, dot_codex_abs.as_path())?;
-                let entry =
-                    project_layer_entry(trust_context, &dot_codex_abs, &layer_dir, config, true);
-                layers.push(entry);
+                }
             }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => {
-                if err.kind() == io::ErrorKind::NotFound {
-                    // If there is no config.toml file, record an empty entry
-                    // for this project layer, as this may still have subfolders
-                    // that are significant in the overall ConfigLayerStack.
-                    layers.push(project_layer_entry(
+                let config_file_display = config_file.as_path().display();
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("Failed to inspect project config file {config_file_display}: {err}"),
+                ));
+            }
+        };
+        match resolved_config_file {
+            Some(resolved_config_file) => match tokio::fs::read_to_string(&resolved_config_file)
+                .await
+            {
+                Ok(contents) => {
+                    let config: TomlValue = match toml::from_str(&contents) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            if decision.is_trusted() {
+                                let config_file_display = config_file.as_path().display();
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "Error parsing project config file {config_file_display}: {e}"
+                                    ),
+                                ));
+                            }
+                            layers.push(project_layer_entry(
+                                trust_context,
+                                &dot_codex_abs,
+                                &layer_dir,
+                                TomlValue::Table(toml::map::Map::new()),
+                                true,
+                            ));
+                            continue;
+                        }
+                    };
+                    let config =
+                        resolve_relative_paths_in_config_toml(config, dot_codex_abs.as_path())?;
+                    let entry = project_layer_entry(
                         trust_context,
                         &dot_codex_abs,
                         &layer_dir,
-                        TomlValue::Table(toml::map::Map::new()),
-                        false,
-                    ));
-                } else {
+                        config,
+                        true,
+                    );
+                    layers.push(entry);
+                }
+                Err(err) => {
                     let config_file_display = config_file.as_path().display();
                     return Err(io::Error::new(
                         err.kind(),
                         format!("Failed to read project config file {config_file_display}: {err}"),
                     ));
                 }
+            },
+            None => {
+                // If there is no repo-owned config.toml file, record an empty entry
+                // for this project layer, as this may still have subfolders
+                // that are significant in the overall ConfigLayerStack.
+                layers.push(project_layer_entry(
+                    trust_context,
+                    &dot_codex_abs,
+                    &layer_dir,
+                    TomlValue::Table(toml::map::Map::new()),
+                    false,
+                ));
             }
         }
     }
@@ -915,6 +986,9 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     #[cfg(windows)]
     use std::path::Path;
     use tempfile::tempdir;
@@ -1016,5 +1090,68 @@ foo = "xyzzy"
                 .as_path()
                 .ends_with(Path::new("OpenAI").join("Codex").join("config.toml"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_project_layers_ignores_dot_codex_symlink_outside_repo() -> anyhow::Result<()> {
+        let repo = tempdir()?;
+        let external = tempdir()?;
+        std::fs::create_dir(repo.path().join(".git"))?;
+        std::fs::write(
+            external.path().join("config.toml"),
+            "model = \"external\"\n",
+        )?;
+        symlink(external.path(), repo.path().join(".codex"))?;
+
+        let cwd = AbsolutePathBuf::from_absolute_path(repo.path())?;
+        let project_root = cwd.clone();
+        let trust_context = ProjectTrustContext {
+            project_root: project_root.clone(),
+            project_root_key: repo.path().to_string_lossy().to_string(),
+            repo_root_key: None,
+            projects_trust: HashMap::new(),
+            user_config_file: AbsolutePathBuf::from_absolute_path(
+                repo.path().join("user-config.toml").as_path(),
+            )?,
+        };
+
+        let layers = load_project_layers(&cwd, &project_root, &trust_context, repo.path()).await?;
+        assert!(layers.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_project_layers_ignores_config_symlink_outside_repo() -> anyhow::Result<()> {
+        let repo = tempdir()?;
+        let external = tempdir()?;
+        std::fs::create_dir(repo.path().join(".git"))?;
+        std::fs::create_dir(repo.path().join(".codex"))?;
+        std::fs::write(
+            external.path().join("outside.toml"),
+            "model = \"external\"\n",
+        )?;
+        symlink(
+            external.path().join("outside.toml"),
+            repo.path().join(".codex").join("config.toml"),
+        )?;
+
+        let cwd = AbsolutePathBuf::from_absolute_path(repo.path())?;
+        let project_root = cwd.clone();
+        let trust_context = ProjectTrustContext {
+            project_root: project_root.clone(),
+            project_root_key: repo.path().to_string_lossy().to_string(),
+            repo_root_key: None,
+            projects_trust: HashMap::new(),
+            user_config_file: AbsolutePathBuf::from_absolute_path(
+                repo.path().join("user-config.toml").as_path(),
+            )?,
+        };
+
+        let layers = load_project_layers(&cwd, &project_root, &trust_context, repo.path()).await?;
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].config, TomlValue::Table(toml::map::Map::new()));
+        Ok(())
     }
 }

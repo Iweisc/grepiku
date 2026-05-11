@@ -1,14 +1,19 @@
 import fs from "fs/promises";
+import os from "os";
 import path from "path";
+import crypto from "crypto";
 import { pathToFileURL } from "url";
 import { z } from "zod";
 import { execa } from "execa";
+import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
 import { buildLocalDiffPatch, buildLocalChangedFiles } from "../review/localCompare.js";
 import { refineReviewComments } from "../review/quality.js";
 import { buildDiffIndex } from "../review/diff.js";
-import { loadRepoConfig } from "../review/config.js";
+import { loadRepoConfigAtGitRef } from "../review/config.js";
 import { buildReviewerPrompt, buildEditorPrompt } from "../review/prompts.js";
 import { createRunDirs, writeBundleFiles } from "../review/bundle.js";
+import { renderPrMarkdown } from "../review/prMarkdown.js";
+import { sanitizeModelVisibleReviewData } from "../review/sensitiveReviewData.js";
 import { ReviewSchema } from "../review/schemas.js";
 import { readAndValidateJson } from "../review/json.js";
 import type { ReviewComment, ReviewOutput } from "../review/schemas.js";
@@ -24,6 +29,8 @@ const ArgsSchema = z.object({
 });
 
 type DemoArgs = z.infer<typeof ArgsSchema>;
+
+const MAX_DEMO_DIFF_FILE_BYTES = 10 * 1024 * 1024;
 
 const FLAG_MAP: Record<string, string> = {
   "--repo-path": "repoPath",
@@ -58,8 +65,27 @@ export function parseCliArgs(argv: string[]): DemoArgs {
 }
 
 async function resolveGitSha(repoPath: string, ref: string): Promise<string> {
-  const { stdout } = await execa("git", ["-C", repoPath, "rev-parse", ref]);
-  return stdout.trim();
+  const normalizedRef = ref.trim();
+  if (!normalizedRef) {
+    throw new Error("Invalid git ref");
+  }
+
+  try {
+    const { stdout } = await execa(
+      "git",
+      ["-C", repoPath, "rev-parse", "--verify", "--end-of-options", `${normalizedRef}^{commit}`],
+      {
+        env: gitCheckoutSafetyEnv()
+      }
+    );
+    const resolved = stdout.trim();
+    if (!/^[0-9a-f]{40}$/i.test(resolved)) {
+      throw new Error("unexpected git rev-parse output");
+    }
+    return resolved;
+  } catch {
+    throw new Error(`Invalid git ref: ${ref}`);
+  }
 }
 
 async function resolveHeadSha(repoPath: string, head?: string): Promise<string> {
@@ -69,8 +95,42 @@ async function resolveHeadSha(repoPath: string, head?: string): Promise<string> 
 
 async function resolveBaseSha(repoPath: string, base?: string): Promise<string> {
   if (base) return resolveGitSha(repoPath, base);
-  const { stdout } = await execa("git", ["-C", repoPath, "merge-base", "HEAD", "HEAD~1"]);
+  const { stdout } = await execa("git", ["-C", repoPath, "merge-base", "HEAD", "HEAD~1"], {
+    env: gitCheckoutSafetyEnv()
+  });
   return stdout.trim();
+}
+
+export function buildDemoRunRoot(repoPath: string): string {
+  const resolvedRepoPath = path.resolve(repoPath);
+  const digest = crypto
+    .createHash("sha256")
+    .update(resolvedRepoPath)
+    .digest("hex")
+    .slice(0, 16);
+  return path.join(os.tmpdir(), "grepiku-demo", digest);
+}
+
+function demoDiffFileLimitError(filePath: string, maxBytes: number): Error {
+  return new Error(`diff file exceeded byte limit (${maxBytes} bytes): ${filePath}`);
+}
+
+export async function readDiffFileWithinLimit(
+  filePath: string,
+  maxBytes = MAX_DEMO_DIFF_FILE_BYTES
+): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size > maxBytes) {
+      throw demoDiffFileLimitError(filePath, maxBytes);
+    }
+    const buffer = Buffer.alloc(Math.max(0, Number(stat.size)));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 export function buildEmptyContextPack(diffPatch: string, changedFiles: Array<{ path: string }>): ContextPack {
@@ -143,6 +203,13 @@ export function formatTextOutput(review: ReviewOutput, comments: ReviewComment[]
   return lines.join("\n");
 }
 
+async function loadDemoRepoConfigAtBase(
+  repoPath: string,
+  baseSha: string | null | undefined
+) {
+  return loadRepoConfigAtGitRef(repoPath, baseSha);
+}
+
 async function main() {
   const args = parseCliArgs(process.argv.slice(2));
   const repoPath = path.resolve(args.repoPath);
@@ -160,7 +227,7 @@ async function main() {
 
   let diffPatch: string;
   if (args.diffFile) {
-    diffPatch = await fs.readFile(path.resolve(args.diffFile), "utf8");
+    diffPatch = await readDiffFileWithinLimit(path.resolve(args.diffFile));
     console.log(`[demo-review] diff loaded from file: ${args.diffFile}`);
   } else {
     diffPatch = await buildLocalDiffPatch({ repoPath, baseSha, headSha });
@@ -182,24 +249,48 @@ async function main() {
     return;
   }
 
-  const { config, warnings } = await loadRepoConfig(repoPath);
+  const { config, warnings } = await loadDemoRepoConfigAtBase(repoPath, baseSha);
   if (warnings.length > 0) {
     for (const warning of warnings) {
       console.warn(`[demo-review] config warning: ${warning}`);
     }
   }
 
-  const contextPack = buildEmptyContextPack(diffPatch, changedFiles);
+  const modelVisibleReviewData = sanitizeModelVisibleReviewData({
+    diffPatch,
+    changedFiles
+  });
+  diffPatch = modelVisibleReviewData.diffPatch;
+  const sanitizedChangedFiles = modelVisibleReviewData.changedFiles;
+  if (modelVisibleReviewData.sensitivePaths.length > 0) {
+    console.log(
+      `[demo-review] withheld ${modelVisibleReviewData.sensitivePaths.length} sensitive changed path(s) from model-visible context`
+    );
+  }
+
+  const contextPack = buildEmptyContextPack(
+    diffPatch,
+    sanitizedChangedFiles.filter((file): file is { path: string } => typeof file.path === "string")
+  );
   const demoRunId = Date.now();
-  const runRoot = path.join(repoPath, ".grepiku-demo");
+  const runRoot = buildDemoRunRoot(repoPath);
   const { bundleDir, outDir, codexHomeDir } = await createRunDirs(runRoot, demoRunId);
 
-  const prMarkdown = `# Demo Review\n\nLocal review of ${baseSha.slice(0, 12)}..${headSha.slice(0, 12)}\n`;
+  const prMarkdown = renderPrMarkdown({
+    title: "Demo Review",
+    number: 0,
+    author: "local-demo",
+    body: `Local review of ${baseSha.slice(0, 12)}..${headSha.slice(0, 12)}`,
+    baseRef: baseSha.slice(0, 12),
+    headRef: headSha.slice(0, 12),
+    headSha,
+    sensitivePathsWithheld: modelVisibleReviewData.sensitivePaths
+  });
   await writeBundleFiles({
     bundleDir,
     prMarkdown,
     diffPatch,
-    changedFiles,
+    changedFiles: sanitizedChangedFiles,
     repoConfig: config,
     resolvedConfig: config,
     contextPack,
@@ -252,7 +343,7 @@ async function main() {
   const { comments, diagnostics } = refineReviewComments({
     comments: finalReview.comments,
     diffIndex,
-    changedFiles,
+    changedFiles: sanitizedChangedFiles,
     maxInlineComments: config.limits.max_inline_comments,
     summaryOnly: config.output.summaryOnly,
     allowedTypes: config.commentTypes.allow
@@ -290,8 +381,13 @@ async function main() {
 
 export const __demoReviewInternals = {
   parseCliArgs,
+  buildDemoRunRoot,
   buildEmptyContextPack,
-  formatTextOutput
+  formatTextOutput,
+  readDiffFileWithinLimit,
+  loadDemoRepoConfigAtBase,
+  resolveBaseSha,
+  resolveHeadSha
 };
 
 const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";

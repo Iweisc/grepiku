@@ -5,6 +5,7 @@ export type ProviderUser = {
   login: string;
   name?: string | null;
   avatarUrl?: string | null;
+  association?: string | null;
 };
 
 export type ProviderRepo = {
@@ -52,6 +53,7 @@ export type ProviderReviewComment = {
   side?: string | null;
   inReplyToId?: string | null;
   createdAt?: string | null;
+  authorLogin?: string | null;
 };
 
 export type ProviderStatusCheck = {
@@ -94,6 +96,7 @@ export type ProviderWebhookEvent =
       provider: ProviderKind;
       type: "reaction";
       action: string;
+      reactionContent?: string | null;
       repo: ProviderRepo;
       pullRequest: ProviderPullRequest;
       comment: ProviderReviewComment;
@@ -119,13 +122,14 @@ export type ProviderClient = {
     side: string;
     body: string;
   }) => Promise<ProviderReviewComment>;
-  listInlineComments: () => Promise<ProviderReviewComment[]>;
+  listInlineComments: (params?: { bodyIncludes?: string; authorLogin?: string }) => Promise<ProviderReviewComment[]>;
   updateInlineComment: (commentId: string, body: string) => Promise<ProviderReviewComment>;
   resolveInlineThread?: (commentId: string) => Promise<boolean>;
   createStatusCheck: (check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   updateStatusCheck: (checkId: string, check: ProviderStatusCheck) => Promise<ProviderStatusCheck>;
   addReaction?: (commentId: string, reaction: string) => Promise<void>;
   replyToComment?: (params: { commentId: string; body: string }) => Promise<ProviderReviewComment>;
+  pushBranch?: (params: { repoPath: string; branchName: string }) => Promise<void>;
   deleteBranch?: (branch: string) => Promise<void>;
   createPullRequest?: (params: {
     title: string;
