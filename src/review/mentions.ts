@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
 import { execa } from "execa";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
@@ -461,14 +462,59 @@ async function readRepoGitMetadataFile(filePath: string): Promise<string> {
   }
 }
 
+async function readRepoGitMetadataDirectoryDigest(dirPath: string): Promise<string> {
+  const hash = crypto.createHash("sha256");
+
+  async function visit(relativeDir: string): Promise<void> {
+    const entries = await fs.readdir(path.join(dirPath, relativeDir), { withFileTypes: true });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      if (!relativeDir && entry.name === "objects") {
+        continue;
+      }
+      const relativePath = path.join(relativeDir, entry.name);
+      const normalizedPath = relativePath.split(path.sep).join("/");
+      const absolutePath = path.join(dirPath, relativePath);
+      const stat = await fs.lstat(absolutePath);
+
+      if (stat.isSymbolicLink()) {
+        throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+      }
+      if (stat.isDirectory()) {
+        hash.update(`dir\0${normalizedPath}\0`);
+        await visit(relativePath);
+        continue;
+      }
+      if (!stat.isFile()) {
+        throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+      }
+
+      hash.update(`file\0${normalizedPath}\0${stat.size}\0`);
+      if (stat.size <= MAX_REPO_GIT_METADATA_BYTES) {
+        hash.update(await fs.readFile(absolutePath));
+      } else {
+        hash.update(`${stat.mtimeMs}\0${stat.ctimeMs}\0`);
+      }
+    }
+  }
+
+  await visit("");
+  return `dir-sha256:${hash.digest("hex")}`;
+}
+
 async function captureRepoGitMetadataState(repoPath: string): Promise<RepoGitMetadataState> {
   const gitFilePath = path.join(repoPath, ".git");
   const stat = await fs.lstat(gitFilePath);
-  if (!stat.isFile()) {
-    throw new Error(GIT_METADATA_TAMPER_SUMMARY);
+  if (stat.isFile()) {
+    const content = await readRepoGitMetadataFile(gitFilePath);
+    return { gitFilePath, content };
   }
-  const content = await readRepoGitMetadataFile(gitFilePath);
-  return { gitFilePath, content };
+  if (stat.isDirectory()) {
+    const content = await readRepoGitMetadataDirectoryDigest(gitFilePath);
+    return { gitFilePath, content };
+  }
+  throw new Error(GIT_METADATA_TAMPER_SUMMARY);
 }
 
 async function assertRepoGitMetadataUnchanged(
@@ -1164,26 +1210,39 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
     console.log(`[mention ${commentId}] already completed; skipping`);
     return;
   }
-  await resetReplyRunState({ bundleDir, outDir, codexHomeDir });
-
-  await writeBundleFiles({
-    bundleDir,
-    prMarkdown,
-    diffPatch,
-    changedFiles,
-    repoConfig,
-    resolvedConfig: repoConfig,
-    contextPack,
-    warnings
+  const lockPath = path.join(runDir, "in_progress.lock");
+  const lockHandle = await fs.open(lockPath, "wx").catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "EEXIST") {
+      return null;
+    }
+    throw err;
   });
+  if (!lockHandle) {
+    console.log(`[mention ${commentId}] already running; skipping`);
+    return;
+  }
 
-  const mentionTask = extractMentionDoTask(commentBody, repoConfig);
-  const mentionExecutionMode = resolveMentionExecutionMode({
-    mentionTask,
-    commentAuthorAssociation,
-    repoFullName: repo.fullName,
-    pullRequest: refreshed
-  });
+  try {
+    await resetReplyRunState({ bundleDir, outDir, codexHomeDir });
+
+    await writeBundleFiles({
+      bundleDir,
+      prMarkdown,
+      diffPatch,
+      changedFiles,
+      repoConfig,
+      resolvedConfig: repoConfig,
+      contextPack,
+      warnings
+    });
+
+    const mentionTask = extractMentionDoTask(commentBody, repoConfig);
+    const mentionExecutionMode = resolveMentionExecutionMode({
+      mentionTask,
+      commentAuthorAssociation,
+      repoFullName: repo.fullName,
+      pullRequest: refreshed
+    });
 
   if (mentionExecutionMode === "deny_untrusted_commenter") {
     const body = withMentionMarker(untrustedMentionDoReply(commentAuthor), commentId);
@@ -1287,6 +1346,9 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
       permissionDenied: true,
       finishedAt: new Date().toISOString()
     });
+  } finally {
+    await lockHandle.close();
+    await fs.rm(lockPath, { force: true });
   }
 }
 

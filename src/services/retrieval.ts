@@ -147,7 +147,7 @@ export async function retrieveContext(params: {
     repoId: params.repoId,
     includeVector: false,
     onBatch: async (batch) => {
-      const { fileMap, symbolMap } = await loadEmbeddingBatchMetadata(batch);
+      const { fileMap, symbolMap } = await loadEmbeddingBatchMetadata(params.repoId, batch);
       for (const embedding of batch) {
         const fileMeta = embedding.fileId ? fileMap.get(embedding.fileId) : undefined;
         const path = fileMeta?.path;
@@ -327,7 +327,10 @@ export async function retrieveContext(params: {
   }));
 }
 
-async function loadEmbeddingBatchMetadata(batch: EmbeddingRow[]): Promise<EmbeddingBatchMetadata> {
+async function loadEmbeddingBatchMetadata(
+  repoId: number,
+  batch: EmbeddingRow[]
+): Promise<EmbeddingBatchMetadata> {
   const fileIds = Array.from(
     new Set(
       batch
@@ -346,13 +349,13 @@ async function loadEmbeddingBatchMetadata(batch: EmbeddingRow[]): Promise<Embedd
   const [files, symbols] = await Promise.all([
     fileIds.length > 0
       ? prisma.fileIndex.findMany({
-          where: { id: { in: fileIds } },
+          where: { repoId, id: { in: fileIds } },
           select: { id: true, path: true, isPattern: true }
         })
       : Promise.resolve([]),
     symbolIds.length > 0
       ? prisma.symbol.findMany({
-          where: { id: { in: symbolIds } },
+          where: { repoId, id: { in: symbolIds } },
           select: { id: true, name: true }
         })
       : Promise.resolve([])

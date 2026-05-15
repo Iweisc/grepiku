@@ -173,9 +173,11 @@ async function lookupToolRun(tool) {
 
 async function upsertToolRun(tool, result) {
   const reviewRunId = Number(process.env.REVIEW_RUN_ID || 0);
+  const topErrors = result.top_errors || result.topErrors || [];
+  const logPath = result.log_path ?? result.logPath ?? null;
   await client.query(
     'INSERT INTO "ToolRun" ("reviewRunId", tool, status, summary, "topErrors", "logPath", "createdAt", "updatedAt") VALUES ($1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT ("reviewRunId",tool) DO UPDATE SET status=EXCLUDED.status, summary=EXCLUDED.summary, "topErrors"=EXCLUDED."topErrors", "logPath"=EXCLUDED."logPath", "updatedAt"=now()',
-    [reviewRunId, tool, result.status, result.summary, JSON.stringify(result.topErrors || []), result.logPath || null]
+    [reviewRunId, tool, result.status, result.summary, JSON.stringify(topErrors), logPath]
   );
 }
 
@@ -193,7 +195,7 @@ async function handleTool(toolName) {
     const trustedTools = await loadTrustedVerifierTools({ bundleRoot, repoRoot });
     const toolCfg = trustedTools[toolName];
     if (!toolCfg || !toolCfg.cmd) {
-      const result = { status: "skipped", summary: "not configured", topErrors: [], logPath: null };
+      const result = { status: "skipped", summary: "not configured", top_errors: [], log_path: null };
       await upsertToolRun(toolName, result);
       return asText(JSON.stringify({ status: result.status, summary: result.summary, top_errors: [] }));
     }
@@ -204,7 +206,7 @@ async function handleTool(toolName) {
     return asText(JSON.stringify({
       status: result.status,
       summary: result.summary,
-      top_errors: result.topErrors || []
+      top_errors: result.top_errors || []
     }));
   });
 }
