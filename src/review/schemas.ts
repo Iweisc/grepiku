@@ -25,24 +25,26 @@ export const ReviewCommentSchema = z.object({
   confidence: z.enum(["high", "medium", "low"]).optional()
 });
 
+export const ReviewSummarySchema = z.object({
+  overview: z.string(),
+  risk: z.enum(["low", "medium", "high"]),
+  confidence: z.number().min(0).max(1).optional(),
+  key_concerns: z.array(z.string()),
+  what_to_test: z.array(z.string()),
+  file_breakdown: z
+    .array(
+      z.object({
+        path: z.string(),
+        summary: z.string(),
+        risk: z.enum(["low", "medium", "high"]).optional()
+      })
+    )
+    .optional(),
+  diagram_mermaid: z.string().optional()
+});
+
 export const ReviewSchema = z.object({
-  summary: z.object({
-    overview: z.string(),
-    risk: z.enum(["low", "medium", "high"]),
-    confidence: z.number().min(0).max(1).optional(),
-    key_concerns: z.array(z.string()),
-    what_to_test: z.array(z.string()),
-    file_breakdown: z
-      .array(
-        z.object({
-          path: z.string(),
-          summary: z.string(),
-          risk: z.enum(["low", "medium", "high"]).optional()
-        })
-      )
-      .optional(),
-    diagram_mermaid: z.string().optional()
-  }),
+  summary: ReviewSummarySchema,
   comments: z.array(ReviewCommentSchema)
 });
 
@@ -56,6 +58,16 @@ export const VerdictsSchema = z.object({
       revised_comment: z.record(z.any()).optional()
     })
   )
+});
+
+export const EditorOutputSchema = z.object({
+  final_review: ReviewSchema,
+  verdicts: VerdictsSchema
+});
+
+export const EditorDecisionOutputSchema = z.object({
+  summary: ReviewSummarySchema,
+  verdicts: VerdictsSchema
 });
 
 export const ToolResultSchema = z.object({
@@ -95,8 +107,11 @@ export const MentionChecksSchema = z.object({
 });
 
 export type ReviewOutput = z.infer<typeof ReviewSchema>;
+export type ReviewSummary = z.infer<typeof ReviewSummarySchema>;
 export type ReviewComment = z.infer<typeof ReviewCommentSchema>;
 export type VerdictsOutput = z.infer<typeof VerdictsSchema>;
+export type EditorOutput = z.infer<typeof EditorOutputSchema>;
+export type EditorDecisionOutput = z.infer<typeof EditorDecisionOutputSchema>;
 export type ChecksOutput = z.infer<typeof ChecksSchema>;
 export type ReplyOutput = z.infer<typeof ReplySchema>;
 export type MentionActionOutput = z.infer<typeof MentionActionSchema>;

@@ -23,6 +23,7 @@ const EnvSchema = z.object({
   PROJECT_ROOT: z.string().min(1),
   CODEX_EXEC_PATH: z.string().default(""),
   CODEX_STAGE_LOG_OUTPUT: z.string().default("false"),
+  CODEX_MODEL_REASONING_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
   INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
   LOG_LEVEL: z.string().default("info")
 });
@@ -49,6 +50,7 @@ export type Env = {
   projectRoot: string;
   codexExecPath: string;
   codexStageLogOutput: boolean;
+  codexModelReasoningEffort: "low" | "medium" | "high" | "xhigh";
   internalApiUrl: string;
   logLevel: string;
 };
@@ -106,6 +108,7 @@ export function loadEnv(): Env {
         ? codexExecPath
         : path.join(parsed.PROJECT_ROOT, "internal_harness", "codex-slim", "target", "release", "codex-exec"),
     codexStageLogOutput: parseBooleanFlag(parsed.CODEX_STAGE_LOG_OUTPUT),
+    codexModelReasoningEffort: parsed.CODEX_MODEL_REASONING_EFFORT,
     internalApiUrl: parsed.INTERNAL_API_URL.trim(),
     logLevel: parsed.LOG_LEVEL
   };

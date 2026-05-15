@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 function ensureRunnerTestEnv(): void {
   const required: Record<string, string> = {
@@ -22,6 +25,11 @@ async function loadRunnerInternals() {
   ensureRunnerTestEnv();
   const module = await import("../src/runner/codexRunner.js");
   return module.__codexRunnerInternals;
+}
+
+async function loadDirectRunnerInternals() {
+  const module = await import("../src/runner/directModelRunner.js");
+  return module.__directModelRunnerInternals;
 }
 
 const sampleParams = {
@@ -147,6 +155,17 @@ test("Codex stage configs disable view_image to keep review runs on the readonly
   }
 });
 
+test("Codex stage config can lower reasoning effort for targeted reviewer chunks", async () => {
+  const { configForStage } = await loadRunnerInternals();
+  const config = configForStage("reviewer", {
+    ...sampleParams,
+    stage: "reviewer" as const,
+    reasoningEffort: "medium" as const
+  });
+
+  assert.match(config, /model_reasoning_effort\s*=\s*"medium"/);
+});
+
 test("mention stage launch uses an isolated cwd instead of the repo checkout", async () => {
   const { buildStageLaunch } = await loadRunnerInternals();
   const launch = buildStageLaunch(sampleParams);
@@ -156,4 +175,128 @@ test("mention stage launch uses an isolated cwd instead of the repo checkout", a
   assert.equal(launch.codexArgs.includes("/tmp/bundle"), true);
   assert.doesNotMatch(launch.fullPrompt, /current working directory is the repo root/i);
   assert.match(launch.fullPrompt, /absolute paths under \/tmp\/repo/i);
+});
+
+test("readonly stages can return captured JSON when file writes are unavailable", async () => {
+  const { buildStageLaunch } = await loadRunnerInternals();
+  const launch = buildStageLaunch({ ...sampleParams, stage: "editor" as const });
+
+  assert.match(launch.fullPrompt, /If no write-capable tool is available/i);
+  assert.match(launch.fullPrompt, /return the required JSON as your final response/i);
+});
+
+test("parseCodexUsageLine extracts turn token usage", async () => {
+  const { parseCodexUsageLine } = await loadRunnerInternals();
+  const usage = parseCodexUsageLine(
+    JSON.stringify({
+      type: "turn.completed",
+      usage: {
+        input_tokens: 1200,
+        cached_input_tokens: 300,
+        output_tokens: 45
+      }
+    })
+  );
+
+  assert.deepEqual(usage, {
+    inputTokens: 1200,
+    cachedInputTokens: 300,
+    outputTokens: 45
+  });
+});
+
+test("parseCodexUsageLine ignores non-usage JSONL events", async () => {
+  const { parseCodexUsageLine } = await loadRunnerInternals();
+
+  assert.equal(parseCodexUsageLine("{not json"), null);
+  assert.equal(parseCodexUsageLine(JSON.stringify({ type: "turn.started" })), null);
+  assert.equal(
+    parseCodexUsageLine(
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: "nan", cached_input_tokens: 0, output_tokens: 10 }
+      })
+    ),
+    null
+  );
+});
+
+test("estimatePromptTokens uses byte-based estimate", async () => {
+  const { estimatePromptTokens } = await loadRunnerInternals();
+
+  assert.equal(estimatePromptTokens(""), 0);
+  assert.equal(estimatePromptTokens("abcd"), 1);
+  assert.equal(estimatePromptTokens("abcde"), 2);
+});
+
+test("direct model runner extracts text content and usage metrics", async () => {
+  const { extractContent, usageFromResponse, estimatePromptTokens, isRetryableHttpStatus, retryDelayMs } =
+    await loadDirectRunnerInternals();
+
+  assert.equal(
+    extractContent({
+      choices: [{ message: { content: [{ type: "text", text: "{" }, { type: "text", text: "}" }] } }]
+    }),
+    "{}"
+  );
+  assert.deepEqual(
+    usageFromResponse({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 80 }
+      }
+    }),
+    {
+      inputTokens: 100,
+      cachedInputTokens: 80,
+      outputTokens: 20
+    }
+  );
+  assert.equal(usageFromResponse({ usage: { prompt_tokens: undefined, completion_tokens: 1 } }), null);
+  assert.equal(estimatePromptTokens("abcdefgh"), 2);
+  assert.equal(isRetryableHttpStatus(429), true);
+  assert.equal(isRetryableHttpStatus(400), false);
+  assert.equal(retryDelayMs(4), 8000);
+});
+
+test("direct model runner retries empty successful responses", async () => {
+  ensureRunnerTestEnv();
+  const { runDirectModelStage } = await import("../src/runner/directModelRunner.js");
+  const originalFetch = globalThis.fetch;
+  const outDir = await mkdtemp(path.join(os.tmpdir(), "grepiku-direct-runner-"));
+  let calls = 0;
+  try {
+    globalThis.fetch = (async () => {
+      calls += 1;
+      const body =
+        calls === 1
+          ? { choices: [{ message: { content: "" } }] }
+          : {
+              choices: [{ message: { content: "{}" } }],
+              usage: { prompt_tokens: 12, completion_tokens: 3 }
+            };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    const metrics = await runDirectModelStage({
+      stage: "reviewer",
+      outDir,
+      prompt: "Return {}",
+      reviewRunId: 1,
+      prNumber: 2,
+      reasoningEffort: "low",
+      outputFileName: "draft_review.json"
+    });
+
+    assert.equal(calls, 2);
+    assert.equal(await readFile(path.join(outDir, "draft_review.json"), "utf8"), "{}");
+    assert.equal(metrics.usage?.inputTokens, 12);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(outDir, { recursive: true, force: true });
+  }
 });

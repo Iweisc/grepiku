@@ -4,15 +4,18 @@ import { minimatch } from "minimatch";
 import { ZodSchema } from "zod";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
-import { loadRepoConfigAtGitRef, saveRepoConfig } from "./config.js";
+import { loadRepoConfigAtGitRef, saveRepoConfig, type RepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
 import {
   buildReviewerPrompt,
+  buildDirectReviewerPrompt,
   buildEditorPrompt,
   buildVerifierPrompt,
-  buildCoverageReviewerPrompt
+  buildCoverageReviewerPrompt,
+  type ReviewPromptOptions
 } from "./prompts.js";
 import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
+import { runDirectModelStage } from "../runner/directModelRunner.js";
 import { readAndValidateJsonWithFallback } from "./json.js";
 import {
   ReviewSchema,
@@ -36,12 +39,12 @@ import {
   selectPreferredExactKeyFinding
 } from "./findingLifecycle.js";
 import { generateMermaidDiagram } from "./diagram.js";
-import { ReviewOutput } from "./schemas.js";
+import { ReviewOutput, VerdictsOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
 import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
 import { resolveRules } from "./triggers.js";
-import { buildContextPack } from "./context.js";
+import { buildContextPack, type ContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 import { getRepoWeights } from "../services/weights.js";
 import { refineReviewComments, sanitizeCommentIdentifier } from "./quality.js";
@@ -66,8 +69,32 @@ import { shouldRunVerifierForPullRequest } from "../providers/pullRequestGuards.
 import { selectTrustedPullRequestIndexSha } from "../providers/bootstrapIndex.js";
 import { resolveGithubBotLogin } from "../providers/github/adapter.js";
 import { mergeStoredPullRequestState } from "./pullRequestState.js";
+import {
+  buildReviewDiffChunkPlan,
+  mergeChunkReviewDrafts,
+  type ReviewChunkDraft,
+  type ReviewDiffChunk,
+  type ReviewDiffChunkPlan
+} from "./diffChunks.js";
+import {
+  buildContextPackForChunk,
+  chunkHasHighImpactHotspot
+} from "./chunkContext.js";
+import {
+  applyEditorDecisionOutput,
+  buildCompactEditorInput,
+  buildDeterministicEditorDecisionOutput
+} from "./editorDecision.js";
 
 const env = loadEnv();
+const CHUNKED_REVIEW_MIN_CHANGED_LINES = 16_000;
+const CHUNKED_REVIEW_TARGET_CHANGED_LINES = 6_000;
+const CHUNKED_REVIEW_MAX_CHANGED_LINES = 7_000;
+const CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 3_000;
+const CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 3_800;
+const CHUNKED_REVIEW_MAX_FILES = 240;
+const CHUNKED_REVIEW_MAX_PARALLEL = 48;
+const CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS = 48;
 
 export type ReviewJobData = {
   provider: "github";
@@ -686,6 +713,230 @@ async function readJsonWithFallback<T>(
   return readAndValidateJsonWithFallback(filePath, fallbackPath, schema);
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index] as T, index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function serializableChunkPlan(plan: ReviewDiffChunkPlan): unknown {
+  return {
+    stats: plan.stats,
+    chunks: plan.chunks.map((chunk) => ({
+      id: chunk.id,
+      ordinal: chunk.ordinal,
+      paths: chunk.paths,
+      changedLines: chunk.changedLines,
+      additions: chunk.additions,
+      deletions: chunk.deletions,
+      risk: chunk.risk,
+      diffBytes: Buffer.byteLength(chunk.diffPatch, "utf8")
+    }))
+  };
+}
+
+function reasoningEffortForChunk(
+  chunk: ReviewDiffChunk,
+  contextPack: ContextPack
+): "low" | "medium" | "high" | "xhigh" {
+  if (env.codexModelReasoningEffort !== "high") {
+    return env.codexModelReasoningEffort;
+  }
+  if (chunkHasHighImpactHotspot(contextPack, chunk)) return "high";
+  return "low";
+}
+
+async function runReviewerChunk(params: {
+  chunk: ReviewDiffChunk;
+  chunkCount: number;
+  totalChangedLines: number;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+  codexHomeDir: string;
+  prMarkdown: string;
+  repoConfig: RepoConfig;
+  resolvedConfig: RepoConfig;
+  contextPack: ContextPack;
+  previousReviewContext: unknown;
+  warnings: string[];
+  promptOptions: ReviewPromptOptions;
+  feedbackPolicy: FeedbackPolicy;
+  prTitle?: string | null;
+  prBody?: string | null;
+  headSha: string;
+  repoId: number;
+  runId: number;
+  prNumber: number;
+}): Promise<ReviewChunkDraft> {
+  const chunkBundleDir = path.join(params.bundleDir, "review_chunks", params.chunk.id);
+  const chunkOutDir = path.join(params.outDir, "review_chunks", params.chunk.id);
+  const chunkCodexHomeDir = path.join(params.codexHomeDir, "review_chunks", params.chunk.id);
+  await fs.mkdir(chunkBundleDir, { recursive: true });
+  await fs.mkdir(chunkOutDir, { recursive: true });
+  await fs.mkdir(chunkCodexHomeDir, { recursive: true });
+  const chunkContextPack = await buildContextPackForChunk({
+    repoId: params.repoId,
+    chunk: params.chunk,
+    config: params.resolvedConfig,
+    prTitle: params.prTitle,
+    prBody: params.prBody,
+    fallbackContextPack: params.contextPack
+  });
+
+  await writeBundleFiles({
+    bundleDir: chunkBundleDir,
+    prMarkdown: params.prMarkdown,
+    diffPatch: params.chunk.diffPatch,
+    changedFiles: params.chunk.changedFiles,
+    repoConfig: params.repoConfig,
+    resolvedConfig: params.resolvedConfig,
+    contextPack: chunkContextPack,
+    previousReviewContext: params.previousReviewContext,
+    warnings: params.warnings
+  });
+
+  const chunkPromptPaths = {
+    repoPath: params.repoPath,
+    bundleDir: chunkBundleDir,
+    outDir: chunkOutDir
+  };
+  const chunkPromptOptions = {
+    ...params.promptOptions,
+    fullRepoStaticAudit: false,
+    chunkReview: {
+      chunkId: params.chunk.id,
+      ordinal: params.chunk.ordinal,
+      totalChunks: params.chunkCount,
+      changedLines: params.chunk.changedLines,
+      totalChangedLines: params.totalChangedLines,
+      paths: params.chunk.paths
+    }
+  } satisfies ReviewPromptOptions;
+  const reasoningEffort = reasoningEffortForChunk(params.chunk, chunkContextPack);
+
+  console.log(
+    `[run ${params.runId} pr#${params.prNumber}] reviewer ${params.chunk.id} starting ` +
+      `files=${params.chunk.paths.length} changedLines=${params.chunk.changedLines} risk=${params.chunk.risk}`
+  );
+  try {
+    await runDirectModelStage({
+      stage: "reviewer",
+      outDir: chunkOutDir,
+      prompt:
+        buildDirectReviewerPrompt({
+          config: params.resolvedConfig,
+          prMarkdown: params.prMarkdown,
+          diffPatch: params.chunk.diffPatch,
+          changedFiles: params.chunk.changedFiles,
+          contextPack: chunkContextPack,
+          warnings: params.warnings,
+          options: chunkPromptOptions
+        }) + buildFeedbackHint(params.feedbackPolicy),
+      reviewRunId: params.runId,
+      prNumber: params.prNumber,
+      reasoningEffort,
+      outputFileName: "draft_review.json"
+    });
+  } catch (err) {
+    console.warn(
+      `[run ${params.runId} pr#${params.prNumber}] direct reviewer ${params.chunk.id} failed; falling back to codex: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    const reviewerPrompt =
+      buildReviewerPrompt(params.resolvedConfig, chunkPromptPaths, chunkPromptOptions) +
+      buildFeedbackHint(params.feedbackPolicy);
+    await runCodexStage({
+      stage: "reviewer",
+      repoPath: params.repoPath,
+      bundleDir: chunkBundleDir,
+      outDir: chunkOutDir,
+      codexHomeDir: chunkCodexHomeDir,
+      prompt: reviewerPrompt,
+      headSha: params.headSha,
+      repoId: params.repoId,
+      reviewRunId: params.runId,
+      prNumber: params.prNumber,
+      reasoningEffort
+    });
+  }
+
+  const review = await readJsonWithFallback(
+    path.join(chunkOutDir, "draft_review.json"),
+    ReviewSchema,
+    "reviewer"
+  );
+  return { chunk: params.chunk, review };
+}
+
+async function runChunkedReviewer(params: {
+  plan: ReviewDiffChunkPlan;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+  codexHomeDir: string;
+  prMarkdown: string;
+  repoConfig: RepoConfig;
+  resolvedConfig: RepoConfig;
+  contextPack: ContextPack;
+  previousReviewContext: unknown;
+  warnings: string[];
+  promptOptions: ReviewPromptOptions;
+  feedbackPolicy: FeedbackPolicy;
+  prTitle?: string | null;
+  prBody?: string | null;
+  headSha: string;
+  repoId: number;
+  runId: number;
+  prNumber: number;
+}): Promise<ReviewOutput> {
+  const drafts = await mapWithConcurrency(
+    params.plan.chunks,
+    CHUNKED_REVIEW_MAX_PARALLEL,
+    (chunk) =>
+      runReviewerChunk({
+        chunk,
+        chunkCount: params.plan.chunks.length,
+        totalChangedLines: params.plan.stats.totalChangedLines,
+        repoPath: params.repoPath,
+        bundleDir: params.bundleDir,
+        outDir: params.outDir,
+        codexHomeDir: params.codexHomeDir,
+        prMarkdown: params.prMarkdown,
+        repoConfig: params.repoConfig,
+        resolvedConfig: params.resolvedConfig,
+        contextPack: params.contextPack,
+        previousReviewContext: params.previousReviewContext,
+        warnings: params.warnings,
+        promptOptions: params.promptOptions,
+        feedbackPolicy: params.feedbackPolicy,
+        prTitle: params.prTitle,
+        prBody: params.prBody,
+        headSha: params.headSha,
+        repoId: params.repoId,
+        runId: params.runId,
+        prNumber: params.prNumber
+      })
+  );
+  return mergeChunkReviewDrafts({
+    drafts,
+    maxKeyConcerns: params.resolvedConfig.limits.max_key_concerns
+  });
+}
+
 export async function processReviewJob(data: ReviewJobData) {
   const { provider, installationId, repoId, pullRequestId, prNumber, headSha, trigger, rulesOverride } = data;
   const repo = await prisma.repo.findFirst({ where: { id: repoId } });
@@ -961,6 +1212,11 @@ export async function processReviewJob(data: ReviewJobData) {
         `[run ${run.id} pr#${prNumber}] withheld ${modelVisibleReviewData.sensitivePaths.length} sensitive changed path(s) from model-visible review context`
       );
     }
+    if (modelVisibleReviewData.bulkNoisePaths.length > 0) {
+      console.log(
+        `[run ${run.id} pr#${prNumber}] omitted ${modelVisibleReviewData.bulkNoisePaths.length} bulk/noise changed path(s) from model-visible review context`
+      );
+    }
 
     const prMarkdown = renderPrMarkdown({
       title: refreshedPullRequestState.title || "Untitled",
@@ -1052,52 +1308,134 @@ export async function processReviewJob(data: ReviewJobData) {
           }
         : {})
     };
-    const reviewerPrompt =
-      buildReviewerPrompt(resolvedConfig, promptPaths, promptOptions) +
-      buildFeedbackHint(feedbackPolicy);
-    await runCodexStage({
-      stage: "reviewer",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: reviewerPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
+    const chunkPlan = buildReviewDiffChunkPlan({
+      diffPatch,
+      changedFiles: changedFiles as Array<{
+        filename?: string;
+        path?: string;
+        status?: string;
+        additions?: number;
+        deletions?: number;
+      }>,
+      changedFileStats: contextPack.changedFileStats,
+      targetChangedLines: CHUNKED_REVIEW_TARGET_CHANGED_LINES,
+      maxChangedLines: CHUNKED_REVIEW_MAX_CHANGED_LINES,
+      highRiskTargetChangedLines: CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES,
+      highRiskMaxChangedLines: CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES,
+      maxFiles: CHUNKED_REVIEW_MAX_FILES
     });
-
-    const draft = await readJsonWithFallback(
-      path.join(outDir, "draft_review.json"),
-      ReviewSchema,
-      "reviewer"
+    await fs.writeFile(
+      path.join(outDir, "review_chunk_plan.json"),
+      JSON.stringify(serializableChunkPlan(chunkPlan), null, 2),
+      "utf8"
     );
+    const shouldUseChunkedReviewer =
+      chunkPlan.chunks.length > 1 &&
+      chunkPlan.stats.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES;
+    let draft: ReviewOutput;
+    if (shouldUseChunkedReviewer) {
+      console.log(
+        `[run ${run.id} pr#${prNumber}] using chunked reviewer ` +
+          `chunks=${chunkPlan.chunks.length} changedLines=${chunkPlan.stats.totalChangedLines}`
+      );
+      draft = await runChunkedReviewer({
+        plan: chunkPlan,
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prMarkdown,
+        repoConfig,
+        resolvedConfig,
+        contextPack,
+        previousReviewContext: incrementalReviewContext,
+        warnings,
+        promptOptions,
+        feedbackPolicy,
+        prTitle: refreshedPullRequestState.title,
+        prBody: refreshedPullRequestState.body,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        runId: run.id,
+        prNumber
+      });
+      await fs.writeFile(
+        path.join(outDir, "draft_review.json"),
+        JSON.stringify(draft, null, 2),
+        "utf8"
+      );
+    } else {
+      const reviewerPrompt =
+        buildReviewerPrompt(resolvedConfig, promptPaths, promptOptions) +
+        buildFeedbackHint(feedbackPolicy);
+      await runCodexStage({
+        stage: "reviewer",
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prompt: reviewerPrompt,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        reviewRunId: run.id,
+        prNumber
+      });
 
-    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, promptOptions);
-    await runCodexStage({
-      stage: "editor",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: editorPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
-    });
+      draft = await readJsonWithFallback(
+        path.join(outDir, "draft_review.json"),
+        ReviewSchema,
+        "reviewer"
+      );
+    }
 
-    const finalReview = await readJsonWithFallback(
-      path.join(outDir, "final_review.json"),
-      ReviewSchema,
-      "editor"
-    );
-    const verdicts = await readJsonWithFallback(
-      path.join(outDir, "verdicts.json"),
-      VerdictsSchema,
-      "editor"
-    );
+    let finalReview: ReviewOutput;
+    let verdicts: VerdictsOutput;
+    if (shouldUseChunkedReviewer) {
+      const editorInput = buildCompactEditorInput({
+        draft,
+        maxComments: Math.max(
+          resolvedConfig.limits.max_inline_comments,
+          Math.min(CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS, resolvedConfig.limits.max_inline_comments * 2)
+        )
+      });
+      await fs.writeFile(path.join(outDir, "editor_input.json"), JSON.stringify(editorInput, null, 2), "utf8");
+      const decisionOutput = buildDeterministicEditorDecisionOutput(editorInput);
+      await fs.writeFile(
+        path.join(outDir, "editor_decision.json"),
+        JSON.stringify(decisionOutput, null, 2),
+        "utf8"
+      );
+      const applied = applyEditorDecisionOutput({ draft, editorInput, decisionOutput });
+      finalReview = applied.finalReview;
+      verdicts = applied.verdicts;
+      await fs.writeFile(path.join(outDir, "final_review.json"), JSON.stringify(finalReview, null, 2), "utf8");
+      await fs.writeFile(path.join(outDir, "verdicts.json"), JSON.stringify(verdicts, null, 2), "utf8");
+    } else {
+      const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, promptOptions);
+      await runCodexStage({
+        stage: "editor",
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prompt: editorPrompt,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        reviewRunId: run.id,
+        prNumber
+      });
+
+      finalReview = await readJsonWithFallback(
+        path.join(outDir, "final_review.json"),
+        ReviewSchema,
+        "editor"
+      );
+      verdicts = await readJsonWithFallback(
+        path.join(outDir, "verdicts.json"),
+        VerdictsSchema,
+        "editor"
+      );
+    }
 
     const diffIndex = buildDiffIndex(diffPatch);
     const verdictMap = new Map(verdicts.verdicts.map((v) => [v.comment_id, v]));
@@ -1135,6 +1473,7 @@ export async function processReviewJob(data: ReviewJobData) {
     };
     const shouldRunCoveragePass =
       coveragePlan.shouldRun &&
+      !shouldUseChunkedReviewer &&
       coveragePlan.targets.length > 0 &&
       !resolvedConfig.output.summaryOnly &&
       resolvedConfig.commentTypes.allow.includes("inline");
@@ -1243,7 +1582,7 @@ export async function processReviewJob(data: ReviewJobData) {
       repoFullName: repo.fullName,
       pullRequest: refreshed
     });
-    if (verifierEligible) {
+    if (verifierEligible && !shouldUseChunkedReviewer) {
       const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
       verifierPromise = runCodexStage({
         stage: "verifier",
@@ -1262,7 +1601,9 @@ export async function processReviewJob(data: ReviewJobData) {
     } else {
       const skippedChecks = buildVerifierSkippedChecks({
         headSha: refreshed.headSha,
-        summary: "skipped for untrusted fork pull request"
+        summary: shouldUseChunkedReviewer
+          ? "skipped for chunked large review"
+          : "skipped for untrusted fork pull request"
       });
       await fs.writeFile(
         path.join(outDir, "checks.json"),
@@ -1270,7 +1611,9 @@ export async function processReviewJob(data: ReviewJobData) {
         "utf8"
       );
       console.warn(
-        `[run ${run.id} pr#${prNumber}] skipping verifier tools for head repo ${refreshed.headRepoFullName || "unknown"}`
+        shouldUseChunkedReviewer
+          ? `[run ${run.id} pr#${prNumber}] skipping verifier tools for chunked large review`
+          : `[run ${run.id} pr#${prNumber}] skipping verifier tools for head repo ${refreshed.headRepoFullName || "unknown"}`
       );
       verifierPromise = Promise.resolve({ ok: true as const });
     }

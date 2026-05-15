@@ -9,15 +9,36 @@ import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
 import { buildLocalDiffPatch, buildLocalChangedFiles } from "../review/localCompare.js";
 import { refineReviewComments } from "../review/quality.js";
 import { buildDiffIndex } from "../review/diff.js";
-import { loadRepoConfigAtGitRef } from "../review/config.js";
-import { buildReviewerPrompt, buildEditorPrompt } from "../review/prompts.js";
+import { loadRepoConfigAtGitRef, type RepoConfig } from "../review/config.js";
+import {
+  buildDirectReviewerPrompt,
+  buildReviewerPrompt,
+  buildEditorPrompt
+} from "../review/prompts.js";
 import { createRunDirs, writeBundleFiles } from "../review/bundle.js";
 import { renderPrMarkdown } from "../review/prMarkdown.js";
 import { sanitizeModelVisibleReviewData } from "../review/sensitiveReviewData.js";
 import { ReviewSchema } from "../review/schemas.js";
-import { readAndValidateJson } from "../review/json.js";
+import { readAndValidateJsonWithFallback } from "../review/json.js";
+import {
+  buildReviewDiffChunkPlan,
+  mergeChunkReviewDrafts,
+  type ReviewChunkDraft,
+  type ReviewDiffChunk,
+  type ReviewDiffChunkPlan
+} from "../review/diffChunks.js";
+import {
+  buildContextPackForChunk,
+  chunkHasHighImpactHotspot,
+  scopeContextPackToChunk
+} from "../review/chunkContext.js";
 import type { ReviewComment, ReviewOutput } from "../review/schemas.js";
 import type { ContextPack } from "../review/context.js";
+import {
+  applyEditorDecisionOutput,
+  buildCompactEditorInput,
+  buildDeterministicEditorDecisionOutput
+} from "../review/editorDecision.js";
 
 const ArgsSchema = z.object({
   repoPath: z.string(),
@@ -25,12 +46,27 @@ const ArgsSchema = z.object({
   head: z.string().optional(),
   diffFile: z.string().optional(),
   output: z.string().optional(),
-  format: z.enum(["json", "text"]).default("json")
+  format: z.enum(["json", "text"]).default("json"),
+  repoId: z.coerce.number().int().positive().optional(),
+  contextMode: z.enum(["production", "empty"]).default("production")
 });
 
 type DemoArgs = z.infer<typeof ArgsSchema>;
 
-const MAX_DEMO_DIFF_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_DEMO_DIFF_FILE_BYTES = 25 * 1024 * 1024;
+const CHUNKED_REVIEW_MIN_CHANGED_LINES = 16_000;
+const CHUNKED_REVIEW_TARGET_CHANGED_LINES = 6_000;
+const CHUNKED_REVIEW_MAX_CHANGED_LINES = 7_000;
+const CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 3_000;
+const CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 3_800;
+const CHUNKED_REVIEW_MAX_FILES = 240;
+const CHUNKED_REVIEW_MAX_PARALLEL = 48;
+const CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS = 48;
+const PRODUCTION_CONTEXT_REPO_ID_ERROR =
+  "Production demo context requires --repo-id. Use --context-mode=empty only for smoke tests without retrieval/graph context.";
+type DemoRunCodexStage = typeof import("../runner/codexRunner.js").runCodexStage;
+type DemoRunDirectModelStage = typeof import("../runner/directModelRunner.js").runDirectModelStage;
+type DemoReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 const FLAG_MAP: Record<string, string> = {
   "--repo-path": "repoPath",
@@ -38,7 +74,9 @@ const FLAG_MAP: Record<string, string> = {
   "--head": "head",
   "--diff-file": "diffFile",
   "--output": "output",
-  "--format": "format"
+  "--format": "format",
+  "--repo-id": "repoId",
+  "--context-mode": "contextMode"
 };
 
 export function parseCliArgs(argv: string[]): DemoArgs {
@@ -64,7 +102,11 @@ export function parseCliArgs(argv: string[]): DemoArgs {
   return ArgsSchema.parse(raw);
 }
 
-async function resolveGitSha(repoPath: string, ref: string): Promise<string> {
+async function resolveGitSha(
+  repoPath: string,
+  ref: string,
+  sourceEnv: NodeJS.ProcessEnv = process.env
+): Promise<string> {
   const normalizedRef = ref.trim();
   if (!normalizedRef) {
     throw new Error("Invalid git ref");
@@ -75,7 +117,7 @@ async function resolveGitSha(repoPath: string, ref: string): Promise<string> {
       "git",
       ["-C", repoPath, "rev-parse", "--verify", "--end-of-options", `${normalizedRef}^{commit}`],
       {
-        env: gitCheckoutSafetyEnv()
+        env: gitCheckoutSafetyEnv(sourceEnv)
       }
     );
     const resolved = stdout.trim();
@@ -88,15 +130,23 @@ async function resolveGitSha(repoPath: string, ref: string): Promise<string> {
   }
 }
 
-async function resolveHeadSha(repoPath: string, head?: string): Promise<string> {
-  if (head) return resolveGitSha(repoPath, head);
-  return resolveGitSha(repoPath, "HEAD");
+async function resolveHeadSha(
+  repoPath: string,
+  head?: string,
+  sourceEnv: NodeJS.ProcessEnv = process.env
+): Promise<string> {
+  if (head) return resolveGitSha(repoPath, head, sourceEnv);
+  return resolveGitSha(repoPath, "HEAD", sourceEnv);
 }
 
-async function resolveBaseSha(repoPath: string, base?: string): Promise<string> {
-  if (base) return resolveGitSha(repoPath, base);
+async function resolveBaseSha(
+  repoPath: string,
+  base?: string,
+  sourceEnv: NodeJS.ProcessEnv = process.env
+): Promise<string> {
+  if (base) return resolveGitSha(repoPath, base, sourceEnv);
   const { stdout } = await execa("git", ["-C", repoPath, "merge-base", "HEAD", "HEAD~1"], {
-    env: gitCheckoutSafetyEnv()
+    env: gitCheckoutSafetyEnv(sourceEnv)
   });
   return stdout.trim();
 }
@@ -203,6 +253,164 @@ export function formatTextOutput(review: ReviewOutput, comments: ReviewComment[]
   return lines.join("\n");
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index] as T, index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function serializableChunkPlan(plan: ReviewDiffChunkPlan): unknown {
+  return {
+    stats: plan.stats,
+    chunks: plan.chunks.map((chunk) => ({
+      id: chunk.id,
+      ordinal: chunk.ordinal,
+      paths: chunk.paths,
+      changedLines: chunk.changedLines,
+      additions: chunk.additions,
+      deletions: chunk.deletions,
+      risk: chunk.risk,
+      diffBytes: Buffer.byteLength(chunk.diffPatch, "utf8")
+    }))
+  };
+}
+
+function configuredReasoningEffort(): DemoReasoningEffort {
+  const value = process.env.CODEX_MODEL_REASONING_EFFORT;
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh" ? value : "high";
+}
+
+function reasoningEffortForDemoChunk(chunk: ReviewDiffChunk, contextPack: ContextPack): DemoReasoningEffort {
+  const effort = configuredReasoningEffort();
+  if (effort !== "high") return effort;
+  if (chunkHasHighImpactHotspot(contextPack, chunk)) return "high";
+  return "low";
+}
+
+async function runDemoReviewerChunk(params: {
+  runCodexStage: DemoRunCodexStage;
+  runDirectModelStage: DemoRunDirectModelStage;
+  chunk: ReviewDiffChunk;
+  chunkCount: number;
+  totalChangedLines: number;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+  codexHomeDir: string;
+  prMarkdown: string;
+  diffWarnings: string[];
+  contextPack: ContextPack;
+  contextMode: DemoArgs["contextMode"];
+  config: RepoConfig;
+  prTitle: string;
+  prBody: string;
+  headSha: string;
+  repoId: number;
+  demoRunId: number;
+}): Promise<ReviewChunkDraft> {
+  const chunkBundleDir = path.join(params.bundleDir, "review_chunks", params.chunk.id);
+  const chunkOutDir = path.join(params.outDir, "review_chunks", params.chunk.id);
+  const chunkCodexHomeDir = path.join(params.codexHomeDir, "review_chunks", params.chunk.id);
+  await fs.mkdir(chunkBundleDir, { recursive: true });
+  await fs.mkdir(chunkOutDir, { recursive: true });
+  await fs.mkdir(chunkCodexHomeDir, { recursive: true });
+  const chunkContextPack =
+    params.contextMode === "production" && params.repoId > 0
+      ? await buildContextPackForChunk({
+          repoId: params.repoId,
+          chunk: params.chunk,
+          config: params.config,
+          prTitle: params.prTitle,
+          prBody: params.prBody,
+          fallbackContextPack: params.contextPack
+        })
+      : scopeContextPackToChunk(params.contextPack, params.chunk);
+  await writeBundleFiles({
+    bundleDir: chunkBundleDir,
+    prMarkdown: params.prMarkdown,
+    diffPatch: params.chunk.diffPatch,
+    changedFiles: params.chunk.changedFiles,
+    repoConfig: params.config,
+    resolvedConfig: params.config,
+    contextPack: chunkContextPack,
+    warnings: params.diffWarnings
+  });
+
+  const promptPaths = { repoPath: params.repoPath, bundleDir: chunkBundleDir, outDir: chunkOutDir };
+  const promptOptions = {
+    chunkReview: {
+      chunkId: params.chunk.id,
+      ordinal: params.chunk.ordinal,
+      totalChunks: params.chunkCount,
+      changedLines: params.chunk.changedLines,
+      totalChangedLines: params.totalChangedLines,
+      paths: params.chunk.paths
+    }
+  };
+  const reasoningEffort = reasoningEffortForDemoChunk(params.chunk, chunkContextPack);
+  console.log(
+    `[demo-review] reviewer ${params.chunk.id} files=${params.chunk.paths.length} ` +
+      `changedLines=${params.chunk.changedLines} risk=${params.chunk.risk}`
+  );
+  try {
+    await params.runDirectModelStage({
+      stage: "reviewer",
+      outDir: chunkOutDir,
+      prompt: buildDirectReviewerPrompt({
+        config: params.config,
+        prMarkdown: params.prMarkdown,
+        diffPatch: params.chunk.diffPatch,
+        changedFiles: params.chunk.changedFiles,
+        contextPack: chunkContextPack,
+        warnings: params.diffWarnings,
+        options: promptOptions
+      }),
+      reviewRunId: params.demoRunId,
+      prNumber: 0,
+      reasoningEffort,
+      outputFileName: "draft_review.json"
+    });
+  } catch (err) {
+    console.warn(
+      `[demo-review] direct reviewer ${params.chunk.id} failed; falling back to codex: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    const reviewerPrompt = buildReviewerPrompt(params.config, promptPaths, promptOptions);
+    await params.runCodexStage({
+      stage: "reviewer",
+      repoPath: params.repoPath,
+      bundleDir: chunkBundleDir,
+      outDir: chunkOutDir,
+      codexHomeDir: chunkCodexHomeDir,
+      prompt: reviewerPrompt,
+      headSha: params.headSha,
+      repoId: params.repoId,
+      reviewRunId: params.demoRunId,
+      prNumber: 0,
+      reasoningEffort
+    });
+  }
+  const review = await readAndValidateJsonWithFallback(
+    path.join(chunkOutDir, "draft_review.json"),
+    path.join(chunkOutDir, "last_message_reviewer.txt"),
+    ReviewSchema
+  );
+  return { chunk: params.chunk, review };
+}
+
 async function loadDemoRepoConfigAtBase(
   repoPath: string,
   baseSha: string | null | undefined
@@ -213,11 +421,15 @@ async function loadDemoRepoConfigAtBase(
 async function main() {
   const args = parseCliArgs(process.argv.slice(2));
   const repoPath = path.resolve(args.repoPath);
+  if (args.contextMode === "production" && !args.repoId) {
+    throw new Error(PRODUCTION_CONTEXT_REPO_ID_ERROR);
+  }
 
   // Dynamic import to avoid triggering loadEnv() at module load time.
   // This allows the pure utility functions (parseCliArgs, buildEmptyContextPack,
   // formatTextOutput) to be imported and tested without env variables set.
   const { runCodexStage } = await import("../runner/codexRunner.js");
+  const { runDirectModelStage } = await import("../runner/directModelRunner.js");
 
   console.log(`[demo-review] repo=${repoPath}`);
 
@@ -230,7 +442,12 @@ async function main() {
     diffPatch = await readDiffFileWithinLimit(path.resolve(args.diffFile));
     console.log(`[demo-review] diff loaded from file: ${args.diffFile}`);
   } else {
-    diffPatch = await buildLocalDiffPatch({ repoPath, baseSha, headSha });
+    diffPatch = await buildLocalDiffPatch({
+      repoPath,
+      baseSha,
+      headSha,
+      maxBytes: MAX_DEMO_DIFF_FILE_BYTES
+    });
     console.log(`[demo-review] diff built from local repo`);
   }
 
@@ -267,20 +484,58 @@ async function main() {
       `[demo-review] withheld ${modelVisibleReviewData.sensitivePaths.length} sensitive changed path(s) from model-visible context`
     );
   }
+  if (modelVisibleReviewData.bulkNoisePaths.length > 0) {
+    console.log(
+      `[demo-review] omitted ${modelVisibleReviewData.bulkNoisePaths.length} bulk/noise changed path(s) from model-visible context`
+    );
+  }
 
-  const contextPack = buildEmptyContextPack(
-    diffPatch,
-    sanitizedChangedFiles.filter((file): file is { path: string } => typeof file.path === "string")
-  );
+  const demoPrTitle = "Demo Review";
+  const demoPrBody = `Local review of ${baseSha.slice(0, 12)}..${headSha.slice(0, 12)}`;
+  let contextPack: ContextPack;
+  if (args.contextMode === "production") {
+    if (!args.repoId) {
+      throw new Error(PRODUCTION_CONTEXT_REPO_ID_ERROR);
+    }
+    const { buildContextPack } = await import("../review/context.js");
+    console.log(`[demo-review] building production context repoId=${args.repoId}`);
+    contextPack = await buildContextPack({
+      repoId: args.repoId,
+      diffPatch,
+      changedFiles: sanitizedChangedFiles as Array<{
+        filename?: string;
+        path?: string;
+        status?: string;
+        additions?: number;
+        deletions?: number;
+      }>,
+      prTitle: demoPrTitle,
+      prBody: demoPrBody,
+      retrieval: config.retrieval,
+      graph: config.graph
+    });
+    console.log(
+      `[demo-review] context retrieved=${contextPack.retrieved.length} related=${contextPack.relatedFiles.length} ` +
+        `graphLinks=${contextPack.graphLinks.length} hotspots=${contextPack.hotspots.length}`
+    );
+  } else {
+    console.warn("[demo-review] using empty context; this is for smoke tests, not production-equivalent benchmarking");
+    contextPack = buildEmptyContextPack(
+      diffPatch,
+      sanitizedChangedFiles.filter((file): file is { path: string } => typeof file.path === "string")
+    );
+  }
+
   const demoRunId = Date.now();
   const runRoot = buildDemoRunRoot(repoPath);
   const { bundleDir, outDir, codexHomeDir } = await createRunDirs(runRoot, demoRunId);
+  const stageRepoId = args.repoId ?? 0;
 
   const prMarkdown = renderPrMarkdown({
-    title: "Demo Review",
+    title: demoPrTitle,
     number: 0,
     author: "local-demo",
-    body: `Local review of ${baseSha.slice(0, 12)}..${headSha.slice(0, 12)}`,
+    body: demoPrBody,
     baseRef: baseSha.slice(0, 12),
     headRef: headSha.slice(0, 12),
     headSha,
@@ -299,45 +554,126 @@ async function main() {
 
   const promptPaths = { repoPath, bundleDir, outDir };
 
-  console.log("[demo-review] running reviewer stage...");
-  const reviewerPrompt = buildReviewerPrompt(config, promptPaths);
-  await runCodexStage({
-    stage: "reviewer",
-    repoPath,
-    bundleDir,
-    outDir,
-    codexHomeDir,
-    prompt: reviewerPrompt,
-    headSha,
-    repoId: 0,
-    reviewRunId: demoRunId,
-    prNumber: 0
+  const chunkPlan = buildReviewDiffChunkPlan({
+    diffPatch,
+    changedFiles: sanitizedChangedFiles,
+    changedFileStats: contextPack.changedFileStats,
+    targetChangedLines: CHUNKED_REVIEW_TARGET_CHANGED_LINES,
+    maxChangedLines: CHUNKED_REVIEW_MAX_CHANGED_LINES,
+    highRiskTargetChangedLines: CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES,
+    highRiskMaxChangedLines: CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES,
+    maxFiles: CHUNKED_REVIEW_MAX_FILES
   });
-
-  const draft = await readAndValidateJson(
-    path.join(outDir, "draft_review.json"),
-    ReviewSchema
+  await fs.writeFile(
+    path.join(outDir, "review_chunk_plan.json"),
+    JSON.stringify(serializableChunkPlan(chunkPlan), null, 2),
+    "utf8"
   );
+  const shouldUseChunkedReviewer =
+    chunkPlan.chunks.length > 1 &&
+    chunkPlan.stats.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES;
+  let draft: ReviewOutput;
+  if (shouldUseChunkedReviewer) {
+    console.log(
+      `[demo-review] running chunked reviewer chunks=${chunkPlan.chunks.length} ` +
+        `changedLines=${chunkPlan.stats.totalChangedLines}`
+    );
+    const drafts = await mapWithConcurrency(
+      chunkPlan.chunks,
+      CHUNKED_REVIEW_MAX_PARALLEL,
+      (chunk) =>
+        runDemoReviewerChunk({
+          runCodexStage,
+          runDirectModelStage,
+          chunk,
+          chunkCount: chunkPlan.chunks.length,
+          totalChangedLines: chunkPlan.stats.totalChangedLines,
+          repoPath,
+          bundleDir,
+          outDir,
+          codexHomeDir,
+          prMarkdown,
+          diffWarnings: warnings,
+          contextPack,
+          contextMode: args.contextMode,
+          config,
+          prTitle: demoPrTitle,
+          prBody: demoPrBody,
+          headSha,
+          repoId: stageRepoId,
+          demoRunId
+        })
+    );
+    draft = mergeChunkReviewDrafts({
+      drafts,
+      maxKeyConcerns: config.limits.max_key_concerns
+    });
+    await fs.writeFile(path.join(outDir, "draft_review.json"), JSON.stringify(draft, null, 2), "utf8");
+  } else {
+    console.log("[demo-review] running reviewer stage...");
+    const reviewerPrompt = buildReviewerPrompt(config, promptPaths);
+    await runCodexStage({
+      stage: "reviewer",
+      repoPath,
+      bundleDir,
+      outDir,
+      codexHomeDir,
+      prompt: reviewerPrompt,
+      headSha,
+      repoId: stageRepoId,
+      reviewRunId: demoRunId,
+      prNumber: 0
+    });
 
-  console.log("[demo-review] running editor stage...");
-  const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths);
-  await runCodexStage({
-    stage: "editor",
-    repoPath,
-    bundleDir,
-    outDir,
-    codexHomeDir,
-    prompt: editorPrompt,
-    headSha,
-    repoId: 0,
-    reviewRunId: demoRunId,
-    prNumber: 0
-  });
+    draft = await readAndValidateJsonWithFallback(
+      path.join(outDir, "draft_review.json"),
+      path.join(outDir, "last_message_reviewer.txt"),
+      ReviewSchema
+    );
+  }
 
-  const finalReview = await readAndValidateJson(
-    path.join(outDir, "final_review.json"),
-    ReviewSchema
-  );
+  console.log("[demo-review] applying editor pass...");
+  let finalReview: ReviewOutput;
+  if (shouldUseChunkedReviewer) {
+    const editorInput = buildCompactEditorInput({
+      draft,
+      maxComments: Math.max(
+        config.limits.max_inline_comments,
+        Math.min(CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS, config.limits.max_inline_comments * 2)
+      )
+    });
+    await fs.writeFile(path.join(outDir, "editor_input.json"), JSON.stringify(editorInput, null, 2), "utf8");
+    const decisionOutput = buildDeterministicEditorDecisionOutput(editorInput);
+    await fs.writeFile(
+      path.join(outDir, "editor_decision.json"),
+      JSON.stringify(decisionOutput, null, 2),
+      "utf8"
+    );
+    const applied = applyEditorDecisionOutput({ draft, editorInput, decisionOutput });
+    finalReview = applied.finalReview;
+    await fs.writeFile(path.join(outDir, "final_review.json"), JSON.stringify(finalReview, null, 2), "utf8");
+    await fs.writeFile(path.join(outDir, "verdicts.json"), JSON.stringify(applied.verdicts, null, 2), "utf8");
+  } else {
+    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths);
+    await runCodexStage({
+      stage: "editor",
+      repoPath,
+      bundleDir,
+      outDir,
+      codexHomeDir,
+      prompt: editorPrompt,
+      headSha,
+      repoId: stageRepoId,
+      reviewRunId: demoRunId,
+      prNumber: 0
+    });
+
+    finalReview = await readAndValidateJsonWithFallback(
+      path.join(outDir, "final_review.json"),
+      path.join(outDir, "last_message_editor.txt"),
+      ReviewSchema
+    );
+  }
 
   const diffIndex = buildDiffIndex(diffPatch);
   const { comments, diagnostics } = refineReviewComments({

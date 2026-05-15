@@ -6,6 +6,7 @@ import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
 
 export type CodexStage = "reviewer" | "editor" | "verifier" | "mention";
+export type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export type CodexRunParams = {
   stage: CodexStage;
@@ -19,6 +20,23 @@ export type CodexRunParams = {
   reviewRunId: number;
   prNumber: number;
   captureLastMessage?: boolean;
+  reasoningEffort?: CodexReasoningEffort;
+};
+
+export type CodexTokenUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+};
+
+export type CodexStageMetrics = {
+  stage: CodexStage;
+  reasoningEffort: CodexReasoningEffort;
+  durationMs: number;
+  promptChars: number;
+  promptBytes: number;
+  estimatedPromptTokens: number;
+  usage: CodexTokenUsage | null;
 };
 
 const env = loadEnv();
@@ -60,7 +78,7 @@ function systemPrompt(stage: CodexStage, roots: string[]): string {
   const writeInstruction =
     stage === "mention"
       ? `You may modify files under the repo root and write required outputs to the output root. The current working directory is not the repo checkout; when editing repository files, target absolute paths under ${roots[0]}.`
-      : `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt.`;
+      : `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt. If no write-capable tool is available, return the required JSON as your final response instead; the runner captures it.`;
   const allowedRoots = roots.join(", ");
   return [
     "SYSTEM: You are a code-review agent running inside a sandboxed repo checkout.",
@@ -140,14 +158,19 @@ function mcpServerBlock(
   return lines.join("\n");
 }
 
-function baseConfig(params?: { shellTool?: boolean; applyPatchFreeform?: boolean }): string {
+function baseConfig(params?: {
+  shellTool?: boolean;
+  applyPatchFreeform?: boolean;
+  reasoningEffort?: CodexReasoningEffort;
+}): string {
   const shellTool = params?.shellTool === true;
   const applyPatchFreeform = params?.applyPatchFreeform === true;
+  const reasoningEffort = params?.reasoningEffort ?? env.codexModelReasoningEffort;
   return [
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
-    `model_reasoning_effort = "high"`,
+    `model_reasoning_effort = ${tomlString(reasoningEffort)}`,
     `project_doc_max_bytes = 0`,
     "",
     "[features]",
@@ -169,7 +192,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     WORK_OUT_ROOT: params.outDir
   };
   if (stage === "reviewer") {
-    const base = baseConfig();
+    const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -181,7 +204,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "editor") {
-    const base = baseConfig();
+    const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -193,7 +216,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "verifier") {
-    const base = baseConfig();
+    const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     const verifierToolTimeoutSec = Math.max(30, Math.ceil(env.codexStageTimeoutMs / 1000));
     return (
       `${base}\n` +
@@ -208,7 +231,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "mention") {
-    const base = baseConfig({ applyPatchFreeform: true });
+    const base = baseConfig({ applyPatchFreeform: true, reasoningEffort: params.reasoningEffort });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -289,6 +312,37 @@ function buildStageLaunch(params: CodexRunParams): {
   };
 }
 
+function estimatePromptTokens(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(Buffer.byteLength(text, "utf8") / 4);
+}
+
+function parseCodexUsageLine(line: string): CodexTokenUsage | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const event = parsed as { type?: unknown; usage?: unknown };
+  if (event.type !== "turn.completed" || !event.usage || typeof event.usage !== "object") {
+    return null;
+  }
+  const usage = event.usage as Record<string, unknown>;
+  const inputTokens = Number(usage.input_tokens);
+  const cachedInputTokens = Number(usage.cached_input_tokens);
+  const outputTokens = Number(usage.output_tokens);
+  if (![inputTokens, cachedInputTokens, outputTokens].every(Number.isFinite)) {
+    return null;
+  }
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens
+  };
+}
+
 function forwardStageStream(params: {
   stream: NodeJS.ReadableStream | null | undefined;
   stageTag: string;
@@ -310,8 +364,55 @@ function forwardStageStream(params: {
   });
 }
 
-export async function runCodexStage(params: CodexRunParams): Promise<void> {
+function scanCodexJsonStream(params: {
+  stream: NodeJS.ReadableStream | null | undefined;
+  stageTag: string;
+  logLines: boolean;
+  onUsage: (usage: CodexTokenUsage) => void;
+}): Promise<void> {
+  if (!params.stream) return Promise.resolve();
+  const rl = createInterface({
+    input: params.stream,
+    crlfDelay: Infinity
+  });
+  rl.on("line", (line) => {
+    if (line.length === 0) return;
+    const usage = parseCodexUsageLine(line);
+    if (usage) {
+      params.onUsage(usage);
+    }
+    if (params.logLines) {
+      console.log(`${params.stageTag} stdout: ${line}`);
+    }
+  });
+  return new Promise((resolve, reject) => {
+    rl.once("close", () => resolve());
+    rl.once("error", reject);
+  });
+}
+
+async function writeStageMetrics(params: {
+  outDir: string;
+  stage: CodexStage;
+  startedAt: number;
+  metrics: CodexStageMetrics;
+}): Promise<void> {
+  const safeStage = params.stage.replace(/[^a-z0-9_-]/gi, "_");
+  const metricsPath = path.join(params.outDir, `stage_metrics_${safeStage}_${params.startedAt}.json`);
+  const latestPath = path.join(params.outDir, `stage_metrics_latest_${safeStage}.json`);
+  const raw = JSON.stringify(params.metrics, null, 2);
+  await fs.writeFile(metricsPath, raw, "utf8");
+  await fs.writeFile(latestPath, raw, "utf8");
+}
+
+function formatTokenUsageForLog(usage: CodexTokenUsage | null): string {
+  if (!usage) return "";
+  return ` tokens input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens}`;
+}
+
+export async function runCodexStage(params: CodexRunParams): Promise<CodexStageMetrics> {
   const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}]`;
+  const reasoningEffort = params.reasoningEffort ?? env.codexModelReasoningEffort;
   const codexExecPath = await resolveCodexExecPath();
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
@@ -323,21 +424,47 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
   const stageEnv = buildStageEnv(params, stageHomeDir);
   const { codexArgs, fullPrompt, stageCwd } = buildStageLaunch(params);
   const startedAt = Date.now();
+  const tokenUsageRef: { current: CodexTokenUsage | null } = { current: null };
   let forwarders: Promise<void>[] = [];
   console.log(`${stageTag} starting`);
   try {
     if (!env.codexStageLogOutput) {
-      await execa(codexExecPath, codexArgs, {
+      const subprocess = execa(codexExecPath, codexArgs, {
         input: fullPrompt,
-        stdio: ["pipe", "ignore", "inherit"],
+        stdout: "pipe",
+        stderr: "inherit",
+        buffer: false,
         cwd: stageCwd,
         env: stageEnv,
         timeout: env.codexStageTimeoutMs,
         killSignal: "SIGTERM",
         forceKillAfterDelay: 10_000
       });
-      console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
-      return;
+      forwarders = [
+        scanCodexJsonStream({
+          stream: subprocess.stdout,
+          stageTag,
+          logLines: false,
+          onUsage: (usage) => {
+            tokenUsageRef.current = usage;
+          }
+        })
+      ];
+      await subprocess;
+      await Promise.allSettled(forwarders);
+      const durationMs = Date.now() - startedAt;
+      const metrics = {
+        stage: params.stage,
+        reasoningEffort,
+        durationMs,
+        promptChars: fullPrompt.length,
+        promptBytes: Buffer.byteLength(fullPrompt, "utf8"),
+        estimatedPromptTokens: estimatePromptTokens(fullPrompt),
+        usage: tokenUsageRef.current
+      };
+      await writeStageMetrics({ outDir: params.outDir, stage: params.stage, startedAt, metrics });
+      console.log(`${stageTag} completed in ${durationMs}ms${formatTokenUsageForLog(tokenUsageRef.current)}`);
+      return metrics;
     }
 
     const subprocess = execa(codexExecPath, codexArgs, {
@@ -353,10 +480,13 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     });
 
     forwarders = [
-      forwardStageStream({
+      scanCodexJsonStream({
         stream: subprocess.stdout,
         stageTag,
-        channel: "stdout"
+        logLines: true,
+        onUsage: (usage) => {
+          tokenUsageRef.current = usage;
+        }
       }),
       forwardStageStream({
         stream: subprocess.stderr,
@@ -367,7 +497,19 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
 
     await subprocess;
     await Promise.allSettled(forwarders);
-    console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
+    const durationMs = Date.now() - startedAt;
+    const metrics = {
+      stage: params.stage,
+      reasoningEffort,
+      durationMs,
+      promptChars: fullPrompt.length,
+      promptBytes: Buffer.byteLength(fullPrompt, "utf8"),
+      estimatedPromptTokens: estimatePromptTokens(fullPrompt),
+      usage: tokenUsageRef.current
+    };
+    await writeStageMetrics({ outDir: params.outDir, stage: params.stage, startedAt, metrics });
+    console.log(`${stageTag} completed in ${durationMs}ms${formatTokenUsageForLog(tokenUsageRef.current)}`);
+    return metrics;
   } catch (err) {
     if (forwarders.length > 0) {
       await Promise.allSettled(forwarders);
@@ -380,5 +522,7 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
 export const __codexRunnerInternals = {
   buildStageEnv,
   configForStage,
-  buildStageLaunch
+  buildStageLaunch,
+  estimatePromptTokens,
+  parseCodexUsageLine
 };

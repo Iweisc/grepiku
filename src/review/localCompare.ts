@@ -160,6 +160,7 @@ export async function buildLocalDiffPatch(params: {
   repoPath: string;
   baseSha: string | null | undefined;
   headSha: string;
+  maxBytes?: number;
 }): Promise<string> {
   const { repoPath, baseSha, headSha } = params;
   if (!baseSha) return "";
@@ -167,7 +168,7 @@ export async function buildLocalDiffPatch(params: {
     file: "git",
     args: ["-C", repoPath, "diff", "--no-color", "--no-ext-diff", `${baseSha}...${headSha}`],
     env: gitCheckoutSafetyEnv(),
-    maxBytes: LOCAL_DIFF_OUTPUT_LIMIT_BYTES
+    maxBytes: params.maxBytes ?? LOCAL_DIFF_OUTPUT_LIMIT_BYTES
   });
 }
 

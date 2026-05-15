@@ -29,7 +29,9 @@ test("parseCliArgs parses all flags", () => {
     "--head=def456",
     "--diff-file=/tmp/diff.patch",
     "--output=/tmp/out.json",
-    "--format=text"
+    "--format=text",
+    "--repo-id=123",
+    "--context-mode=empty"
   ]);
   assert.equal(args.repoPath, "/tmp/repo");
   assert.equal(args.base, "abc123");
@@ -37,15 +39,19 @@ test("parseCliArgs parses all flags", () => {
   assert.equal(args.diffFile, "/tmp/diff.patch");
   assert.equal(args.output, "/tmp/out.json");
   assert.equal(args.format, "text");
+  assert.equal(args.repoId, 123);
+  assert.equal(args.contextMode, "empty");
 });
 
-test("parseCliArgs defaults format to json", () => {
+test("parseCliArgs defaults format to json and production context", () => {
   const args = parseCliArgs(["--repo-path=/tmp/repo"]);
   assert.equal(args.format, "json");
+  assert.equal(args.contextMode, "production");
   assert.equal(args.base, undefined);
   assert.equal(args.head, undefined);
   assert.equal(args.diffFile, undefined);
   assert.equal(args.output, undefined);
+  assert.equal(args.repoId, undefined);
 });
 
 test("parseCliArgs throws on missing required --repo-path", () => {
@@ -74,6 +80,23 @@ test("parseCliArgs accepts format=json explicitly", () => {
 test("parseCliArgs accepts format=text explicitly", () => {
   const args = parseCliArgs(["--repo-path=/tmp/repo", "--format=text"]);
   assert.equal(args.format, "text");
+});
+
+test("parseCliArgs accepts repo id as separate argument", () => {
+  const args = parseCliArgs(["--repo-path=/tmp/repo", "--repo-id", "42"]);
+  assert.equal(args.repoId, 42);
+});
+
+test("parseCliArgs throws on invalid repo id", () => {
+  assert.throws(() => parseCliArgs(["--repo-path=/tmp/repo", "--repo-id=0"]), {
+    name: "ZodError"
+  });
+});
+
+test("parseCliArgs throws on invalid context mode", () => {
+  assert.throws(() => parseCliArgs(["--repo-path=/tmp/repo", "--context-mode=demo"]), {
+    name: "ZodError"
+  });
 });
 
 test("parseCliArgs ignores unknown flags", () => {
@@ -122,9 +145,9 @@ test("readDiffFileWithinLimit rejects oversized demo diff inputs", async () => {
   const diffPath = path.join(root, "oversized.diff");
 
   try {
-    await fs.writeFile(diffPath, "x".repeat(10 * 1024 * 1024 + 1), "utf8");
+    await fs.writeFile(diffPath, "x".repeat(1025), "utf8");
 
-    await assert.rejects(() => readDiffFileWithinLimit(diffPath), /diff file exceeded byte limit/i);
+    await assert.rejects(() => readDiffFileWithinLimit(diffPath, 1024), /diff file exceeded byte limit/i);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -193,8 +216,6 @@ test("demo review ignores inherited git repository env when resolving base and h
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-demo-git-env-"));
   const targetRepoPath = path.join(root, "target");
   const alternateRepoPath = path.join(root, "alternate");
-  const originalGitDir = process.env.GIT_DIR;
-  const originalGitWorkTree = process.env.GIT_WORK_TREE;
 
   try {
     for (const repoPath of [targetRepoPath, alternateRepoPath]) {
@@ -222,25 +243,18 @@ test("demo review ignores inherited git repository env when resolving base and h
       "HEAD~1"
     ]);
 
-    process.env.GIT_DIR = path.join(alternateRepoPath, ".git");
-    process.env.GIT_WORK_TREE = alternateRepoPath;
+    const inheritedEnv = {
+      ...process.env,
+      GIT_DIR: path.join(alternateRepoPath, ".git"),
+      GIT_WORK_TREE: alternateRepoPath
+    };
 
-    const resolvedHeadSha = await resolveHeadSha(targetRepoPath);
-    const resolvedBaseSha = await resolveBaseSha(targetRepoPath);
+    const resolvedHeadSha = await resolveHeadSha(targetRepoPath, undefined, inheritedEnv);
+    const resolvedBaseSha = await resolveBaseSha(targetRepoPath, undefined, inheritedEnv);
 
     assert.equal(resolvedHeadSha, expectedHeadSha.trim());
     assert.equal(resolvedBaseSha, expectedBaseSha.trim());
   } finally {
-    if (originalGitDir === undefined) {
-      delete process.env.GIT_DIR;
-    } else {
-      process.env.GIT_DIR = originalGitDir;
-    }
-    if (originalGitWorkTree === undefined) {
-      delete process.env.GIT_WORK_TREE;
-    } else {
-      process.env.GIT_WORK_TREE = originalGitWorkTree;
-    }
     await fs.rm(root, { recursive: true, force: true });
   }
 });

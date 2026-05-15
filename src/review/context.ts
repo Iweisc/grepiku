@@ -2,6 +2,7 @@ import { prisma } from "../db/client.js";
 import { retrieveContext } from "../services/retrieval.js";
 import { normalizeDiffPath, normalizePath } from "./diff.js";
 import type { RepoConfig } from "./config.js";
+import { classifyChangedFileRisk, isStatefulReviewPath } from "./risk.js";
 
 export type ContextPack = {
   query: string;
@@ -833,15 +834,12 @@ export async function buildContextPack(params: {
       if (!path) return null;
       const additions = typeof file.additions === "number" ? file.additions : undefined;
       const deletions = typeof file.deletions === "number" ? file.deletions : undefined;
-      const churn = (additions || 0) + (deletions || 0);
-      const risk: "low" | "medium" | "high" =
-        churn >= 250 ? "high" : churn >= 80 ? "medium" : "low";
       return {
         path,
         status: file.status,
         additions,
         deletions,
-        risk
+        risk: classifyChangedFileRisk({ path, additions, deletions })
       };
     })
     .filter((value): value is NonNullable<typeof value> => Boolean(value));
@@ -1106,9 +1104,12 @@ function buildFocusHints(params: {
   const hints: string[] = [];
   for (const file of params.changedFileStats.slice(0, 8)) {
     if (file.risk === "high") {
-      hints.push(`High churn changed file: ${file.path} (prioritize correctness and regressions).`);
+      hints.push(`High-risk changed file: ${file.path} (prioritize correctness and regressions).`);
     } else if (file.risk === "medium") {
-      hints.push(`Medium churn changed file: ${file.path} (check edge cases and tests).`);
+      const focus = isStatefulReviewPath(file.path)
+        ? "check concurrency, transaction boundaries, idempotency, and auth edge cases"
+        : "check edge cases and tests";
+      hints.push(`Medium-risk changed file: ${file.path} (${focus}).`);
     }
   }
   for (const hotspot of params.hotspots.slice(0, 5)) {
