@@ -1316,30 +1316,35 @@ export function registerDashboard(app: FastifyInstance) {
       reply.code(400).send({ error: "Invalid rule suggestion id" });
       return;
     }
-    const suggestion = await prisma.ruleSuggestion.findFirst({ where: { id } });
-    if (!suggestion) {
+    const accepted = await prisma.$transaction(async (tx) => {
+      const suggestion = await tx.ruleSuggestion.findFirst({ where: { id } });
+      if (!suggestion) {
+        return false;
+      }
+      const repoConfig = await tx.repoConfig.findFirst({
+        where: { repoId: suggestion.repoId }
+      });
+      if (repoConfig) {
+        const config = isRecord(repoConfig.configJson) ? { ...repoConfig.configJson } : {};
+        const rules = Array.isArray(config.rules) ? [...config.rules] : [];
+        const candidateIdentity = ruleIdentity(suggestion.ruleJson);
+        const exists =
+          candidateIdentity !== null &&
+          rules.some((rule) => ruleIdentity(rule) === candidateIdentity);
+        if (!exists) {
+          config.rules = [...rules, suggestion.ruleJson];
+          await tx.repoConfig.update({
+            where: { id: repoConfig.id },
+            data: { configJson: config }
+          });
+        }
+      }
+      await tx.ruleSuggestion.update({ where: { id }, data: { status: "accepted" } });
+      return true;
+    }, { isolationLevel: "Serializable" });
+    if (!accepted) {
       reply.code(404).send({ error: "Not found" });
       return;
-    }
-    await prisma.ruleSuggestion.update({ where: { id }, data: { status: "accepted" } });
-    const repoConfig = await prisma.repoConfig.findFirst({
-      where: { repoId: suggestion.repoId }
-    });
-    if (repoConfig) {
-      const config = isRecord(repoConfig.configJson) ? { ...repoConfig.configJson } : {};
-      const rules = Array.isArray(config.rules) ? [...config.rules] : [];
-      const candidateIdentity = ruleIdentity(suggestion.ruleJson);
-      const exists =
-        candidateIdentity !== null &&
-        rules.some((rule) => ruleIdentity(rule) === candidateIdentity);
-      if (!exists) {
-        rules.push(suggestion.ruleJson);
-      }
-      config.rules = rules;
-      await prisma.repoConfig.update({
-        where: { id: repoConfig.id },
-        data: { configJson: config }
-      });
     }
     reply.send({ ok: true });
     });

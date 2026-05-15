@@ -67,7 +67,15 @@ function splitDiffSections(diffPatch: string): {
   return { preamble, sections };
 }
 
-function resolveDiffSectionPath(lines: string[]): string | null {
+function resolveDiffSectionPaths(lines: string[]): string[] {
+  const paths: string[] = [];
+  const addPath = (value: string) => {
+    const normalized = normalizeDiffPath(value);
+    if (normalized && !paths.includes(normalized)) {
+      paths.push(normalized);
+    }
+  };
+
   for (const line of lines) {
     if (!line.startsWith("+++ ") && !line.startsWith("--- ")) {
       continue;
@@ -76,23 +84,22 @@ function resolveDiffSectionPath(lines: string[]): string | null {
     if (!candidate || candidate === "/dev/null") {
       continue;
     }
-    const normalized = normalizeDiffPath(candidate);
-    if (normalized) {
-      return normalized;
-    }
+    addPath(candidate);
   }
 
   for (const line of lines) {
-    if (!line.startsWith("rename to ") && !line.startsWith("copy to ")) {
+    if (
+      !line.startsWith("rename from ") &&
+      !line.startsWith("rename to ") &&
+      !line.startsWith("copy from ") &&
+      !line.startsWith("copy to ")
+    ) {
       continue;
     }
-    const normalized = normalizePath(line.replace(/^(rename|copy) to\s+/, ""));
-    if (normalized) {
-      return normalized;
-    }
+    addPath(line.replace(/^(rename|copy) (from|to)\s+/, ""));
   }
 
-  return null;
+  return paths;
 }
 
 function countSectionChanges(lines: string[]): { additions: number; deletions: number } {
@@ -209,11 +216,15 @@ export function sanitizeModelVisibleReviewData(params: {
   );
 
   for (const section of sections) {
-    const sectionPath = resolveDiffSectionPath(section);
-    if (sectionPath && shouldSkipSensitivePath(sectionPath)) {
-      redactedSectionPaths.push(sectionPath);
+    const sectionPaths = resolveDiffSectionPaths(section);
+    const sensitiveSectionPaths = sectionPaths.filter((sectionPath) =>
+      shouldSkipSensitivePath(sectionPath)
+    );
+    if (sensitiveSectionPaths.length > 0) {
+      redactedSectionPaths.push(...sensitiveSectionPaths);
       continue;
     }
+    const sectionPath = sectionPaths[0] ?? null;
     if (sectionPath) {
       const metadata = changedFileByPath.get(sectionPath);
       const sectionChanges = countSectionChanges(section);

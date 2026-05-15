@@ -256,7 +256,7 @@ test("retrieveContext avoids preloading full repo file and symbol metadata table
   prisma.fileIndex.findMany = (async (args: any) => {
     const ids = args?.where?.id?.in;
     assert.ok(Array.isArray(ids), "expected file metadata lookup by id batch");
-    assert.equal(args?.where?.repoId, undefined);
+    assert.equal(args?.where?.repoId, 88);
     fileLookups.push([...ids]);
     return ids.map((id: number) => ({
       id,
@@ -268,7 +268,7 @@ test("retrieveContext avoids preloading full repo file and symbol metadata table
   prisma.symbol.findMany = (async (args: any) => {
     const ids = args?.where?.id?.in;
     assert.ok(Array.isArray(ids), "expected symbol metadata lookup by id batch");
-    assert.equal(args?.where?.repoId, undefined);
+    assert.equal(args?.where?.repoId, 88);
     symbolLookups.push([...ids]);
     return ids.map((id: number) => ({
       id,

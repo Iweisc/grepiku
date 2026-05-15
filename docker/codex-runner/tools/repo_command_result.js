@@ -12,7 +12,7 @@ function hasSuppressedStderr(params = {}) {
 
 export function buildVerifierToolResult(params = {}) {
   const hadStderr = hasSuppressedStderr(params);
-  const topErrors =
+  const top_errors =
     hadStderr && (params.timedOut || (params.exitCode ?? 1) !== 0)
       ? [SUPPRESSED_STDERR_MESSAGE]
       : [];
@@ -21,8 +21,8 @@ export function buildVerifierToolResult(params = {}) {
     return {
       status: "timeout",
       summary: "Timed out",
-      topErrors,
-      logPath: null
+      top_errors,
+      log_path: null
     };
   }
 
@@ -31,15 +31,15 @@ export function buildVerifierToolResult(params = {}) {
     return {
       status: "pass",
       summary: "Success",
-      topErrors,
-      logPath: null
+      top_errors,
+      log_path: null
     };
   }
 
   return {
     status: "fail",
     summary: `Exited with ${exitCode}`,
-    topErrors,
-    logPath: null
+    top_errors,
+    log_path: null
   };
 }

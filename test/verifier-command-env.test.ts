@@ -116,8 +116,8 @@ test("buildVerifierToolResult suppresses raw repo-command stderr and avoids log 
 
   assert.equal(result.status, "fail");
   assert.equal(result.summary, "Exited with 1");
-  assert.deepEqual(result.topErrors, ["stderr output suppressed for security"]);
-  assert.equal(result.logPath, null);
+  assert.deepEqual(result.top_errors, ["stderr output suppressed for security"]);
+  assert.equal(result.log_path, null);
 });
 
 test("buildRepoCommandWorkspacePaths keeps verifier temp state outside the model-readable output root", async () => {

@@ -1926,7 +1926,12 @@ export async function processReviewJob(data: ReviewJobData) {
           inlineSyncBotLogin
         );
         for (const comment of reviewComments) {
-          const existing = byMarker.get(comment.comment_id);
+          const markerId = sanitizeCommentIdentifier(
+            comment.comment_id,
+            `${normalizePath(comment.path)}|${comment.side}|${comment.line}|${comment.title}`,
+            64
+          );
+          const existing = byMarker.get(markerId);
           if (!existing) continue;
           const desiredBody = formatInlineComment(comment);
           if ((existing.body || "") !== desiredBody) {
