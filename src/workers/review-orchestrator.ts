@@ -6,6 +6,8 @@ import { loadEnv } from "../config/env.js";
 import { sanitizeGithubGitAuthError } from "../github/gitAuth.js";
 
 const env = loadEnv();
+const reviewWorkerConcurrency = Number(process.env.REVIEW_WORKER_CONCURRENCY || 3);
+const reviewWorkerLockDurationMs = Math.max(env.codexStageTimeoutMs * 2, 2 * 60 * 60 * 1000);
 
 process.on("unhandledRejection", (reason) => {
   console.error("Unhandled rejection in review worker", sanitizeGithubGitAuthError(reason));
@@ -22,7 +24,8 @@ const worker = new Worker(
   },
   {
     connection: redisConnection,
-    concurrency: Number(process.env.REVIEW_WORKER_CONCURRENCY || 3)
+    concurrency: reviewWorkerConcurrency,
+    lockDuration: reviewWorkerLockDurationMs
   }
 );
 

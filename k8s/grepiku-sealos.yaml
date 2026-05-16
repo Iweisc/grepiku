@@ -310,6 +310,8 @@ spec:
           env:
             - name: NODE_ENV
               value: production
+            - name: REVIEW_WORKER_CONCURRENCY
+              value: "1"
             - name: SANDBOX_EXECUTION_MODE
               value: kubernetes
             - name: K8S_NAMESPACE
