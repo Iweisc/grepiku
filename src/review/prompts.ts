@@ -850,13 +850,14 @@ Comment body:
 ${promptCommentBody}
 
 Output requirements:
-- Write JSON to ${outDir}/reply.json with this schema:
+- Return only valid JSON with this schema:
 {
   "body": "string"
 }
+- If you prefer, you may also write the same JSON to ${outDir}/reply.json.
 - The body should mention @${commentAuthor} once at the start and be under 10 lines.
 
-Do not print anything else. Ensure the JSON is valid.`;
+Do not print anything except the JSON reply. Ensure the JSON is valid.`;
 }
 
 export function buildMentionImplementPrompt(params: {

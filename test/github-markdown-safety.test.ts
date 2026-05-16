@@ -172,7 +172,56 @@ test("summary diagrams keep attacker-controlled fence text inside the mermaid bl
     );
 
     assert.match(block, /````mermaid/);
-    assert.match(block, /\ngraph TD\nA-->B\n```\n@click\n````\n<!-- grepiku-summary:end -->$/);
+    assert.match(block, /\ngraph TD\nA-->B\n```\n@click\n````\n<\/details>\n<!-- grepiku-summary:end -->$/);
+  } finally {
+    await closeQueueClients();
+  }
+});
+
+test("summary block keeps large-review details collapsed behind concise headings", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    const block = __pipelineInternals.buildSummaryBlock(
+      {
+        overview:
+          "Large PR reviewed in 7 chunks across 149 files. Highest-risk areas: docker-compose.yml, Dockerfile, src/review/pipeline.ts. Top findings: git metadata check rejects normal .git directories; chunked reviewer output is too verbose.",
+        risk: "high",
+        confidence: 0.82,
+        key_concerns: ["git metadata check rejects .git directories", "summary is too verbose"],
+        what_to_test: ["open a PR with >100 files", "verify the PR body stays compact"],
+        file_breakdown: [
+          { path: "docker-compose.yml", summary: "infra changes", risk: "high" },
+          { path: "Dockerfile", summary: "runtime changes", risk: "high" }
+        ]
+      },
+      [
+        {
+          comment_id: "c1",
+          comment_key: "c1",
+          path: "src/review/pipeline.ts",
+          side: "RIGHT",
+          line: 10,
+          severity: "blocking",
+          category: "bug",
+          title: "Git metadata check rejects normal .git directories",
+          body: "details",
+          evidence: "evidence",
+          suggested_patch: "fix();",
+          comment_type: "summary",
+          confidence: "high"
+        }
+      ],
+      [],
+      []
+    );
+
+    assert.match(block, /## Grepiku Summary/);
+    assert.match(block, /### Top Findings/);
+    assert.match(block, /### What to Test/);
+    assert.match(block, /<summary>Fix with AI<\/summary>/);
+    assert.match(block, /<summary>Review details<\/summary>/);
+    assert.doesNotMatch(block, /Risk: high  /);
   } finally {
     await closeQueueClients();
   }

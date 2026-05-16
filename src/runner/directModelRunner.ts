@@ -1,6 +1,10 @@
 import fs from "fs/promises";
 import path from "path";
 import { loadEnv } from "../config/env.js";
+import {
+  runDirectModelStageInKubernetes,
+  shouldUseKubernetesSandbox
+} from "../sandbox/k8sRunner.js";
 import type {
   CodexReasoningEffort,
   CodexStage,
@@ -8,7 +12,7 @@ import type {
   CodexTokenUsage
 } from "./codexRunner.js";
 
-type DirectModelRunParams = {
+export type DirectModelRunParams = {
   stage: CodexStage;
   outDir: string;
   prompt: string;
@@ -16,6 +20,7 @@ type DirectModelRunParams = {
   prNumber: number;
   reasoningEffort?: CodexReasoningEffort;
   outputFileName: string;
+  executionMode?: "local" | "kubernetes-sandbox";
 };
 
 type ChatCompletionResponse = {
@@ -150,6 +155,14 @@ async function requestChatCompletion(params: {
 }
 
 export async function runDirectModelStage(params: DirectModelRunParams): Promise<CodexStageMetrics> {
+  const env = loadEnv();
+  if (shouldUseKubernetesSandbox(env) && params.executionMode !== "kubernetes-sandbox") {
+    return runDirectModelStageInKubernetes(params);
+  }
+  return runDirectModelStageLocal(params);
+}
+
+export async function runDirectModelStageLocal(params: DirectModelRunParams): Promise<CodexStageMetrics> {
   const env = loadEnv();
   const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}:direct]`;
   const reasoningEffort = params.reasoningEffort ?? env.codexModelReasoningEffort;

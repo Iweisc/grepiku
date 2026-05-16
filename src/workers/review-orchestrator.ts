@@ -18,7 +18,7 @@ const worker = new Worker(
       console.warn(`Review queue received unexpected legacy job ${job.name} (${job.id}); dropping`);
       return;
     }
-    await processReviewJob(job.data);
+    await processReviewJob(job.data, { jobId: job.id ?? null });
   },
   {
     connection: redisConnection,

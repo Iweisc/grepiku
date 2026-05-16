@@ -67,15 +67,26 @@ export function shouldSkipSelfBotFollowUpPrReview(params: {
   return isSelfBotComment({ authorLogin, botLogin: params.botLogin });
 }
 
+export function shouldSkipReviewForSelfAuthoredPullRequest(params: {
+  pullRequest: PullRequestReviewSkipCandidate;
+  botLogin: string;
+}): boolean {
+  const authorLogin = params.pullRequest.author?.login || "";
+  if (params.botLogin.trim() && isSelfBotComment({ authorLogin, botLogin: params.botLogin })) {
+    return true;
+  }
+
+  const headRef = params.pullRequest.headRef?.trim() || "";
+  return headRef.startsWith(FOLLOW_UP_BRANCH_PREFIX) && (/\[bot\]$/i.test(authorLogin.trim()) || /^app\//i.test(authorLogin.trim()));
+}
+
 export function shouldSkipBotAuthoredReview(params: {
   action: string;
   pullRequest: PullRequestReviewSkipCandidate;
   botLogin: string;
 }): boolean {
-  if (!params.botLogin.trim()) return false;
   if (!REVIEWABLE_PULL_REQUEST_ACTIONS.has(params.action)) return false;
-  const authorLogin = params.pullRequest.author?.login || "";
-  return isSelfBotComment({ authorLogin, botLogin: params.botLogin });
+  return shouldSkipReviewForSelfAuthoredPullRequest(params);
 }
 
 export function shouldRunVerifierForPullRequest(params: {

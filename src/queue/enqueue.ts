@@ -21,6 +21,15 @@ export async function enqueueReviewJob(data: any) {
 
 export async function enqueueCommentReplyJob(data: any) {
   const jobId = buildCommentReplyJobId(data);
+  const existing = await mentionQueue.getJob(jobId);
+  if (existing) {
+    const state = await existing.getState().catch(() => "unknown");
+    if (state === "failed") {
+      await existing.remove().catch(() => undefined);
+    } else {
+      return;
+    }
+  }
   await mentionQueue.add("comment-reply", data, {
     jobId,
     removeOnComplete: true,

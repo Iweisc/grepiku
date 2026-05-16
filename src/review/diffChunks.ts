@@ -346,6 +346,34 @@ function uniqueStrings(values: string[], limit: number): string[] {
   return output;
 }
 
+function truncateSingleLine(value: string, maxChars: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function buildMergedChunkOverview(params: {
+  drafts: ReviewChunkDraft[];
+  comments: ReviewComment[];
+}): string {
+  const topFindings = uniqueStrings(params.comments.map((comment) => comment.title), 3).map((value) =>
+    truncateSingleLine(value, 110)
+  );
+  if (topFindings.length > 0) {
+    return truncateSingleLine(`Top review findings: ${topFindings.join("; ")}.`, 400);
+  }
+
+  const keyConcerns = uniqueStrings(
+    params.drafts.flatMap(({ review }) => review.summary.key_concerns || []),
+    2
+  ).map((value) => truncateSingleLine(value, 120));
+  if (keyConcerns.length > 0) {
+    return truncateSingleLine(`Key concerns: ${keyConcerns.join("; ")}.`, 320);
+  }
+
+  return "Review completed with no high-confidence findings.";
+}
+
 function chunkCommentId(chunk: ReviewDiffChunk, comment: ReviewComment): string {
   const rawId = comment.comment_id.trim() || comment.comment_key.trim() || "comment";
   return `${chunk.id}:${rawId}`;
@@ -363,20 +391,11 @@ export function mergeChunkReviewDrafts(params: {
     }))
   );
   const summaries = params.drafts.map((draft) => draft.review.summary);
-  const overviewParts = params.drafts
-    .map(({ chunk, review }) => {
-      const overview = review.summary.overview.trim();
-      if (!overview) return "";
-      return `${chunk.id} (${chunk.paths.join(", ")}): ${overview}`;
-    })
-    .filter(Boolean);
-  const overview = overviewParts.length > 0
-    ? overviewParts.join("\n").slice(0, 8_000)
-    : `Parallel chunk review covered ${params.drafts.length} chunks.`;
   const fileBreakdown = params.drafts.flatMap(({ review }) => review.summary.file_breakdown || []);
   const confidenceValues = summaries
     .map((summary) => summary.confidence)
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const overview = buildMergedChunkOverview({ drafts: params.drafts, comments });
 
   return {
     summary: {

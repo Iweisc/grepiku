@@ -21,6 +21,10 @@ const outRoot = path.resolve(process.env.WORK_OUT_ROOT || "/work/out");
 const workspacePaths = buildRepoCommandWorkspacePaths(outRoot);
 const repoRw = workspacePaths.repoPath;
 const repoCommandHome = workspacePaths.homeDir;
+const verifierCacheDir = process.env.VERIFIER_CACHE_DIR
+  ? path.resolve(process.env.VERIFIER_CACHE_DIR)
+  : "";
+const directRepoCommandMode = process.env.VERIFIER_REPO_COMMAND_MODE === "direct";
 
 const tools = [
   {
@@ -56,6 +60,21 @@ function asText(text) {
 }
 
 async function ensureRepoWritable() {
+  if (directRepoCommandMode) {
+    await fs.mkdir(workspacePaths.stateRoot, { recursive: true });
+    await fs.rm(repoRw, { recursive: true, force: true }).catch(() => undefined);
+    await fs.cp(repoRoot, repoRw, {
+      recursive: true,
+      force: true,
+      dereference: false,
+      errorOnExist: false,
+      preserveTimestamps: true,
+      verbatimSymlinks: true
+    });
+    await fs.rm(path.join(repoRw, ".git"), { recursive: true, force: true }).catch(() => undefined);
+    await assertWorkspaceHasNoExternalSymlinks(repoRw, "verifier workspace");
+    return;
+  }
   try {
     await fs.stat(repoRw);
     await assertWorkspaceHasNoExternalSymlinks(repoRw, "verifier workspace");
@@ -114,13 +133,23 @@ async function runCommand(cmd, timeoutSec, toolName) {
     await fs.mkdir(commandEnv.TMPDIR, { recursive: true });
   }
   await assertWorkspaceHasNoExternalSymlinks(repoCommandHome, "verifier tool home");
-  const invocation = buildSandboxedRepoCommandInvocation({
-    codexExecPath: process.env.CODEX_EXEC_PATH || "codex-exec",
-    repoPath: repoRw,
-    homeDir: repoCommandHome,
-    command: cmd,
-    env: commandEnv
-  });
+  const invocation = directRepoCommandMode
+    ? {
+        file: "/bin/sh",
+        args: ["-lc", cmd],
+        options: {
+          cwd: repoRw,
+          env: commandEnv,
+          shell: false
+        }
+      }
+    : buildSandboxedRepoCommandInvocation({
+        codexExecPath: process.env.CODEX_EXEC_PATH || "codex-exec",
+        repoPath: repoRw,
+        homeDir: repoCommandHome,
+        command: cmd,
+        env: commandEnv
+      });
   const child = spawn(invocation.file, invocation.args, {
     ...invocation.options,
     stdio: ["ignore", "ignore", "pipe"]
@@ -149,10 +178,35 @@ async function runCommand(cmd, timeoutSec, toolName) {
   });
 }
 
-const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
-await client.connect();
+const client = process.env.DATABASE_URL
+  ? new pg.Client({ connectionString: process.env.DATABASE_URL })
+  : null;
+if (client) {
+  await client.connect();
+}
+
+async function cacheFileForTool(tool) {
+  if (!verifierCacheDir) return null;
+  await fs.mkdir(verifierCacheDir, { recursive: true });
+  return path.join(verifierCacheDir, `${tool.replace(/[^a-z0-9_-]/gi, "_")}.json`);
+}
 
 async function lookupToolRun(tool) {
+  const cachePath = await cacheFileForTool(tool);
+  if (cachePath) {
+    try {
+      const cached = JSON.parse(await fs.readFile(cachePath, "utf8"));
+      return {
+        status: cached.status,
+        summary: cached.summary,
+        topErrors: cached.topErrors || cached.top_errors || [],
+        logPath: cached.logPath || null
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (!client) return null;
   const reviewRunId = Number(process.env.REVIEW_RUN_ID || 0);
   const res = await client.query(
     'SELECT status, summary, "topErrors", "logPath" FROM "ToolRun" WHERE "reviewRunId"=$1 AND tool=$2',
@@ -172,6 +226,12 @@ async function lookupToolRun(tool) {
 }
 
 async function upsertToolRun(tool, result) {
+  const cachePath = await cacheFileForTool(tool);
+  if (cachePath) {
+    await fs.writeFile(cachePath, JSON.stringify(result, null, 2), "utf8");
+    return;
+  }
+  if (!client) return;
   const reviewRunId = Number(process.env.REVIEW_RUN_ID || 0);
   const topErrors = result.top_errors || result.topErrors || [];
   const logPath = result.log_path ?? result.logPath ?? null;
@@ -262,7 +322,7 @@ rl.on("line", async (line) => {
     }
 
     if (msg.method === "exit") {
-      await client.end();
+      if (client) await client.end();
       process.exit(0);
     }
   } catch (err) {
