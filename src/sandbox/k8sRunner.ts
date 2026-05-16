@@ -3,7 +3,7 @@ import { createWriteStream } from "fs";
 import os from "os";
 import path from "path";
 import { PassThrough, Readable, Writable } from "stream";
-import { pipeline } from "stream/promises";
+import { finished, pipeline } from "stream/promises";
 import { once } from "events";
 import { execa } from "execa";
 import {
@@ -494,6 +494,7 @@ async function tarFromPod(params: {
       stderr,
       timeoutMs: SANDBOX_TRANSFER_TIMEOUT_MS
     });
+    await finished(stdout);
     await validateTarFile(tarPath);
     await fs.mkdir(params.targetDir, { recursive: true });
     await execa("tar", ["-xf", tarPath, "-C", params.targetDir], { stdout: "ignore" });
