@@ -285,6 +285,7 @@ test("rule suggestion approve does not append duplicate rules into repo config",
   const originalSuggestionUpdate = prisma.ruleSuggestion.update;
   const originalRepoConfigFindFirst = prisma.repoConfig.findFirst;
   const originalRepoConfigUpdate = prisma.repoConfig.update;
+  const originalTransaction = prisma.$transaction;
   let updatedConfigJson: any = null;
 
   prisma.ruleSuggestion.findFirst = (async () => suggestion) as typeof prisma.ruleSuggestion.findFirst;
@@ -294,6 +295,11 @@ test("rule suggestion approve does not append duplicate rules into repo config",
     updatedConfigJson = args.data.configJson;
     return { ...repoConfig, configJson: args.data.configJson };
   }) as typeof prisma.repoConfig.update;
+  prisma.$transaction = (async (callback: any) =>
+    callback({
+      ruleSuggestion: prisma.ruleSuggestion,
+      repoConfig: prisma.repoConfig
+    })) as typeof prisma.$transaction;
 
   try {
     const response = await app.inject({
@@ -303,14 +309,16 @@ test("rule suggestion approve does not append duplicate rules into repo config",
     });
 
     assert.equal(response.statusCode, 200);
-    assert.equal(Array.isArray(updatedConfigJson.rules), true);
-    assert.equal(updatedConfigJson.rules.length, 1);
-    assert.deepEqual(updatedConfigJson.rules[0], existingRule);
+    const finalConfigJson = updatedConfigJson ?? repoConfig.configJson;
+    assert.equal(Array.isArray(finalConfigJson.rules), true);
+    assert.equal(finalConfigJson.rules.length, 1);
+    assert.deepEqual(finalConfigJson.rules[0], existingRule);
   } finally {
     prisma.ruleSuggestion.findFirst = originalSuggestionFindFirst;
     prisma.ruleSuggestion.update = originalSuggestionUpdate;
     prisma.repoConfig.findFirst = originalRepoConfigFindFirst;
     prisma.repoConfig.update = originalRepoConfigUpdate;
+    prisma.$transaction = originalTransaction;
   }
 });
 

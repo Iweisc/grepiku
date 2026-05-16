@@ -3,6 +3,7 @@ import { createWriteStream } from "fs";
 import os from "os";
 import path from "path";
 import { PassThrough, Readable, Writable } from "stream";
+import { pipeline } from "stream/promises";
 import { once } from "events";
 import { execa } from "execa";
 import {
@@ -37,6 +38,7 @@ import {
 const SERVICE_ACCOUNT_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 const SANDBOX_CONTAINER_NAME = "sandbox";
 const SANDBOX_WORK_VOLUME_NAME = "workdir";
+const SANDBOX_TRANSFER_TIMEOUT_MS = 120_000;
 
 type KubernetesSandboxRequest = {
   task: SandboxTask;
@@ -220,6 +222,37 @@ async function waitForSocketClose(socket: { on: (...args: any[]) => unknown; rea
   await once(socket as any, "close");
 }
 
+function closeExecSocket(socket: { readyState?: number; close?: () => void } | null): void {
+  if (socket?.readyState !== 3 && typeof socket?.close === "function") {
+    socket.close();
+  }
+}
+
+function execTimeout(params: {
+  timeoutMs: number;
+  command: string[];
+  getSocket: () => { readyState?: number; close?: () => void } | null;
+}): { promise: Promise<never>; cancel: () => void } {
+  let timer: NodeJS.Timeout | null = null;
+  const promise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      closeExecSocket(params.getSocket());
+      reject(
+        new Error(
+          `sandbox exec timed out after ${params.timeoutMs}ms: ${params.command.join(" ")}`
+        )
+      );
+    }, params.timeoutMs);
+    timer.unref();
+  });
+  return {
+    promise,
+    cancel: () => {
+      if (timer) clearTimeout(timer);
+    }
+  };
+}
+
 async function execInPod(params: {
   execClient: Exec;
   namespace: string;
@@ -228,22 +261,47 @@ async function execInPod(params: {
   stdin?: Readable | null;
   stdout?: Writable | null;
   stderr?: Writable | null;
+  timeoutMs?: number;
 }): Promise<void> {
   let status: V1Status | null = null;
-  const socket = await params.execClient.exec(
-    params.namespace,
-    params.podName,
-    SANDBOX_CONTAINER_NAME,
-    params.command,
-    params.stdout ?? null,
-    params.stderr ?? null,
-    params.stdin ?? null,
-    false,
-    (receivedStatus) => {
-      status = receivedStatus;
-    }
-  );
-  await waitForSocketClose(socket);
+  let resolveStatus!: (value: V1Status | null) => void;
+  let socket: { on: (...args: any[]) => unknown; readyState?: number; close?: () => void } | null =
+    null;
+  const statusPromise = new Promise<V1Status | null>((resolve) => {
+    resolveStatus = resolve;
+  });
+  const completion = (async () => {
+    const execSocket = await params.execClient.exec(
+      params.namespace,
+      params.podName,
+      SANDBOX_CONTAINER_NAME,
+      params.command,
+      params.stdout ?? null,
+      params.stderr ?? null,
+      params.stdin ?? null,
+      false,
+      (receivedStatus) => {
+        status = receivedStatus;
+        resolveStatus(receivedStatus);
+      }
+    );
+    socket = execSocket;
+    await Promise.race([statusPromise, waitForSocketClose(execSocket).then(() => status)]);
+  })();
+  const timeout =
+    params.timeoutMs && params.timeoutMs > 0
+      ? execTimeout({
+          timeoutMs: params.timeoutMs,
+          command: params.command,
+          getSocket: () => socket
+        })
+      : null;
+  try {
+    await (timeout ? Promise.race([completion, timeout.promise]) : completion);
+  } finally {
+    timeout?.cancel();
+  }
+  closeExecSocket(socket);
   const exitCode = statusExitCode(status);
   if (exitCode !== 0) {
     throw new Error(`sandbox exec failed (${exitCode}): ${params.command.join(" ")}`);
@@ -255,6 +313,7 @@ async function execCapture(params: {
   namespace: string;
   podName: string;
   command: string[];
+  timeoutMs?: number;
 }): Promise<ExecResult> {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -268,7 +327,8 @@ async function execCapture(params: {
     podName: params.podName,
     command: params.command,
     stdout,
-    stderr
+    stderr,
+    timeoutMs: params.timeoutMs
   });
   return {
     stdout: Buffer.concat(stdoutChunks).toString("utf8"),
@@ -285,12 +345,16 @@ async function tarToPod(params: {
   maxBytes: number;
   excludeGit?: boolean;
 }): Promise<void> {
-  await collectLocalTreeEntries({
+  const entries = await collectLocalTreeEntries({
     root: params.sourceDir,
     maxBytes: params.maxBytes,
     excludeGit: params.excludeGit
   });
-  const tarArgs = ["-C", params.sourceDir, "-cf", "-", "."];
+  if (entries.length === 0) return;
+  const listDir = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-sandbox-tar-list-"));
+  const listPath = path.join(listDir, "files");
+  await fs.writeFile(listPath, `${entries.map((entry) => entry.path).join("\0")}\0`, "utf8");
+  const tarArgs = ["-cf", "-", "-C", params.sourceDir, "--null", "--files-from", listPath];
   if (params.excludeGit) {
     tarArgs.splice(0, 0, "--exclude=.git");
   }
@@ -299,26 +363,52 @@ async function tarToPod(params: {
     stderr: "pipe",
     buffer: false
   });
+  const stdin = new PassThrough({ highWaterMark: 1024 * 1024 });
   const stderr = new PassThrough();
   const stderrChunks: Buffer[] = [];
+  const tarStderrChunks: Buffer[] = [];
   stderr.on("data", (chunk) => stderrChunks.push(Buffer.from(chunk)));
+  tar.stderr?.on("data", (chunk) => tarStderrChunks.push(Buffer.from(chunk)));
   try {
-    await execInPod({
+    if (!tar.stdout) {
+      tar.kill("SIGKILL");
+      throw new Error("local tar stdout pipe was not created");
+    }
+    const execPromise = execInPod({
       execClient: params.execClient,
       namespace: params.namespace,
       podName: params.podName,
-      command: ["tar", "-C", params.targetDir, "-xf", "-"],
-      stdin: tar.stdout,
-      stderr
-    });
-    await tar;
+      command: [
+        "tar",
+        "--no-same-owner",
+        "--no-same-permissions",
+        "--touch",
+        "-C",
+        params.targetDir,
+        "-xf",
+        "-"
+      ],
+      stdin,
+      stderr,
+      timeoutMs: SANDBOX_TRANSFER_TIMEOUT_MS
+    }).finally(() => stdin.destroy());
+    const pipePromise = pipeline(tar.stdout, stdin);
+    await Promise.all([execPromise, pipePromise, tar]);
   } catch (error) {
     tar.kill("SIGKILL");
-    const details = Buffer.concat(stderrChunks).toString("utf8").trim();
+    stdin.destroy();
+    const details = [
+      Buffer.concat(stderrChunks).toString("utf8").trim(),
+      Buffer.concat(tarStderrChunks).toString("utf8").trim()
+    ]
+      .filter(Boolean)
+      .join(": ");
     if (details) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}: ${details}`);
     }
     throw error;
+  } finally {
+    await fs.rm(listDir, { recursive: true, force: true });
   }
 }
 
@@ -395,7 +485,8 @@ async function tarFromPod(params: {
       podName: params.podName,
       command,
       stdout,
-      stderr
+      stderr,
+      timeoutMs: SANDBOX_TRANSFER_TIMEOUT_MS
     });
     await validateTarFile(tarPath);
     await fs.mkdir(params.targetDir, { recursive: true });
@@ -541,7 +632,8 @@ async function runKubernetesSandbox(request: KubernetesSandboxRequest): Promise<
       execClient,
       namespace,
       podName,
-      command: ["node", "/app/dist/sandbox/entrypoint.js"]
+      command: ["node", "/app/dist/sandbox/entrypoint.js"],
+      timeoutMs: env.k8sSandboxActiveDeadlineSeconds * 1000
     });
     if (result.stderr.trim()) {
       console.warn(`[sandbox ${podName}] stderr: ${result.stderr.trim()}`);
