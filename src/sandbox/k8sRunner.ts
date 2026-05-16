@@ -49,6 +49,12 @@ type KubernetesSandboxRequest = {
   includeGit?: boolean;
 };
 
+type SandboxUploadPlanEntry = {
+  sourceDir: string;
+  targetDir: string;
+  excludeGit: boolean;
+};
+
 type ExecResult = {
   stdout: string;
   stderr: string;
@@ -549,6 +555,36 @@ function rewriteTaskForPod(task: SandboxTask): SandboxTask {
   return rewriteDirectTaskForPod(rewriteCodexTaskForPod(task));
 }
 
+function shouldSeedSandboxOutDir(task: SandboxTask): boolean {
+  return task.kind === "codex-stage" && task.params.stage === "verifier";
+}
+
+function buildSandboxUploadPlan(request: KubernetesSandboxRequest): SandboxUploadPlanEntry[] {
+  const uploads: SandboxUploadPlanEntry[] = [];
+  if (request.localRepoPath) {
+    uploads.push({
+      sourceDir: request.localRepoPath,
+      targetDir: SANDBOX_REPO_PATH,
+      excludeGit: !request.includeGit
+    });
+  }
+  if (request.localBundleDir) {
+    uploads.push({
+      sourceDir: request.localBundleDir,
+      targetDir: SANDBOX_BUNDLE_PATH,
+      excludeGit: true
+    });
+  }
+  if (shouldSeedSandboxOutDir(request.task)) {
+    uploads.push({
+      sourceDir: request.localOutDir,
+      targetDir: SANDBOX_OUT_PATH,
+      excludeGit: true
+    });
+  }
+  return uploads;
+}
+
 function parseSandboxTaskResult(stdout: string): SandboxTaskResult {
   const lines = stdout
     .split("\n")
@@ -621,25 +657,16 @@ async function runKubernetesSandbox(request: KubernetesSandboxRequest): Promise<
         maxBytes: env.k8sSandboxTarMaxBytes,
         excludeGit: !request.includeGit
       });
-      await tarToPod({
-        execClient,
-        namespace,
-        podName,
-        sourceDir: request.localRepoPath,
-        targetDir: SANDBOX_REPO_PATH,
-        maxBytes: env.k8sSandboxTarMaxBytes,
-        excludeGit: !request.includeGit
-      });
     }
-    if (request.localBundleDir) {
+    for (const upload of buildSandboxUploadPlan(request)) {
       await tarToPod({
         execClient,
         namespace,
         podName,
-        sourceDir: request.localBundleDir,
-        targetDir: SANDBOX_BUNDLE_PATH,
+        sourceDir: upload.sourceDir,
+        targetDir: upload.targetDir,
         maxBytes: env.k8sSandboxTarMaxBytes,
-        excludeGit: true
+        excludeGit: upload.excludeGit
       });
     }
     await writeTaskFile({
@@ -759,5 +786,7 @@ export const __k8sSandboxInternals = {
   parseVerboseTarSymlink,
   parseSandboxTaskResult,
   rewriteTaskForPod,
-  rewritePromptPaths
+  rewritePromptPaths,
+  shouldSeedSandboxOutDir,
+  buildSandboxUploadPlan
 };

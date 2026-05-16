@@ -137,6 +137,87 @@ test("Kubernetes sandbox task rewriting remaps prompt paths into /work roots", (
   assert.doesNotMatch(rewritten.params.prompt, /\/app\/var\/repos\/demo/);
 });
 
+test("Kubernetes sandbox seeds verifier out artifacts into /work/out", () => {
+  const uploads = __k8sSandboxInternals.buildSandboxUploadPlan({
+    task: {
+      kind: "codex-stage",
+      params: {
+        stage: "verifier",
+        repoPath: "/app/var/repos/demo",
+        bundleDir: "/app/var/runs/9/bundle",
+        outDir: "/app/var/runs/9/out",
+        codexHomeDir: "/app/var/runs/9/codex-home",
+        prompt: "read /app/var/runs/9/out/inline_findings.json",
+        headSha: "abc123",
+        repoId: 1,
+        reviewRunId: 9,
+        prNumber: 44,
+        executionMode: "local"
+      }
+    },
+    localRepoPath: "/app/var/repos/demo",
+    localBundleDir: "/app/var/runs/9/bundle",
+    localOutDir: "/app/var/runs/9/out",
+    includeGit: true
+  });
+
+  assert.deepEqual(uploads, [
+    {
+      sourceDir: "/app/var/repos/demo",
+      targetDir: SANDBOX_REPO_PATH,
+      excludeGit: false
+    },
+    {
+      sourceDir: "/app/var/runs/9/bundle",
+      targetDir: SANDBOX_BUNDLE_PATH,
+      excludeGit: true
+    },
+    {
+      sourceDir: "/app/var/runs/9/out",
+      targetDir: SANDBOX_OUT_PATH,
+      excludeGit: true
+    }
+  ]);
+});
+
+test("Kubernetes sandbox does not upload prior out artifacts for reviewer stage", () => {
+  const uploads = __k8sSandboxInternals.buildSandboxUploadPlan({
+    task: {
+      kind: "codex-stage",
+      params: {
+        stage: "reviewer",
+        repoPath: "/app/var/repos/demo",
+        bundleDir: "/app/var/runs/9/bundle",
+        outDir: "/app/var/runs/9/out",
+        codexHomeDir: "/app/var/runs/9/codex-home",
+        prompt: "write /app/var/runs/9/out/draft_review.json",
+        headSha: "abc123",
+        repoId: 1,
+        reviewRunId: 9,
+        prNumber: 44,
+        executionMode: "local"
+      }
+    },
+    localRepoPath: "/app/var/repos/demo",
+    localBundleDir: "/app/var/runs/9/bundle",
+    localOutDir: "/app/var/runs/9/out",
+    includeGit: false
+  });
+
+  assert.deepEqual(uploads, [
+    {
+      sourceDir: "/app/var/repos/demo",
+      targetDir: SANDBOX_REPO_PATH,
+      excludeGit: true
+    },
+    {
+      sourceDir: "/app/var/runs/9/bundle",
+      targetDir: SANDBOX_BUNDLE_PATH,
+      excludeGit: true
+    }
+  ]);
+});
+
 test("sandbox tar validation rejects traversal and external symlinks", () => {
   assert.equal(validateTarEntryPath("./src/index.ts"), "src/index.ts");
   assert.throws(() => validateTarEntryPath("../secret"), /escapes target/);
