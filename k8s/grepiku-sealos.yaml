@@ -208,7 +208,7 @@ spec:
                   key: POSTGRES_DB
       containers:
         - name: migrate
-          image: ghcr.io/iweisc/grepiku:dev-2a53cda-20260516080201
+          image: ghcr.io/iweisc/grepiku:dev-1452700-20260516153706
           imagePullPolicy: Always
           command: ["sh", "-lc", "node_modules/.bin/prisma migrate deploy"]
           resources:
@@ -243,7 +243,7 @@ spec:
         - name: grepiku-regcred
       containers:
         - name: web
-          image: ghcr.io/iweisc/grepiku:dev-2a53cda-20260516080201
+          image: ghcr.io/iweisc/grepiku:dev-1452700-20260516153706
           imagePullPolicy: Always
           command: ["node", "dist/server.js"]
           resources:
@@ -297,7 +297,7 @@ spec:
         - name: grepiku-regcred
       containers:
         - name: worker
-          image: ghcr.io/iweisc/grepiku:dev-2a53cda-20260516080201
+          image: ghcr.io/iweisc/grepiku:dev-1452700-20260516153706
           imagePullPolicy: Always
           command: ["node", "dist/worker.js"]
           resources:
@@ -315,7 +315,7 @@ spec:
             - name: K8S_NAMESPACE
               value: ns-0kkzfz
             - name: K8S_SANDBOX_IMAGE
-              value: ghcr.io/iweisc/grepiku-sandbox:dev-2a53cda-20260516080201
+              value: ghcr.io/iweisc/grepiku-sandbox:dev-df91f91-20260516081542
             - name: K8S_SANDBOX_SERVICE_ACCOUNT
               value: grepiku-sandbox
             - name: K8S_SANDBOX_IMAGE_PULL_SECRET
