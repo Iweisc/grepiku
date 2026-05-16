@@ -1618,6 +1618,7 @@ export async function processReviewJob(
     const shouldRunCoveragePass =
       coveragePlan.shouldRun &&
       !shouldUseChunkedReviewer &&
+      env.sandboxExecutionMode !== "kubernetes" &&
       coveragePlan.targets.length > 0 &&
       !resolvedConfig.output.summaryOnly &&
       resolvedConfig.commentTypes.allow.includes("inline");

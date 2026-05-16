@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import {
   buildCoveragePlan,
   mergeSupplementalComments,
@@ -126,4 +127,9 @@ test("mergeSupplementalSummary promotes higher risk and keeps conservative confi
   assert.equal(summary.confidence, 0.6);
   assert.equal(summary.key_concerns.length, 2);
   assert.equal(summary.file_breakdown?.length, 2);
+});
+
+test("pipeline skips the supplemental coverage pass in kubernetes sandbox mode", async () => {
+  const script = await fs.readFile(new URL("../src/review/pipeline.ts", import.meta.url), "utf8");
+  assert.match(script, /shouldRunCoveragePass[\s\S]*env\.sandboxExecutionMode !== "kubernetes"/);
 });
