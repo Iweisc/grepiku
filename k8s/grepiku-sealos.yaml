@@ -318,6 +318,8 @@ spec:
               value: ghcr.io/iweisc/grepiku-sandbox:dev-2a53cda-20260516080201
             - name: K8S_SANDBOX_SERVICE_ACCOUNT
               value: grepiku-sandbox
+            - name: K8S_SANDBOX_IMAGE_PULL_SECRET
+              value: grepiku-regcred
           envFrom:
             - secretRef:
                 name: grepiku-env

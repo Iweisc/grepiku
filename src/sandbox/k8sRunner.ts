@@ -115,6 +115,9 @@ export function buildSandboxPodSpec(params: {
     component: "sandbox",
     "grepiku.io/task-kind": sanitizePodNamePart(params.taskKind)
   };
+  const imagePullSecrets = params.env.k8sSandboxImagePullSecret
+    ? [{ name: params.env.k8sSandboxImagePullSecret }]
+    : undefined;
   return {
     apiVersion: "v1",
     kind: "Pod",
@@ -125,6 +128,7 @@ export function buildSandboxPodSpec(params: {
     spec: {
       restartPolicy: "Never",
       serviceAccountName: params.serviceAccountName,
+      imagePullSecrets,
       automountServiceAccountToken: false,
       activeDeadlineSeconds: params.env.k8sSandboxActiveDeadlineSeconds,
       enableServiceLinks: false,

@@ -29,6 +29,7 @@ const EnvSchema = z.object({
   K8S_NAMESPACE: z.string().default(""),
   K8S_SANDBOX_IMAGE: z.string().default(""),
   K8S_SANDBOX_SERVICE_ACCOUNT: z.string().default("default"),
+  K8S_SANDBOX_IMAGE_PULL_SECRET: z.string().default(""),
   K8S_SANDBOX_CPU_REQUEST: z.string().default("500m"),
   K8S_SANDBOX_CPU_LIMIT: z.string().default("2"),
   K8S_SANDBOX_MEMORY_REQUEST: z.string().default("512Mi"),
@@ -68,6 +69,7 @@ export type Env = {
   k8sNamespace: string;
   k8sSandboxImage: string;
   k8sSandboxServiceAccount: string;
+  k8sSandboxImagePullSecret: string;
   k8sSandboxCpuRequest: string;
   k8sSandboxCpuLimit: string;
   k8sSandboxMemoryRequest: string;
@@ -143,6 +145,7 @@ export function loadEnv(): Env {
     k8sNamespace: parsed.K8S_NAMESPACE.trim(),
     k8sSandboxImage: parsed.K8S_SANDBOX_IMAGE.trim(),
     k8sSandboxServiceAccount: parsed.K8S_SANDBOX_SERVICE_ACCOUNT.trim() || "default",
+    k8sSandboxImagePullSecret: parsed.K8S_SANDBOX_IMAGE_PULL_SECRET.trim(),
     k8sSandboxCpuRequest: parsed.K8S_SANDBOX_CPU_REQUEST.trim() || "500m",
     k8sSandboxCpuLimit: parsed.K8S_SANDBOX_CPU_LIMIT.trim() || "2",
     k8sSandboxMemoryRequest: parsed.K8S_SANDBOX_MEMORY_REQUEST.trim() || "512Mi",

@@ -44,6 +44,7 @@ function sampleEnv(): Env {
     k8sNamespace: "ns-0kkzfz",
     k8sSandboxImage: "grepiku-sandbox:test",
     k8sSandboxServiceAccount: "grepiku-sandbox",
+    k8sSandboxImagePullSecret: "grepiku-regcred",
     k8sSandboxCpuRequest: "500m",
     k8sSandboxCpuLimit: "2",
     k8sSandboxMemoryRequest: "512Mi",
@@ -68,6 +69,7 @@ test("Kubernetes sandbox pod spec is restricted and short lived", () => {
   assert.equal(pod.spec?.automountServiceAccountToken, false);
   assert.equal(pod.spec?.activeDeadlineSeconds, 1200);
   assert.equal(pod.spec?.serviceAccountName, "grepiku-sandbox");
+  assert.equal(pod.spec?.imagePullSecrets?.[0]?.name, "grepiku-regcred");
   assert.equal(pod.metadata?.labels?.["grepiku.io/task-kind"], "codex-stage");
   assert.equal(pod.spec?.securityContext?.runAsNonRoot, true);
   assert.equal(pod.spec?.securityContext?.seccompProfile?.type, "RuntimeDefault");
@@ -168,7 +170,8 @@ test(
       SANDBOX_EXECUTION_MODE: "kubernetes",
       K8S_NAMESPACE: process.env.K8S_NAMESPACE || "ns-0kkzfz",
       K8S_SANDBOX_IMAGE:
-        process.env.K8S_SANDBOX_IMAGE || "ghcr.io/iweisc/grepiku-sandbox:sealos-dev-a0f8302-gpt55high"
+        process.env.K8S_SANDBOX_IMAGE || "ghcr.io/iweisc/grepiku-sandbox:sealos-dev-a0f8302-gpt55high",
+      K8S_SANDBOX_IMAGE_PULL_SECRET: process.env.K8S_SANDBOX_IMAGE_PULL_SECRET || "grepiku-regcred"
     };
     for (const [key, value] of Object.entries(required)) {
       if (!process.env[key]) process.env[key] = value;
