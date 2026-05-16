@@ -496,15 +496,34 @@ async function tarFromPod(params: {
   }
 }
 
+function rewritePromptPaths(prompt: string, replacements: Array<[string, string]>): string {
+  const ordered = replacements
+    .filter(([from, to]) => from.trim().length > 0 && from !== to)
+    .sort((a, b) => b[0].length - a[0].length);
+  let output = prompt;
+  for (const [from, to] of ordered) {
+    output = output.split(from).join(to);
+  }
+  return output;
+}
+
 function rewriteCodexTaskForPod(task: SandboxTask): SandboxTask {
   if (task.kind !== "codex-stage" && task.kind !== "mention-implementation-sync") {
     return task;
   }
+  const repoPath = task.params.repoPath ? SANDBOX_REPO_PATH : undefined;
+  const rewrittenPrompt = rewritePromptPaths(task.params.prompt, [
+    [task.params.repoPath || "", repoPath || ""],
+    [task.params.bundleDir, SANDBOX_BUNDLE_PATH],
+    [task.params.outDir, SANDBOX_OUT_PATH],
+    [task.params.codexHomeDir, SANDBOX_CODEX_HOME_PATH]
+  ]);
   return {
     kind: task.kind,
     params: {
       ...task.params,
-      repoPath: task.params.repoPath ? SANDBOX_REPO_PATH : undefined,
+      prompt: rewrittenPrompt,
+      repoPath,
       bundleDir: SANDBOX_BUNDLE_PATH,
       outDir: SANDBOX_OUT_PATH,
       codexHomeDir: SANDBOX_CODEX_HOME_PATH,
@@ -519,6 +538,7 @@ function rewriteDirectTaskForPod(task: SandboxTask): SandboxTask {
     kind: task.kind,
     params: {
       ...task.params,
+      prompt: rewritePromptPaths(task.params.prompt, [[task.params.outDir, SANDBOX_OUT_PATH]]),
       outDir: SANDBOX_OUT_PATH,
       executionMode: "kubernetes-sandbox"
     }
@@ -737,5 +757,7 @@ export const __k8sSandboxInternals = {
   runKubernetesSandbox,
   validateTarFile,
   parseVerboseTarSymlink,
-  parseSandboxTaskResult
+  parseSandboxTaskResult,
+  rewriteTaskForPod,
+  rewritePromptPaths
 };

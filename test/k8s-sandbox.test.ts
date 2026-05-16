@@ -4,9 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  __k8sSandboxInternals,
   buildSandboxPodSpec,
   runMentionChecksInKubernetes
 } from "../src/sandbox/k8sRunner.js";
+import {
+  SANDBOX_BUNDLE_PATH,
+  SANDBOX_CODEX_HOME_PATH,
+  SANDBOX_OUT_PATH,
+  SANDBOX_REPO_PATH
+} from "../src/sandbox/task.js";
 import {
   collectLocalTreeEntries,
   syncSandboxRepoBack,
@@ -87,6 +94,47 @@ test("Kubernetes sandbox pod spec is restricted and short lived", () => {
   assert.equal(envByName.get("INTERNAL_API_KEY"), undefined);
   assert.equal(envByName.get("DATABASE_URL"), "unused://sandbox");
   assert.equal(envByName.get("GITHUB_PRIVATE_KEY"), "unused");
+});
+
+test("Kubernetes sandbox task rewriting remaps prompt paths into /work roots", () => {
+  const task = {
+    kind: "codex-stage" as const,
+    params: {
+      stage: "reviewer" as const,
+      repoPath: "/app/var/repos/demo",
+      bundleDir: "/app/var/runs/9/bundle",
+      outDir: "/app/var/runs/9/out",
+      codexHomeDir: "/app/var/runs/9/codex-home",
+      prompt: [
+        "Context files:",
+        "- /app/var/runs/9/bundle/pr.md",
+        "- /app/var/runs/9/bundle/diff.patch",
+        "- Repo checkout: /app/var/repos/demo (read-only)",
+        "- Write JSON to /app/var/runs/9/out/draft_review.json"
+      ].join("\n"),
+      headSha: "abc123",
+      repoId: 1,
+      reviewRunId: 9,
+      prNumber: 44,
+      executionMode: "local" as const
+    }
+  };
+
+  const rewritten = __k8sSandboxInternals.rewriteTaskForPod(task);
+  assert.equal(rewritten.kind, "codex-stage");
+  if (rewritten.kind !== "codex-stage") return;
+  assert.equal(rewritten.params.repoPath, SANDBOX_REPO_PATH);
+  assert.equal(rewritten.params.bundleDir, SANDBOX_BUNDLE_PATH);
+  assert.equal(rewritten.params.outDir, SANDBOX_OUT_PATH);
+  assert.equal(rewritten.params.codexHomeDir, SANDBOX_CODEX_HOME_PATH);
+  assert.equal(rewritten.params.executionMode, "kubernetes-sandbox");
+  assert.match(rewritten.params.prompt, /\/work\/bundle\/pr\.md/);
+  assert.match(rewritten.params.prompt, /\/work\/bundle\/diff\.patch/);
+  assert.match(rewritten.params.prompt, /Repo checkout: \/work\/repo \(read-only\)/);
+  assert.match(rewritten.params.prompt, /\/work\/out\/draft_review\.json/);
+  assert.doesNotMatch(rewritten.params.prompt, /\/app\/var\/runs\/9\/bundle/);
+  assert.doesNotMatch(rewritten.params.prompt, /\/app\/var\/runs\/9\/out/);
+  assert.doesNotMatch(rewritten.params.prompt, /\/app\/var\/repos\/demo/);
 });
 
 test("sandbox tar validation rejects traversal and external symlinks", () => {
