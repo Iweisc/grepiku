@@ -208,7 +208,7 @@ spec:
                   key: POSTGRES_DB
       containers:
         - name: migrate
-          image: ghcr.io/iweisc/grepiku:dev-416888c-20260516155958
+          image: ghcr.io/iweisc/grepiku:dev-b116889-20260516162516
           imagePullPolicy: Always
           command: ["sh", "-lc", "node_modules/.bin/prisma migrate deploy"]
           resources:
@@ -243,7 +243,7 @@ spec:
         - name: grepiku-regcred
       containers:
         - name: web
-          image: ghcr.io/iweisc/grepiku:dev-416888c-20260516155958
+          image: ghcr.io/iweisc/grepiku:dev-b116889-20260516162516
           imagePullPolicy: Always
           command: ["node", "dist/server.js"]
           resources:
@@ -297,7 +297,7 @@ spec:
         - name: grepiku-regcred
       containers:
         - name: worker
-          image: ghcr.io/iweisc/grepiku:dev-416888c-20260516155958
+          image: ghcr.io/iweisc/grepiku:dev-b116889-20260516162516
           imagePullPolicy: Always
           command: ["node", "dist/worker.js"]
           resources:
