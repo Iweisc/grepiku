@@ -1361,6 +1361,7 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
       permissionDenied: true,
       finishedAt: new Date().toISOString()
     });
+  }
   } finally {
     await lockHandle.close();
     await fs.rm(lockPath, { force: true });
