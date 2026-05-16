@@ -70,6 +70,8 @@ test("Kubernetes sandbox pod spec is restricted and short lived", () => {
   assert.equal(pod.spec?.activeDeadlineSeconds, 1200);
   assert.equal(pod.spec?.serviceAccountName, "grepiku-sandbox");
   assert.equal(pod.spec?.imagePullSecrets?.[0]?.name, "grepiku-regcred");
+  assert.equal(pod.spec?.volumes?.[0]?.name, "workdir");
+  assert.equal(pod.spec?.volumes?.[0]?.emptyDir != null, true);
   assert.equal(pod.metadata?.labels?.["grepiku.io/task-kind"], "codex-stage");
   assert.equal(pod.spec?.securityContext?.runAsNonRoot, true);
   assert.equal(pod.spec?.securityContext?.seccompProfile?.type, "RuntimeDefault");

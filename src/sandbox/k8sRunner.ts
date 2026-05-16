@@ -36,6 +36,7 @@ import {
 
 const SERVICE_ACCOUNT_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 const SANDBOX_CONTAINER_NAME = "sandbox";
+const SANDBOX_WORK_VOLUME_NAME = "workdir";
 
 type KubernetesSandboxRequest = {
   task: SandboxTask;
@@ -132,6 +133,12 @@ export function buildSandboxPodSpec(params: {
       automountServiceAccountToken: false,
       activeDeadlineSeconds: params.env.k8sSandboxActiveDeadlineSeconds,
       enableServiceLinks: false,
+      volumes: [
+        {
+          name: SANDBOX_WORK_VOLUME_NAME,
+          emptyDir: {}
+        }
+      ],
       securityContext: {
         runAsNonRoot: true,
         runAsUser: 1000,
@@ -144,8 +151,14 @@ export function buildSandboxPodSpec(params: {
           name: SANDBOX_CONTAINER_NAME,
           image: params.image,
           imagePullPolicy: "IfNotPresent",
-          command: ["sh", "-lc", "mkdir -p /work/repo /work/bundle /work/out /work/codex-home && sleep 3600"],
+          command: ["sh", "-lc", "mkdir -p /work/repo /work/bundle /work/out /work/codex-home /work/tool-home/.tmp && sleep 3600"],
           env: baseSandboxEnv(params.env),
+          volumeMounts: [
+            {
+              name: SANDBOX_WORK_VOLUME_NAME,
+              mountPath: "/work"
+            }
+          ],
           resources: {
             requests: {
               cpu: params.env.k8sSandboxCpuRequest,
