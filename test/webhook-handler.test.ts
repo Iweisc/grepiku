@@ -1,8 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isGeneratedMentionReply, isSelfBotComment, normalizeBotAwareLogin } from "../src/providers/commentGuards.js";
+import {
+  isGeneratedMentionReply,
+  isPullRequestAuthorComment,
+  isPrivilegedCommentActionAllowed,
+  isReviewThreadReplyAllowed,
+  resolveTrackedFeedbackCommentId,
+  shouldCaptureRepoMemory,
+  isSelfBotComment,
+  isTrustedCommentAuthorAssociation,
+  normalizeBotAwareLogin
+} from "../src/providers/commentGuards.js";
 import { isResolutionReply } from "../src/providers/commentResolution.js";
-import { shouldDeleteClosedBotPrBranch, shouldSkipBotAuthoredReview, shouldSkipSelfBotFollowUpPrReview } from "../src/providers/pullRequestGuards.js";
+import {
+  headCommitReviewSkipReason,
+  shouldDeleteClosedBotPrBranch,
+  shouldRunVerifierForPullRequest,
+  shouldSkipBotAuthoredReview,
+  shouldSkipSelfBotFollowUpPrReview
+} from "../src/providers/pullRequestGuards.js";
+import {
+  selectBootstrapIndexSha,
+  selectTrustedPullRequestIndexSha
+} from "../src/providers/bootstrapIndex.js";
 
 test("normalizeBotAwareLogin strips [bot] suffix", () => {
   assert.equal(normalizeBotAwareLogin("grepiku-dev[bot]"), "grepiku-dev");
@@ -36,6 +56,13 @@ test("isSelfBotComment does not match unrelated bots or users", () => {
   );
   assert.equal(
     isSelfBotComment({
+      authorLogin: "grepiku-helper[bot]",
+      botLogin: "grepiku-dev"
+    }),
+    false
+  );
+  assert.equal(
+    isSelfBotComment({
       authorLogin: "Iweisc",
       botLogin: "grepiku-dev"
     }),
@@ -46,6 +73,176 @@ test("isSelfBotComment does not match unrelated bots or users", () => {
 test("isGeneratedMentionReply detects mention marker only", () => {
   assert.equal(isGeneratedMentionReply("<!-- grepiku-mention:2862044956 -->\n@grepiku-dev[bot] ok"), true);
   assert.equal(isGeneratedMentionReply("<!-- grepiku:cmt-1 -->"), false);
+});
+
+test("isTrustedCommentAuthorAssociation allows maintainers and rejects untrusted commenters", () => {
+  assert.equal(isTrustedCommentAuthorAssociation("OWNER"), true);
+  assert.equal(isTrustedCommentAuthorAssociation("member"), true);
+  assert.equal(isTrustedCommentAuthorAssociation("COLLABORATOR"), true);
+  assert.equal(isTrustedCommentAuthorAssociation("CONTRIBUTOR"), false);
+  assert.equal(isTrustedCommentAuthorAssociation("FIRST_TIME_CONTRIBUTOR"), false);
+  assert.equal(isTrustedCommentAuthorAssociation(""), false);
+  assert.equal(isTrustedCommentAuthorAssociation(undefined), false);
+});
+
+test("isPrivilegedCommentActionAllowed only allows trusted commenters to trigger standalone bot actions", () => {
+  assert.equal(
+    isPrivilegedCommentActionAllowed({
+      trigger: "review",
+      mentionTask: null,
+      authorAssociation: "OWNER"
+    }),
+    true
+  );
+  assert.equal(
+    isPrivilegedCommentActionAllowed({
+      trigger: "review",
+      mentionTask: null,
+      authorAssociation: "CONTRIBUTOR"
+    }),
+    false
+  );
+  assert.equal(
+    isPrivilegedCommentActionAllowed({
+      trigger: "mention",
+      mentionTask: "apply the requested fix",
+      authorAssociation: "COLLABORATOR"
+    }),
+    true
+  );
+  assert.equal(
+    isPrivilegedCommentActionAllowed({
+      trigger: "mention",
+      mentionTask: "apply the requested fix",
+      authorAssociation: "FIRST_TIME_CONTRIBUTOR"
+    }),
+    false
+  );
+  assert.equal(
+    isPrivilegedCommentActionAllowed({
+      trigger: "mention",
+      mentionTask: null,
+      authorAssociation: "FIRST_TIME_CONTRIBUTOR"
+    }),
+    false
+  );
+});
+
+test("isPullRequestAuthorComment matches the PR author by external id or login", () => {
+  assert.equal(
+    isPullRequestAuthorComment({
+      commentAuthorExternalId: "101",
+      commentAuthorLogin: "contributor",
+      pullRequestAuthorExternalId: "101",
+      pullRequestAuthorLogin: "someone-else"
+    }),
+    true
+  );
+  assert.equal(
+    isPullRequestAuthorComment({
+      commentAuthorExternalId: "202",
+      commentAuthorLogin: "ContribUser",
+      pullRequestAuthorExternalId: "999",
+      pullRequestAuthorLogin: "contribuser"
+    }),
+    true
+  );
+  assert.equal(
+    isPullRequestAuthorComment({
+      commentAuthorExternalId: "202",
+      commentAuthorLogin: "outsider",
+      pullRequestAuthorExternalId: "999",
+      pullRequestAuthorLogin: "contribuser"
+    }),
+    false
+  );
+});
+
+test("isReviewThreadReplyAllowed only allows trusted collaborators or the PR author", () => {
+  assert.equal(
+    isReviewThreadReplyAllowed({
+      hasTargetComment: true,
+      trustedCommentAuthor: true,
+      isPullRequestAuthor: false
+    }),
+    true
+  );
+  assert.equal(
+    isReviewThreadReplyAllowed({
+      hasTargetComment: true,
+      trustedCommentAuthor: false,
+      isPullRequestAuthor: true
+    }),
+    true
+  );
+  assert.equal(
+    isReviewThreadReplyAllowed({
+      hasTargetComment: true,
+      trustedCommentAuthor: false,
+      isPullRequestAuthor: false
+    }),
+    false
+  );
+  assert.equal(
+    isReviewThreadReplyAllowed({
+      hasTargetComment: false,
+      trustedCommentAuthor: true,
+      isPullRequestAuthor: true
+    }),
+    false
+  );
+});
+
+test("shouldCaptureRepoMemory requires a trusted commenter for mention-driven memory suggestions", () => {
+  assert.equal(
+    shouldCaptureRepoMemory({
+      trustedCommentAuthor: false,
+      commentTrigger: "mention",
+      hasTargetComment: false
+    }),
+    false
+  );
+  assert.equal(
+    shouldCaptureRepoMemory({
+      trustedCommentAuthor: true,
+      commentTrigger: "mention",
+      hasTargetComment: false
+    }),
+    true
+  );
+  assert.equal(
+    shouldCaptureRepoMemory({
+      trustedCommentAuthor: true,
+      commentTrigger: null,
+      hasTargetComment: true
+    }),
+    true
+  );
+});
+
+test("resolveTrackedFeedbackCommentId only accepts tracked Grepiku review comments", () => {
+  assert.equal(
+    resolveTrackedFeedbackCommentId({
+      providerCommentId: "github-inline-comment-1",
+      finding: { commentId: "finding-comment-1" }
+    }),
+    "finding-comment-1"
+  );
+  assert.equal(
+    resolveTrackedFeedbackCommentId({
+      providerCommentId: "github-summary-comment-9",
+      finding: null
+    }),
+    "github-summary-comment-9"
+  );
+  assert.equal(resolveTrackedFeedbackCommentId(null), null);
+  assert.equal(
+    resolveTrackedFeedbackCommentId({
+      providerCommentId: "   ",
+      finding: null
+    }),
+    null
+  );
 });
 
 test("isResolutionReply ignores negated resolution phrases", () => {
@@ -205,6 +402,20 @@ test("shouldSkipSelfBotFollowUpPrReview does not skip non-follow-up or non-bot p
   );
 });
 
+test("shouldSkipSelfBotFollowUpPrReview fails closed when bot identity cannot be resolved", () => {
+  assert.equal(
+    shouldSkipSelfBotFollowUpPrReview({
+      action: "opened",
+      botLogin: "",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "grepiku-helper[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+});
+
 test("shouldSkipBotAuthoredReview skips any PR authored by the bot", () => {
   assert.equal(
     shouldSkipBotAuthoredReview({
@@ -230,6 +441,20 @@ test("shouldSkipBotAuthoredReview skips any PR authored by the bot", () => {
   );
 });
 
+test("shouldSkipBotAuthoredReview fails closed when bot identity cannot be resolved", () => {
+  assert.equal(
+    shouldSkipBotAuthoredReview({
+      action: "opened",
+      botLogin: "",
+      pullRequest: {
+        headRef: "feature/some-branch",
+        author: { login: "grepiku-helper[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+});
+
 test("shouldSkipBotAuthoredReview does not skip human-authored PRs", () => {
   assert.equal(
     shouldSkipBotAuthoredReview({
@@ -252,5 +477,138 @@ test("shouldSkipBotAuthoredReview does not skip human-authored PRs", () => {
       }
     }),
     false
+  );
+});
+
+test("shouldDeleteClosedBotPrBranch fails closed when bot identity cannot be resolved", () => {
+  assert.equal(
+    shouldDeleteClosedBotPrBranch({
+      action: "closed",
+      repoFullName: "acme/grepiku",
+      botLogin: "",
+      pullRequest: {
+        state: "closed",
+        headRef: "grepiku/mention-123",
+        headRepoFullName: "acme/grepiku",
+        author: { login: "grepiku-helper[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+});
+
+test("shouldRunVerifierForPullRequest only allows same-repo heads", () => {
+  assert.equal(
+    shouldRunVerifierForPullRequest({
+      repoFullName: "acme/grepiku",
+      pullRequest: {
+        headRepoFullName: "acme/grepiku"
+      }
+    }),
+    true
+  );
+  assert.equal(
+    shouldRunVerifierForPullRequest({
+      repoFullName: "acme/grepiku",
+      pullRequest: {
+        headRepoFullName: "fork-user/grepiku"
+      }
+    }),
+    false
+  );
+  assert.equal(
+    shouldRunVerifierForPullRequest({
+      repoFullName: "acme/grepiku",
+      pullRequest: {
+        headRepoFullName: null
+      }
+    }),
+    false
+  );
+});
+
+test("headCommitReviewSkipReason only skips self-bot synchronize commits", () => {
+  assert.equal(
+    headCommitReviewSkipReason({
+      commitMessage: "Apply suggestions from code review",
+      authorLogin: "octocat",
+      parentCount: 1,
+      botLogin: "grepiku-dev"
+    }),
+    null
+  );
+
+  assert.equal(
+    headCommitReviewSkipReason({
+      commitMessage: "Merge branch 'main' into feature/refactor",
+      authorLogin: "octocat",
+      parentCount: 2,
+      botLogin: "grepiku-dev"
+    }),
+    null
+  );
+
+  assert.equal(
+    headCommitReviewSkipReason({
+      commitMessage: "chore: update follow-up branch",
+      authorLogin: "grepiku-dev[bot]",
+      parentCount: 1,
+      botLogin: "grepiku-dev"
+    }),
+    "bot-commit"
+  );
+
+  assert.equal(
+    headCommitReviewSkipReason({
+      commitMessage: "chore: spoof bot-like author",
+      authorLogin: "grepiku-helper[bot]",
+      parentCount: 1,
+      botLogin: "grepiku-dev"
+    }),
+    null
+  );
+
+  assert.equal(
+    headCommitReviewSkipReason({
+      commitMessage: "chore: unknown bot identity should not skip",
+      authorLogin: "grepiku-dev[bot]",
+      parentCount: 1,
+      botLogin: ""
+    }),
+    null
+  );
+});
+
+test("bootstrap repo indexing trusts the pull request base sha and fails closed without one", () => {
+  assert.equal(
+    selectBootstrapIndexSha({
+      baseSha: "base123",
+      headSha: "head456"
+    }),
+    "base123"
+  );
+  assert.equal(
+    selectBootstrapIndexSha({
+      baseSha: null,
+      headSha: "head456"
+    }),
+    null
+  );
+});
+
+test("post-review repo indexing stays pinned to the trusted pull request base sha", () => {
+  assert.equal(
+    selectTrustedPullRequestIndexSha({
+      baseSha: "base123",
+      headSha: "head456"
+    }),
+    "base123"
+  );
+  assert.equal(
+    selectTrustedPullRequestIndexSha({
+      baseSha: null,
+      headSha: "head456"
+    }),
+    null
   );
 });

@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   parseAndValidateJson,
+  readAndValidateJson,
   readAndValidateJsonWithFallback
 } from "../src/review/json.js";
 import { ReviewSchema, VerdictsSchema } from "../src/review/schemas.js";
@@ -91,6 +92,40 @@ test("readAndValidateJsonWithFallback uses last message when the primary file is
     const parsed = await readAndValidateJsonWithFallback(filePath, fallbackPath, ReviewSchema);
 
     assert.deepEqual(parsed, sampleReview);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("readAndValidateJson rejects oversized stage output files", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-review-json-"));
+  const filePath = path.join(root, "draft_review.json");
+  const oversizedReview = {
+    ...sampleReview,
+    comments: [
+      {
+        comment_id: "huge-output",
+        comment_key: "huge-output",
+        path: "src/review/json.ts",
+        side: "RIGHT" as const,
+        line: 1,
+        severity: "important" as const,
+        category: "security" as const,
+        title: "Oversized output",
+        body: "x".repeat(1_100_000),
+        evidence: "bounded",
+        suggested_patch: "bounded"
+      }
+    ]
+  };
+
+  try {
+    await fs.writeFile(filePath, JSON.stringify(oversizedReview), "utf8");
+
+    await assert.rejects(
+      () => readAndValidateJson(filePath, ReviewSchema),
+      /output file exceeded byte limit/i
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

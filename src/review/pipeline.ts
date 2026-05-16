@@ -4,15 +4,18 @@ import { minimatch } from "minimatch";
 import { ZodSchema } from "zod";
 import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
-import { loadRepoConfig, saveRepoConfig } from "./config.js";
+import { loadRepoConfigAtGitRef, saveRepoConfig, type RepoConfig } from "./config.js";
 import { createRunDirs, writeBundleFiles } from "./bundle.js";
 import {
   buildReviewerPrompt,
+  buildDirectReviewerPrompt,
   buildEditorPrompt,
   buildVerifierPrompt,
-  buildCoverageReviewerPrompt
+  buildCoverageReviewerPrompt,
+  type ReviewPromptOptions
 } from "./prompts.js";
 import { CodexStage, runCodexStage } from "../runner/codexRunner.js";
+import { runDirectModelStage } from "../runner/directModelRunner.js";
 import { readAndValidateJsonWithFallback } from "./json.js";
 import {
   ReviewSchema,
@@ -36,27 +39,62 @@ import {
   selectPreferredExactKeyFinding
 } from "./findingLifecycle.js";
 import { generateMermaidDiagram } from "./diagram.js";
-import { ReviewOutput } from "./schemas.js";
+import { ReviewOutput, VerdictsOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
 import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
 import { resolveRules } from "./triggers.js";
-import { buildContextPack } from "./context.js";
+import { buildContextPack, type ContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
 import { getRepoWeights } from "../services/weights.js";
-import { refineReviewComments } from "./quality.js";
-import { buildLocalChangedFiles, buildLocalDiffPatch } from "./localCompare.js";
+import { refineReviewComments, sanitizeCommentIdentifier } from "./quality.js";
+import {
+  buildLocalChangedFiles,
+  buildLocalDiffPatch,
+  resolveDiffPatchAfterLocalCompareFailure
+} from "./localCompare.js";
+import { renderPrMarkdown } from "./prMarkdown.js";
+import { sanitizeModelVisibleReviewData } from "./sensitiveReviewData.js";
 import { loadAcceptedRepoMemoryRules, mergeRulesWithRepoMemory } from "../services/repoMemory.js";
 import { buildIncrementalReviewContext } from "./incrementalContext.js";
-import { readVerifierChecks } from "./checks.js";
+import { buildVerifierSkippedChecks, readVerifierChecks } from "./checks.js";
 import {
   buildCoveragePlan,
   mergeSupplementalComments,
   mergeSupplementalSummary
 } from "./coverage.js";
+import { sanitizeGitHubMarkdownText } from "./githubMarkdown.js";
 import { normalizeSuggestedPatchText, stripEdgeBlankLines } from "./text.js";
+import { shouldRunVerifierForPullRequest } from "../providers/pullRequestGuards.js";
+import { selectTrustedPullRequestIndexSha } from "../providers/bootstrapIndex.js";
+import { resolveGithubBotLogin } from "../providers/github/adapter.js";
+import { mergeStoredPullRequestState } from "./pullRequestState.js";
+import {
+  buildReviewDiffChunkPlan,
+  mergeChunkReviewDrafts,
+  type ReviewChunkDraft,
+  type ReviewDiffChunk,
+  type ReviewDiffChunkPlan
+} from "./diffChunks.js";
+import {
+  buildContextPackForChunk,
+  chunkHasHighImpactHotspot
+} from "./chunkContext.js";
+import {
+  applyEditorDecisionOutput,
+  buildCompactEditorInput,
+  buildDeterministicEditorDecisionOutput
+} from "./editorDecision.js";
 
 const env = loadEnv();
+const CHUNKED_REVIEW_MIN_CHANGED_LINES = 16_000;
+const CHUNKED_REVIEW_TARGET_CHANGED_LINES = 6_000;
+const CHUNKED_REVIEW_MAX_CHANGED_LINES = 7_000;
+const CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 3_000;
+const CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 3_800;
+const CHUNKED_REVIEW_MAX_FILES = 240;
+const CHUNKED_REVIEW_MAX_PARALLEL = 48;
+const CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS = 48;
 
 export type ReviewJobData = {
   provider: "github";
@@ -125,6 +163,38 @@ function filterAndNormalizeComments(
   return { inline, summary };
 }
 
+function hasBlockingVisibleFindings(params: {
+  inline: Array<Pick<ReviewComment, "severity">>;
+  summary: Array<Pick<ReviewComment, "severity">>;
+}): boolean {
+  return [...params.inline, ...params.summary].some(
+    (comment) => comment.severity === "blocking"
+  );
+}
+
+function hasFailingVerifierChecks(checks: ChecksOutput["checks"]): boolean {
+  return [checks.lint, checks.build, checks.test].some((result) =>
+    ["fail", "timeout", "error"].includes(result.status)
+  );
+}
+
+function resolveStatusCheckConclusion(params: {
+  required: boolean;
+  inline: Array<Pick<ReviewComment, "severity">>;
+  summary: Array<Pick<ReviewComment, "severity">>;
+  checks: ChecksOutput["checks"];
+}): "success" | "failure" | "neutral" {
+  const hasBlocking = hasBlockingVisibleFindings({
+    inline: params.inline,
+    summary: params.summary
+  });
+  const hasVerifierFailure = hasFailingVerifierChecks(params.checks);
+  if (!hasBlocking && !hasVerifierFailure) {
+    return "success";
+  }
+  return params.required ? "failure" : "neutral";
+}
+
 function buildFeedbackHint(policy: FeedbackPolicy): string {
   const lines: string[] = [];
   if (policy.negativeCategories.length > 0) {
@@ -142,7 +212,20 @@ function buildFeedbackHint(policy: FeedbackPolicy): string {
 }
 
 function formatInlineComment(comment: ReviewComment): string {
-  const marker = `<!-- grepiku:${comment.comment_id} -->`;
+  const markerId = sanitizeCommentIdentifier(
+    comment.comment_id,
+    `${normalizePath(comment.path)}|${comment.side}|${comment.line}|${comment.title}`,
+    64
+  );
+  const marker = `<!-- grepiku:${markerId} -->`;
+  const maxBacktickRun = (value: string) => {
+    const matches = value.match(/`+/g);
+    return matches?.reduce((max, match) => Math.max(max, match.length), 0) || 0;
+  };
+  const buildFencedBlock = (value: string, infoString: string) => {
+    const fence = "`".repeat(Math.max(3, maxBacktickRun(value) + 1));
+    return `${fence}${infoString}\n${value}\n${fence}`;
+  };
   const normalizeSuggestedPatch = (patch: string) => {
     let normalized = normalizeSuggestedPatchText(patch);
     normalized = normalized
@@ -190,10 +273,10 @@ function formatInlineComment(comment: ReviewComment): string {
   };
   const bodyParts = [
     marker,
-    `**${comment.severity.toUpperCase()}** ${comment.title}`,
-    `Category: ${comment.category}`,
-    comment.rule_id ? `Rule: ${comment.rule_id}` : null,
-    comment.body
+    `**${comment.severity.toUpperCase()}** ${sanitizeGitHubMarkdownText(comment.title)}`,
+    `Category: ${sanitizeGitHubMarkdownText(comment.category)}`,
+    comment.rule_id ? `Rule: ${sanitizeGitHubMarkdownText(comment.rule_id)}` : null,
+    sanitizeGitHubMarkdownText(comment.body)
   ].filter((line) => line !== null);
 
   const suggestedPatch = comment.suggested_patch
@@ -201,7 +284,7 @@ function formatInlineComment(comment: ReviewComment): string {
     : null;
 
   if (suggestedPatch) {
-    bodyParts.push("Suggested change:", "```suggestion", suggestedPatch, "```");
+    bodyParts.push("Suggested change:", buildFencedBlock(suggestedPatch, "suggestion"));
   }
 
   return bodyParts.join("\n\n");
@@ -210,6 +293,33 @@ function formatInlineComment(comment: ReviewComment): string {
 function extractCommentId(body: string): string | null {
   const match = body.match(/<!--\s*grepiku:([^\s]+)\s*-->/);
   return match ? match[1] : null;
+}
+
+function normalizeBotAwareLogin(value: string | null | undefined): string {
+  return (value || "").trim().toLowerCase().replace(/\[bot\]$/i, "");
+}
+
+function buildExistingInlineCommentLookup(
+  comments: ProviderReviewComment[],
+  botLogin: string
+): Map<string, ProviderReviewComment> {
+  const byMarker = new Map<string, ProviderReviewComment>();
+  const normalizedBotLogin = normalizeBotAwareLogin(botLogin);
+  if (!normalizedBotLogin) {
+    return byMarker;
+  }
+
+  for (const comment of comments) {
+    if (normalizeBotAwareLogin(comment.authorLogin) !== normalizedBotLogin) {
+      continue;
+    }
+    const marker = extractCommentId(comment.body || "");
+    if (marker) {
+      byMarker.set(marker, comment);
+    }
+  }
+
+  return byMarker;
 }
 
 function renderStatusComment(params: {
@@ -231,24 +341,31 @@ function renderStatusComment(params: {
   const { summary, newFindings, openFindings, fixedFindings, checks, warnings } = params;
   const renderList = (items: Array<{ title: string; url?: string }>) => {
     if (items.length === 0) return "- (none)";
-    return items.map((item) => (item.url ? `- [${item.title}](${item.url})` : `- ${item.title}`)).join("\n");
+    return items
+      .map((item) => {
+        const safeTitle = sanitizeGitHubMarkdownText(item.title);
+        return item.url ? `- [View finding](${item.url}) ${safeTitle}` : `- ${safeTitle}`;
+      })
+      .join("\n");
   };
 
   const renderFixed = () => {
     if (fixedFindings.length === 0) return "- (none)";
-    return fixedFindings.map((item) => `- ${item.title}`).join("\n");
+    return fixedFindings.map((item) => `- ${sanitizeGitHubMarkdownText(item.title)}`).join("\n");
   };
 
   const renderCheck = (name: string, result: { status: string; summary: string; top_errors: string[] }) => {
-    const errors = result.top_errors.length ? result.top_errors.map((e) => `  - ${e}`).join("\n") : "  - (none)";
-    return `**${name}**: ${result.status} - ${result.summary}\n${errors}`;
+    const errors = result.top_errors.length
+      ? result.top_errors.map((e) => `  - ${sanitizeGitHubMarkdownText(e)}`).join("\n")
+      : "  - (none)";
+    return `**${name}**: ${result.status} - ${sanitizeGitHubMarkdownText(result.summary)}\n${errors}`;
   };
 
   return [
     "## AI Review Status",
     "",
-    `**Overview:** ${summary.overview}`,
-    `**Risk:** ${summary.risk}`,
+    `**Overview:** ${sanitizeGitHubMarkdownText(summary.overview)}`,
+    `**Risk:** ${sanitizeGitHubMarkdownText(summary.risk)}`,
     summary.confidence !== undefined ? `**Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : "",
     params.run ? `**Run:** #${params.run.id} (\`${params.run.headSha.slice(0, 12)}\`)` : "",
     "",
@@ -261,7 +378,10 @@ function renderStatusComment(params: {
     "### Fixed Findings",
     renderFixed(),
     "",
-    warnings && warnings.length > 0 ? "### Config Warnings\n" + warnings.map((w) => `- ${w}`).join("\n") : "",
+    warnings && warnings.length > 0
+      ? "### Config Warnings\n" +
+        warnings.map((w) => `- ${sanitizeGitHubMarkdownText(w)}`).join("\n")
+      : "",
     "",
     "### Checks",
     renderCheck("lint", checks.lint),
@@ -417,6 +537,13 @@ function buildSummaryBlock(
   summaryComments: ReviewComment[],
   patternMatches: string[]
 ): string {
+  const buildFencedBlock = (value: string, infoString: string) => {
+    const matches = value.match(/`+/g);
+    const maxBacktickRun =
+      matches?.reduce((max, match) => Math.max(max, match.length), 0) || 0;
+    const fence = "`".repeat(Math.max(3, maxBacktickRun + 1));
+    return [`${fence}${infoString}`, value, fence];
+  };
   const start = "<!-- grepiku-summary:start -->";
   const end = "<!-- grepiku-summary:end -->";
   const severityOrder = { blocking: 0, important: 1, nit: 2 } as const;
@@ -425,32 +552,39 @@ function buildSummaryBlock(
   )[0];
   const keyConcerns =
     summary.key_concerns.length > 0
-      ? summary.key_concerns.map((c) => `- ${c}`).join("\n")
+      ? summary.key_concerns.map((c) => `- ${sanitizeGitHubMarkdownText(c)}`).join("\n")
       : "- (none)";
   const whatToTest =
     summary.what_to_test.length > 0
-      ? summary.what_to_test.map((c) => `- ${c}`).join("\n")
+      ? summary.what_to_test.map((c) => `- ${sanitizeGitHubMarkdownText(c)}`).join("\n")
       : "- (none)";
 
   const notableLine = notable
-    ? `Notable issue: ${notable.title} (${notable.severity})`
+    ? `Notable issue: ${sanitizeGitHubMarkdownText(notable.title)} (${notable.severity})`
     : "Notable issue: (none)";
 
   const fileBreakdown =
     summary.file_breakdown?.length
       ? summary.file_breakdown
-          .map((file) => `- ${file.path}: ${file.summary}${file.risk ? ` (risk: ${file.risk})` : ""}`)
+          .map(
+            (file) =>
+              `- ${sanitizeGitHubMarkdownText(file.path)}: ${sanitizeGitHubMarkdownText(file.summary)}${
+                file.risk ? ` (risk: ${sanitizeGitHubMarkdownText(file.risk)})` : ""
+              }`
+          )
           .join("\n")
       : "- (none)";
 
   const summaryFindings =
     summaryComments.length > 0
-      ? summaryComments.map((c) => `- ${c.title}: ${c.body}`).join("\n")
+      ? summaryComments
+          .map((c) => `- ${sanitizeGitHubMarkdownText(c.title)}: ${sanitizeGitHubMarkdownText(c.body)}`)
+          .join("\n")
       : "- (none)";
 
   const patternBlock =
     patternMatches.length > 0
-      ? patternMatches.map((match) => `- ${match}`).join("\n")
+      ? patternMatches.map((match) => `- ${sanitizeGitHubMarkdownText(match)}`).join("\n")
       : "- (none)";
   const fixPrompt =
     comments.length > 0
@@ -475,8 +609,8 @@ function buildSummaryBlock(
   ].join("\n");
 
   const summaryLines = [
-    summary.overview,
-    `Risk: ${summary.risk}`,
+    sanitizeGitHubMarkdownText(summary.overview),
+    `Risk: ${sanitizeGitHubMarkdownText(summary.risk)}`,
     summary.confidence !== undefined ? `Confidence: ${(summary.confidence * 100).toFixed(0)}%` : null,
     notableLine
   ]
@@ -507,9 +641,7 @@ function buildSummaryBlock(
     whatToTest,
     summary.diagram_mermaid ? "" : "",
     summary.diagram_mermaid ? "Diagram:" : "",
-    summary.diagram_mermaid ? "```mermaid" : "",
-    summary.diagram_mermaid || "",
-    summary.diagram_mermaid ? "```" : "",
+    ...(summary.diagram_mermaid ? buildFencedBlock(summary.diagram_mermaid, "mermaid") : []),
     end
   ].filter((line) => line !== null).join("\n");
 }
@@ -572,30 +704,6 @@ function upsertSummaryBlock(body: string, block: string): string {
   return `${trimmed}\n\n${block}`;
 }
 
-function renderPrMarkdown(params: {
-  title: string;
-  number: number;
-  author: string;
-  body?: string | null;
-  baseRef?: string | null;
-  headRef?: string | null;
-  headSha: string;
-  url?: string | null;
-}): string {
-  const { title, number, author, body, baseRef, headRef, headSha, url } = params;
-  return `# PR #${number}: ${title}
-
-Author: ${author}
-Base: ${baseRef || ""}
-Head: ${headRef || ""}
-Head SHA: ${headSha}
-URL: ${url || ""}
-
-## Description
-${body || "(no description)"}
-`;
-}
-
 async function readJsonWithFallback<T>(
   filePath: string,
   schema: ZodSchema<T>,
@@ -603,6 +711,230 @@ async function readJsonWithFallback<T>(
 ): Promise<T> {
   const fallbackPath = path.join(path.dirname(filePath), `last_message_${stage}.txt`);
   return readAndValidateJsonWithFallback(filePath, fallbackPath, schema);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index] as T, index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function serializableChunkPlan(plan: ReviewDiffChunkPlan): unknown {
+  return {
+    stats: plan.stats,
+    chunks: plan.chunks.map((chunk) => ({
+      id: chunk.id,
+      ordinal: chunk.ordinal,
+      paths: chunk.paths,
+      changedLines: chunk.changedLines,
+      additions: chunk.additions,
+      deletions: chunk.deletions,
+      risk: chunk.risk,
+      diffBytes: Buffer.byteLength(chunk.diffPatch, "utf8")
+    }))
+  };
+}
+
+function reasoningEffortForChunk(
+  chunk: ReviewDiffChunk,
+  contextPack: ContextPack
+): "low" | "medium" | "high" | "xhigh" {
+  if (env.codexModelReasoningEffort !== "high") {
+    return env.codexModelReasoningEffort;
+  }
+  if (chunkHasHighImpactHotspot(contextPack, chunk)) return "high";
+  return "low";
+}
+
+async function runReviewerChunk(params: {
+  chunk: ReviewDiffChunk;
+  chunkCount: number;
+  totalChangedLines: number;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+  codexHomeDir: string;
+  prMarkdown: string;
+  repoConfig: RepoConfig;
+  resolvedConfig: RepoConfig;
+  contextPack: ContextPack;
+  previousReviewContext: unknown;
+  warnings: string[];
+  promptOptions: ReviewPromptOptions;
+  feedbackPolicy: FeedbackPolicy;
+  prTitle?: string | null;
+  prBody?: string | null;
+  headSha: string;
+  repoId: number;
+  runId: number;
+  prNumber: number;
+}): Promise<ReviewChunkDraft> {
+  const chunkBundleDir = path.join(params.bundleDir, "review_chunks", params.chunk.id);
+  const chunkOutDir = path.join(params.outDir, "review_chunks", params.chunk.id);
+  const chunkCodexHomeDir = path.join(params.codexHomeDir, "review_chunks", params.chunk.id);
+  await fs.mkdir(chunkBundleDir, { recursive: true });
+  await fs.mkdir(chunkOutDir, { recursive: true });
+  await fs.mkdir(chunkCodexHomeDir, { recursive: true });
+  const chunkContextPack = await buildContextPackForChunk({
+    repoId: params.repoId,
+    chunk: params.chunk,
+    config: params.resolvedConfig,
+    prTitle: params.prTitle,
+    prBody: params.prBody,
+    fallbackContextPack: params.contextPack
+  });
+
+  await writeBundleFiles({
+    bundleDir: chunkBundleDir,
+    prMarkdown: params.prMarkdown,
+    diffPatch: params.chunk.diffPatch,
+    changedFiles: params.chunk.changedFiles,
+    repoConfig: params.repoConfig,
+    resolvedConfig: params.resolvedConfig,
+    contextPack: chunkContextPack,
+    previousReviewContext: params.previousReviewContext,
+    warnings: params.warnings
+  });
+
+  const chunkPromptPaths = {
+    repoPath: params.repoPath,
+    bundleDir: chunkBundleDir,
+    outDir: chunkOutDir
+  };
+  const chunkPromptOptions = {
+    ...params.promptOptions,
+    fullRepoStaticAudit: false,
+    chunkReview: {
+      chunkId: params.chunk.id,
+      ordinal: params.chunk.ordinal,
+      totalChunks: params.chunkCount,
+      changedLines: params.chunk.changedLines,
+      totalChangedLines: params.totalChangedLines,
+      paths: params.chunk.paths
+    }
+  } satisfies ReviewPromptOptions;
+  const reasoningEffort = reasoningEffortForChunk(params.chunk, chunkContextPack);
+
+  console.log(
+    `[run ${params.runId} pr#${params.prNumber}] reviewer ${params.chunk.id} starting ` +
+      `files=${params.chunk.paths.length} changedLines=${params.chunk.changedLines} risk=${params.chunk.risk}`
+  );
+  try {
+    await runDirectModelStage({
+      stage: "reviewer",
+      outDir: chunkOutDir,
+      prompt:
+        buildDirectReviewerPrompt({
+          config: params.resolvedConfig,
+          prMarkdown: params.prMarkdown,
+          diffPatch: params.chunk.diffPatch,
+          changedFiles: params.chunk.changedFiles,
+          contextPack: chunkContextPack,
+          warnings: params.warnings,
+          options: chunkPromptOptions
+        }) + buildFeedbackHint(params.feedbackPolicy),
+      reviewRunId: params.runId,
+      prNumber: params.prNumber,
+      reasoningEffort,
+      outputFileName: "draft_review.json"
+    });
+  } catch (err) {
+    console.warn(
+      `[run ${params.runId} pr#${params.prNumber}] direct reviewer ${params.chunk.id} failed; falling back to codex: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    const reviewerPrompt =
+      buildReviewerPrompt(params.resolvedConfig, chunkPromptPaths, chunkPromptOptions) +
+      buildFeedbackHint(params.feedbackPolicy);
+    await runCodexStage({
+      stage: "reviewer",
+      repoPath: params.repoPath,
+      bundleDir: chunkBundleDir,
+      outDir: chunkOutDir,
+      codexHomeDir: chunkCodexHomeDir,
+      prompt: reviewerPrompt,
+      headSha: params.headSha,
+      repoId: params.repoId,
+      reviewRunId: params.runId,
+      prNumber: params.prNumber,
+      reasoningEffort
+    });
+  }
+
+  const review = await readJsonWithFallback(
+    path.join(chunkOutDir, "draft_review.json"),
+    ReviewSchema,
+    "reviewer"
+  );
+  return { chunk: params.chunk, review };
+}
+
+async function runChunkedReviewer(params: {
+  plan: ReviewDiffChunkPlan;
+  repoPath: string;
+  bundleDir: string;
+  outDir: string;
+  codexHomeDir: string;
+  prMarkdown: string;
+  repoConfig: RepoConfig;
+  resolvedConfig: RepoConfig;
+  contextPack: ContextPack;
+  previousReviewContext: unknown;
+  warnings: string[];
+  promptOptions: ReviewPromptOptions;
+  feedbackPolicy: FeedbackPolicy;
+  prTitle?: string | null;
+  prBody?: string | null;
+  headSha: string;
+  repoId: number;
+  runId: number;
+  prNumber: number;
+}): Promise<ReviewOutput> {
+  const drafts = await mapWithConcurrency(
+    params.plan.chunks,
+    CHUNKED_REVIEW_MAX_PARALLEL,
+    (chunk) =>
+      runReviewerChunk({
+        chunk,
+        chunkCount: params.plan.chunks.length,
+        totalChangedLines: params.plan.stats.totalChangedLines,
+        repoPath: params.repoPath,
+        bundleDir: params.bundleDir,
+        outDir: params.outDir,
+        codexHomeDir: params.codexHomeDir,
+        prMarkdown: params.prMarkdown,
+        repoConfig: params.repoConfig,
+        resolvedConfig: params.resolvedConfig,
+        contextPack: params.contextPack,
+        previousReviewContext: params.previousReviewContext,
+        warnings: params.warnings,
+        promptOptions: params.promptOptions,
+        feedbackPolicy: params.feedbackPolicy,
+        prTitle: params.prTitle,
+        prBody: params.prBody,
+        headSha: params.headSha,
+        repoId: params.repoId,
+        runId: params.runId,
+        prNumber: params.prNumber
+      })
+  );
+  return mergeChunkReviewDrafts({
+    drafts,
+    maxKeyConcerns: params.resolvedConfig.limits.max_key_concerns
+  });
 }
 
 export async function processReviewJob(data: ReviewJobData) {
@@ -669,18 +1001,33 @@ export async function processReviewJob(data: ReviewJobData) {
       })
     : null;
 
+  const refreshedPullRequestState = mergeStoredPullRequestState(
+    {
+      title: pullRequestRecord.title,
+      body: pullRequestRecord.body,
+      url: pullRequestRecord.url,
+      state: pullRequestRecord.state,
+      baseRef: pullRequestRecord.baseRef,
+      headRef: pullRequestRecord.headRef,
+      baseSha: pullRequestRecord.baseSha,
+      headSha: pullRequestRecord.headSha,
+      draft: pullRequestRecord.draft
+    },
+    refreshed
+  );
+
   const pullRequest = await prisma.pullRequest.update({
     where: { id: pullRequestRecord.id },
     data: {
-      title: refreshed.title || pullRequestRecord.title,
-      body: refreshed.body || pullRequestRecord.body,
-      url: refreshed.url || pullRequestRecord.url,
-      state: refreshed.state,
-      baseRef: refreshed.baseRef || pullRequestRecord.baseRef,
-      headRef: refreshed.headRef || pullRequestRecord.headRef,
-      baseSha: refreshed.baseSha || pullRequestRecord.baseSha,
-      headSha: refreshed.headSha,
-      draft: refreshed.draft ?? pullRequestRecord.draft,
+      title: refreshedPullRequestState.title,
+      body: refreshedPullRequestState.body,
+      url: refreshedPullRequestState.url,
+      state: refreshedPullRequestState.state,
+      baseRef: refreshedPullRequestState.baseRef,
+      headRef: refreshedPullRequestState.headRef,
+      baseSha: refreshedPullRequestState.baseSha,
+      headSha: refreshedPullRequestState.headSha,
+      draft: refreshedPullRequestState.draft,
       authorId: authorUser?.id || pullRequestRecord.authorId
     }
   });
@@ -738,13 +1085,16 @@ export async function processReviewJob(data: ReviewJobData) {
     const incrementalReview = Boolean(incrementalFrom) && !data.force && trigger !== "manual";
     const fullRepoStaticAudit = !latestCompletedRun;
 
-    const { config: fileRepoConfig, warnings } = await loadRepoConfig(repoPath);
-    await saveRepoConfig(repo.id, fileRepoConfig, warnings);
+    const { config: trustedRepoConfig, warnings } = await loadRepoConfigAtGitRef(
+      repoPath,
+      refreshed.baseSha || pullRequestRecord.baseSha || null
+    );
+    await saveRepoConfig(repo.id, trustedRepoConfig, warnings);
     const memoryRules = await loadAcceptedRepoMemoryRules(repo.id);
     const repoConfig =
       memoryRules.length > 0
-        ? { ...fileRepoConfig, rules: mergeRulesWithRepoMemory(fileRepoConfig.rules, memoryRules) }
-        : fileRepoConfig;
+        ? { ...trustedRepoConfig, rules: mergeRulesWithRepoMemory(trustedRepoConfig.rules, memoryRules) }
+        : trustedRepoConfig;
     const resolvedConfig = resolveRules(repoConfig, {
       orgDefaults: (installation?.configJson as any) || undefined,
       uiRules: rulesOverride?.rules || [],
@@ -839,27 +1189,45 @@ export async function processReviewJob(data: ReviewJobData) {
     }
 
     if (!localCompareSucceeded) {
-      try {
-        diffPatch = await client.fetchDiffPatch();
-      } catch {
-        diffPatch = await buildLocalDiffPatch({
-          repoPath,
-          baseSha: refreshed.baseSha,
-          headSha: refreshed.headSha
-        });
-      }
+      diffPatch = await resolveDiffPatchAfterLocalCompareFailure({
+        fetchProviderDiff: () => client.fetchDiffPatch(),
+        buildLocalDiff: () =>
+          buildLocalDiffPatch({
+            repoPath,
+            baseSha: refreshed.baseSha,
+            headSha: refreshed.headSha
+          })
+      });
       changedFiles = await client.listChangedFiles();
     }
 
+    const modelVisibleReviewData = sanitizeModelVisibleReviewData({
+      diffPatch,
+      changedFiles
+    });
+    diffPatch = modelVisibleReviewData.diffPatch;
+    changedFiles = modelVisibleReviewData.changedFiles;
+    if (modelVisibleReviewData.sensitivePaths.length > 0) {
+      console.log(
+        `[run ${run.id} pr#${prNumber}] withheld ${modelVisibleReviewData.sensitivePaths.length} sensitive changed path(s) from model-visible review context`
+      );
+    }
+    if (modelVisibleReviewData.bulkNoisePaths.length > 0) {
+      console.log(
+        `[run ${run.id} pr#${prNumber}] omitted ${modelVisibleReviewData.bulkNoisePaths.length} bulk/noise changed path(s) from model-visible review context`
+      );
+    }
+
     const prMarkdown = renderPrMarkdown({
-      title: refreshed.title || pullRequest.title || "Untitled",
+      title: refreshedPullRequestState.title || "Untitled",
       number: prNumber,
       author: refreshed.author?.login || "unknown",
-      body: refreshed.body,
-      baseRef: refreshed.baseRef,
-      headRef: refreshed.headRef,
-      headSha: refreshed.headSha,
-      url: refreshed.url
+      body: refreshedPullRequestState.body,
+      baseRef: refreshedPullRequestState.baseRef,
+      headRef: refreshedPullRequestState.headRef,
+      headSha: refreshedPullRequestState.headSha,
+      url: refreshedPullRequestState.url,
+      sensitivePathsWithheld: modelVisibleReviewData.sensitivePaths
     });
 
     const contextPack = await buildContextPack({
@@ -872,8 +1240,8 @@ export async function processReviewJob(data: ReviewJobData) {
         additions?: number;
         deletions?: number;
       }>,
-      prTitle: refreshed.title || pullRequest.title,
-      prBody: refreshed.body || pullRequest.body,
+      prTitle: refreshedPullRequestState.title,
+      prBody: refreshedPullRequestState.body,
       retrieval: resolvedConfig.retrieval,
       graph: resolvedConfig.graph
     });
@@ -940,52 +1308,134 @@ export async function processReviewJob(data: ReviewJobData) {
           }
         : {})
     };
-    const reviewerPrompt =
-      buildReviewerPrompt(resolvedConfig, promptPaths, promptOptions) +
-      buildFeedbackHint(feedbackPolicy);
-    await runCodexStage({
-      stage: "reviewer",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: reviewerPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
+    const chunkPlan = buildReviewDiffChunkPlan({
+      diffPatch,
+      changedFiles: changedFiles as Array<{
+        filename?: string;
+        path?: string;
+        status?: string;
+        additions?: number;
+        deletions?: number;
+      }>,
+      changedFileStats: contextPack.changedFileStats,
+      targetChangedLines: CHUNKED_REVIEW_TARGET_CHANGED_LINES,
+      maxChangedLines: CHUNKED_REVIEW_MAX_CHANGED_LINES,
+      highRiskTargetChangedLines: CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES,
+      highRiskMaxChangedLines: CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES,
+      maxFiles: CHUNKED_REVIEW_MAX_FILES
     });
-
-    const draft = await readJsonWithFallback(
-      path.join(outDir, "draft_review.json"),
-      ReviewSchema,
-      "reviewer"
+    await fs.writeFile(
+      path.join(outDir, "review_chunk_plan.json"),
+      JSON.stringify(serializableChunkPlan(chunkPlan), null, 2),
+      "utf8"
     );
+    const shouldUseChunkedReviewer =
+      chunkPlan.chunks.length > 1 &&
+      chunkPlan.stats.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES;
+    let draft: ReviewOutput;
+    if (shouldUseChunkedReviewer) {
+      console.log(
+        `[run ${run.id} pr#${prNumber}] using chunked reviewer ` +
+          `chunks=${chunkPlan.chunks.length} changedLines=${chunkPlan.stats.totalChangedLines}`
+      );
+      draft = await runChunkedReviewer({
+        plan: chunkPlan,
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prMarkdown,
+        repoConfig,
+        resolvedConfig,
+        contextPack,
+        previousReviewContext: incrementalReviewContext,
+        warnings,
+        promptOptions,
+        feedbackPolicy,
+        prTitle: refreshedPullRequestState.title,
+        prBody: refreshedPullRequestState.body,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        runId: run.id,
+        prNumber
+      });
+      await fs.writeFile(
+        path.join(outDir, "draft_review.json"),
+        JSON.stringify(draft, null, 2),
+        "utf8"
+      );
+    } else {
+      const reviewerPrompt =
+        buildReviewerPrompt(resolvedConfig, promptPaths, promptOptions) +
+        buildFeedbackHint(feedbackPolicy);
+      await runCodexStage({
+        stage: "reviewer",
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prompt: reviewerPrompt,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        reviewRunId: run.id,
+        prNumber
+      });
 
-    const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, promptOptions);
-    await runCodexStage({
-      stage: "editor",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: editorPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
-    });
+      draft = await readJsonWithFallback(
+        path.join(outDir, "draft_review.json"),
+        ReviewSchema,
+        "reviewer"
+      );
+    }
 
-    const finalReview = await readJsonWithFallback(
-      path.join(outDir, "final_review.json"),
-      ReviewSchema,
-      "editor"
-    );
-    const verdicts = await readJsonWithFallback(
-      path.join(outDir, "verdicts.json"),
-      VerdictsSchema,
-      "editor"
-    );
+    let finalReview: ReviewOutput;
+    let verdicts: VerdictsOutput;
+    if (shouldUseChunkedReviewer) {
+      const editorInput = buildCompactEditorInput({
+        draft,
+        maxComments: Math.max(
+          resolvedConfig.limits.max_inline_comments,
+          Math.min(CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS, resolvedConfig.limits.max_inline_comments * 2)
+        )
+      });
+      await fs.writeFile(path.join(outDir, "editor_input.json"), JSON.stringify(editorInput, null, 2), "utf8");
+      const decisionOutput = buildDeterministicEditorDecisionOutput(editorInput);
+      await fs.writeFile(
+        path.join(outDir, "editor_decision.json"),
+        JSON.stringify(decisionOutput, null, 2),
+        "utf8"
+      );
+      const applied = applyEditorDecisionOutput({ draft, editorInput, decisionOutput });
+      finalReview = applied.finalReview;
+      verdicts = applied.verdicts;
+      await fs.writeFile(path.join(outDir, "final_review.json"), JSON.stringify(finalReview, null, 2), "utf8");
+      await fs.writeFile(path.join(outDir, "verdicts.json"), JSON.stringify(verdicts, null, 2), "utf8");
+    } else {
+      const editorPrompt = buildEditorPrompt(JSON.stringify(draft, null, 2), promptPaths, promptOptions);
+      await runCodexStage({
+        stage: "editor",
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prompt: editorPrompt,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        reviewRunId: run.id,
+        prNumber
+      });
+
+      finalReview = await readJsonWithFallback(
+        path.join(outDir, "final_review.json"),
+        ReviewSchema,
+        "editor"
+      );
+      verdicts = await readJsonWithFallback(
+        path.join(outDir, "verdicts.json"),
+        VerdictsSchema,
+        "editor"
+      );
+    }
 
     const diffIndex = buildDiffIndex(diffPatch);
     const verdictMap = new Map(verdicts.verdicts.map((v) => [v.comment_id, v]));
@@ -1023,6 +1473,7 @@ export async function processReviewJob(data: ReviewJobData) {
     };
     const shouldRunCoveragePass =
       coveragePlan.shouldRun &&
+      !shouldUseChunkedReviewer &&
       coveragePlan.targets.length > 0 &&
       !resolvedConfig.output.summaryOnly &&
       resolvedConfig.commentTypes.allow.includes("inline");
@@ -1114,7 +1565,7 @@ export async function processReviewJob(data: ReviewJobData) {
       resolvedConfig.strictness,
       feedbackPolicy
     );
-    const hasBlocking = filteredComments.inline.some((comment) => comment.severity === "blocking");
+    const hasBlocking = hasBlockingVisibleFindings(filteredComments);
 
     const inlineContext = {
       head_sha: refreshed.headSha,
@@ -1127,21 +1578,45 @@ export async function processReviewJob(data: ReviewJobData) {
       "utf8"
     );
 
-    const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
-    verifierPromise = runCodexStage({
-      stage: "verifier",
-      repoPath,
-      bundleDir,
-      outDir,
-      codexHomeDir,
-      prompt: checksPrompt,
-      headSha: refreshed.headSha,
-      repoId: repo.id,
-      reviewRunId: run.id,
-      prNumber
-    })
-      .then(() => ({ ok: true as const }))
-      .catch((error: unknown) => ({ ok: false as const, error }));
+    const verifierEligible = shouldRunVerifierForPullRequest({
+      repoFullName: repo.fullName,
+      pullRequest: refreshed
+    });
+    if (verifierEligible && !shouldUseChunkedReviewer) {
+      const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
+      verifierPromise = runCodexStage({
+        stage: "verifier",
+        repoPath,
+        bundleDir,
+        outDir,
+        codexHomeDir,
+        prompt: checksPrompt,
+        headSha: refreshed.headSha,
+        repoId: repo.id,
+        reviewRunId: run.id,
+        prNumber
+      })
+        .then(() => ({ ok: true as const }))
+        .catch((error: unknown) => ({ ok: false as const, error }));
+    } else {
+      const skippedChecks = buildVerifierSkippedChecks({
+        headSha: refreshed.headSha,
+        summary: shouldUseChunkedReviewer
+          ? "skipped for chunked large review"
+          : "skipped for untrusted fork pull request"
+      });
+      await fs.writeFile(
+        path.join(outDir, "checks.json"),
+        JSON.stringify(skippedChecks, null, 2),
+        "utf8"
+      );
+      console.warn(
+        shouldUseChunkedReviewer
+          ? `[run ${run.id} pr#${prNumber}] skipping verifier tools for chunked large review`
+          : `[run ${run.id} pr#${prNumber}] skipping verifier tools for head repo ${refreshed.headRepoFullName || "unknown"}`
+      );
+      verifierPromise = Promise.resolve({ ok: true as const });
+    }
 
     const patternMatches = contextPack.retrieved
       .filter((item) => item.isPattern)
@@ -1434,22 +1909,35 @@ export async function processReviewJob(data: ReviewJobData) {
         }
       }
 
-      const existingComments = await client.listInlineComments();
-      const byMarker = new Map<string, ProviderReviewComment>();
-      for (const rc of existingComments) {
-        const marker = extractCommentId(rc.body || "");
-        if (marker) {
-          byMarker.set(marker, rc);
-        }
-      }
       let updatedInline = 0;
-      for (const comment of reviewComments) {
-        const existing = byMarker.get(comment.comment_id);
-        if (!existing) continue;
-        const desiredBody = formatInlineComment(comment);
-        if ((existing.body || "") !== desiredBody) {
-          await client.updateInlineComment(existing.id, desiredBody);
-          updatedInline += 1;
+      const inlineSyncBotLogin =
+        provider === "github" ? await resolveGithubBotLogin().catch(() => "") : "";
+      if (!inlineSyncBotLogin) {
+        console.warn(
+          `[run ${run.id} pr#${prNumber}] inline comment sync skipped: bot identity unavailable`
+        );
+      } else {
+        const existingComments = await client.listInlineComments({
+          bodyIncludes: "<!-- grepiku:",
+          authorLogin: inlineSyncBotLogin
+        });
+        const byMarker = buildExistingInlineCommentLookup(
+          existingComments,
+          inlineSyncBotLogin
+        );
+        for (const comment of reviewComments) {
+          const markerId = sanitizeCommentIdentifier(
+            comment.comment_id,
+            `${normalizePath(comment.path)}|${comment.side}|${comment.line}|${comment.title}`,
+            64
+          );
+          const existing = byMarker.get(markerId);
+          if (!existing) continue;
+          const desiredBody = formatInlineComment(comment);
+          if ((existing.body || "") !== desiredBody) {
+            await client.updateInlineComment(existing.id, desiredBody);
+            updatedInline += 1;
+          }
         }
       }
       console.log(`[run ${run.id} pr#${prNumber}] inline comments: created=${createdInline} updated=${updatedInline}`);
@@ -1572,13 +2060,12 @@ export async function processReviewJob(data: ReviewJobData) {
     });
 
     if (statusCheckRecord?.id) {
-      const conclusion = resolvedConfig.statusChecks.required
-        ? hasBlocking
-          ? "failure"
-          : "success"
-        : hasBlocking
-          ? "neutral"
-          : "success";
+      const conclusion = resolveStatusCheckConclusion({
+        required: resolvedConfig.statusChecks.required,
+        inline: filteredComments.inline,
+        summary: filteredComments.summary,
+        checks: checks.checks
+      });
       await client.updateStatusCheck(statusCheckRecord.id, {
         name: statusCheckRecord.name,
         status: "completed",
@@ -1593,12 +2080,18 @@ export async function processReviewJob(data: ReviewJobData) {
       }
     }
 
-    await enqueueIndexJob({
-      provider,
-      installationId: installationId || null,
-      repoId: repo.id,
+    const trustedRepoIndexSha = selectTrustedPullRequestIndexSha({
+      baseSha: refreshed.baseSha || pullRequest.baseSha || null,
       headSha: refreshed.headSha
     });
+    if (trustedRepoIndexSha) {
+      await enqueueIndexJob({
+        provider,
+        installationId: installationId || null,
+        repoId: repo.id,
+        headSha: trustedRepoIndexSha
+      });
+    }
     await enqueueAnalyticsJob({ reviewRunId: run.id });
   } catch (err) {
     await prisma.reviewRun.update({
@@ -1622,3 +2115,14 @@ export async function processReviewJob(data: ReviewJobData) {
     throw err;
   }
 }
+
+export const __pipelineInternals = {
+  buildExistingInlineCommentLookup,
+  buildSummaryBlock,
+  formatInlineComment,
+  hasFailingVerifierChecks,
+  hasBlockingVisibleFindings,
+  renderStatusComment,
+  resolveStatusCheckConclusion,
+  upsertSummaryBlock
+};

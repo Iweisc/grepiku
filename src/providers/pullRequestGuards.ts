@@ -11,6 +11,11 @@ type PullRequestReviewSkipCandidate = Pick<
   "headRef" | "author"
 >;
 
+type PullRequestVerifierCandidate = Pick<
+  ProviderPullRequest,
+  "headRepoFullName"
+>;
+
 const FOLLOW_UP_BRANCH_PREFIX = "grepiku/mention-";
 
 const REVIEWABLE_PULL_REQUEST_ACTIONS = new Set([
@@ -26,6 +31,7 @@ export function shouldDeleteClosedBotPrBranch(params: {
   pullRequest: PullRequestBranchCleanupCandidate;
   botLogin: string;
 }): boolean {
+  if (!params.botLogin.trim()) return false;
   if (params.action !== "closed") return false;
   if (params.pullRequest.state !== "closed") return false;
   const headRef = params.pullRequest.headRef?.trim() || "";
@@ -51,6 +57,7 @@ export function shouldSkipSelfBotFollowUpPrReview(params: {
   pullRequest: PullRequestReviewSkipCandidate;
   botLogin: string;
 }): boolean {
+  if (!params.botLogin.trim()) return false;
   if (!REVIEWABLE_PULL_REQUEST_ACTIONS.has(params.action)) return false;
 
   const headRef = params.pullRequest.headRef?.trim() || "";
@@ -65,7 +72,36 @@ export function shouldSkipBotAuthoredReview(params: {
   pullRequest: PullRequestReviewSkipCandidate;
   botLogin: string;
 }): boolean {
+  if (!params.botLogin.trim()) return false;
   if (!REVIEWABLE_PULL_REQUEST_ACTIONS.has(params.action)) return false;
   const authorLogin = params.pullRequest.author?.login || "";
   return isSelfBotComment({ authorLogin, botLogin: params.botLogin });
+}
+
+export function shouldRunVerifierForPullRequest(params: {
+  repoFullName: string;
+  pullRequest: PullRequestVerifierCandidate;
+}): boolean {
+  const repoFullName = params.repoFullName.trim().toLowerCase();
+  const headRepoFullName = params.pullRequest.headRepoFullName?.trim().toLowerCase() || "";
+  if (!repoFullName || !headRepoFullName) {
+    return false;
+  }
+  return headRepoFullName === repoFullName;
+}
+
+export function headCommitReviewSkipReason(params: {
+  commitMessage: string;
+  authorLogin?: string | null;
+  parentCount?: number | null;
+  botLogin: string;
+}): string | null {
+  if (!params.botLogin.trim()) {
+    return null;
+  }
+  const authorLogin = params.authorLogin || "";
+  if (isSelfBotComment({ authorLogin, botLogin: params.botLogin })) {
+    return "bot-commit";
+  }
+  return null;
 }

@@ -1,4 +1,5 @@
 import { prisma } from "../db/client.js";
+import { isTrustedFeedbackMetadata } from "./feedbackTrust.js";
 
 const PROTECTED_PATTERNS = [
   "security",
@@ -98,14 +99,34 @@ export async function recalculateWeightsFromReactions(repoId: number): Promise<v
   });
 
   if (feedback.length === 0) return;
-
-  const reviewComments = await prisma.reviewComment.findMany({
-    where: {
-      createdAt: { gte: since },
-      pullRequest: { repoId }
-    },
-    include: { finding: true }
+  const trustedFeedback = feedback.flatMap((item) => {
+    const commentId = typeof item.commentId === "string" ? item.commentId.trim() : "";
+    if (!isTrustedFeedbackMetadata(item.metadata) || !commentId) {
+      return [];
+    }
+    return [{ ...item, commentId }];
   });
+  if (trustedFeedback.length === 0) return;
+  const feedbackCommentIds = Array.from(
+    new Set(trustedFeedback.map((item) => item.commentId))
+  );
+
+  const [reviewComments, findings] = await Promise.all([
+    prisma.reviewComment.findMany({
+      where: {
+        providerCommentId: { in: feedbackCommentIds },
+        pullRequest: { repoId }
+      },
+      include: { finding: true }
+    }),
+    prisma.finding.findMany({
+      where: {
+        commentId: { in: feedbackCommentIds },
+        pullRequest: { repoId }
+      },
+      select: { commentId: true, category: true, ruleId: true }
+    })
+  ]);
 
   const providerToFinding = new Map<string, { category: string; ruleId: string | null }>();
   for (const comment of reviewComments) {
@@ -115,11 +136,17 @@ export async function recalculateWeightsFromReactions(repoId: number): Promise<v
       ruleId: comment.finding.ruleId
     });
   }
+  const findingByCommentId = new Map<string, { category: string; ruleId: string | null }>();
+  for (const finding of findings) {
+    findingByCommentId.set(finding.commentId, {
+      category: finding.category,
+      ruleId: finding.ruleId
+    });
+  }
 
   const buckets = new Map<string, { positive: number; negative: number }>();
-  for (const fb of feedback) {
-    if (!fb.commentId) continue;
-    const finding = providerToFinding.get(fb.commentId);
+  for (const fb of trustedFeedback) {
+    const finding = providerToFinding.get(fb.commentId) || findingByCommentId.get(fb.commentId);
     if (!finding) continue;
 
     const keys = [finding.category];

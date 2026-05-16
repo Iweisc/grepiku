@@ -3,6 +3,8 @@ import os from "os";
 import path from "path";
 import { execa } from "execa";
 import { prisma } from "../db/client.js";
+import { normalizePath } from "../review/diff.js";
+import { shouldSkipSensitivePath } from "./indexerPathPolicy.js";
 
 export type RetrievalResult = {
   kind: "file" | "symbol" | "chunk";
@@ -44,6 +46,11 @@ const DEFAULT_WEIGHTS: RetrievalWeights = {
 };
 
 const EMBEDDING_FETCH_BATCH = 2000;
+const MIN_RETRIEVAL_CANDIDATES = 2000;
+const MAX_RETRIEVAL_CANDIDATES = 12000;
+const RETRIEVAL_CANDIDATES_PER_TOPK = 200;
+const RETRIEVAL_CANDIDATE_TRIM_MULTIPLIER = 2;
+const MAX_PAGEINDEX_INPUT_BYTES = 8 * 1024 * 1024;
 
 type EmbeddingRow = {
   id: number;
@@ -99,6 +106,11 @@ type PageIndexInputItem = {
   text: string;
 };
 
+type EmbeddingBatchMetadata = {
+  fileMap: Map<number, { path: string; isPattern: boolean }>;
+  symbolMap: Map<number, string>;
+};
+
 export async function retrieveContext(params: {
   repoId: number;
   query: string;
@@ -123,23 +135,10 @@ export async function retrieveContext(params: {
       .map((value) => directoryPath(value))
       .filter(Boolean)
   );
-  const [files, symbols] = await Promise.all([
-    prisma.fileIndex.findMany({ where: { repoId: params.repoId }, select: { id: true, path: true, isPattern: true } }),
-    prisma.symbol.findMany({ where: { repoId: params.repoId }, select: { id: true, name: true } })
-  ]);
-
-  const fileMap = new Map<number, { path: string; isPattern: boolean }>();
-  for (const file of files) {
-    fileMap.set(file.id, { path: normalizeRepoPath(file.path), isPattern: file.isPattern });
-  }
-
-  const symbolMap = new Map<number, string>();
-  for (const sym of symbols) {
-    symbolMap.set(sym.id, sym.name);
-  }
-
   const queryTokens = tokenize(params.query);
   const queryPathHints = extractPathHints(params.query);
+  const candidateLimit = computeRetrievalCandidateLimit(topK);
+  const candidateTrimThreshold = candidateLimit * RETRIEVAL_CANDIDATE_TRIM_MULTIPLIER;
 
   const scored: ScoredRetrievalItem[] = [];
   const sourceTextByEmbeddingId = new Map<number, string>();
@@ -147,11 +146,41 @@ export async function retrieveContext(params: {
   await forEachRepoEmbeddingBatch({
     repoId: params.repoId,
     includeVector: false,
-    onBatch: (batch) => {
+    onBatch: async (batch) => {
+      const { fileMap, symbolMap } = await loadEmbeddingBatchMetadata(params.repoId, batch);
       for (const embedding of batch) {
         const fileMeta = embedding.fileId ? fileMap.get(embedding.fileId) : undefined;
         const path = fileMeta?.path;
+        if (path && shouldSkipSensitivePath(path)) {
+          continue;
+        }
         const symbol = embedding.symbolId ? symbolMap.get(embedding.symbolId) : undefined;
+        const sourceText = embedding.text || "";
+        const semantic = lexicalSimilarity(
+          queryTokens,
+          tokenize(buildNodeTitle({ path, symbol, text: sourceText }))
+        );
+        const lexical = lexicalSimilarity(
+          queryTokens,
+          tokenize(buildLexicalInput({ path, symbol, text: sourceText }))
+        );
+        const pathBoost = path
+          ? computePathBoost({
+              path,
+              changedPaths,
+              changedDirectories,
+              queryPathHints,
+              changedPathBoost: weights.changedPathBoost,
+              sameDirectoryBoost: weights.sameDirectoryBoost
+            })
+          : 0;
+        const patternBoost = fileMeta?.isPattern ? weights.patternBoost : 0;
+        const kindBoost =
+          embedding.kind === "symbol"
+            ? weights.symbolBoost
+            : embedding.kind === "chunk"
+              ? weights.chunkBoost
+              : 0;
         const item: ScoredRetrievalItem = {
           embedding: {
             id: embedding.id,
@@ -162,34 +191,56 @@ export async function retrieveContext(params: {
           path,
           symbol,
           isPattern: fileMeta?.isPattern,
-          semantic: 0,
-          lexical: 0,
-          pathBoost: 0,
-          patternBoost: 0,
-          kindBoost: 0,
+          semantic,
+          lexical,
+          pathBoost,
+          patternBoost,
+          kindBoost,
           directoryAffinity: 0,
           fileAnchor: 0,
           rrf: 0,
-          baseScore: 0,
+          baseScore:
+            semantic * weights.semanticWeight +
+            lexical * weights.lexicalWeight +
+            pathBoost +
+            patternBoost +
+            kindBoost,
           score: 0
         };
         scored.push(item);
-        sourceTextByEmbeddingId.set(item.embedding.id, embedding.text || "");
+        sourceTextByEmbeddingId.set(item.embedding.id, sourceText);
+      }
+      if (scored.length > candidateTrimThreshold) {
+        trimRetrievalCandidates({
+          candidates: scored,
+          sourceTextByEmbeddingId,
+          limit: candidateLimit
+        });
       }
     }
   });
+
+  if (scored.length > candidateLimit) {
+    trimRetrievalCandidates({
+      candidates: scored,
+      sourceTextByEmbeddingId,
+      limit: candidateLimit
+    });
+  }
 
   const pageIndexScores = await scoreWithPageIndex({
     query: params.query,
     topK,
     changedPaths: changedPathList,
-    items: scored.map((item) => ({
-      id: item.embedding.id,
-      kind: mapEmbeddingKind(item.embedding.kind),
-      path: item.path,
-      symbol: item.symbol,
-      text: sourceTextByEmbeddingId.get(item.embedding.id) || ""
-    })),
+    items: [...scored]
+      .sort((left, right) => right.baseScore - left.baseScore)
+      .map((item) => ({
+        id: item.embedding.id,
+        kind: mapEmbeddingKind(item.embedding.kind),
+        path: item.path,
+        symbol: item.symbol,
+        text: sourceTextByEmbeddingId.get(item.embedding.id) || ""
+      })),
   }).catch(() => new Map<number, PageIndexScore>());
   const pageIndexAvailable = pageIndexScores.size > 0;
 
@@ -197,33 +248,10 @@ export async function retrieveContext(params: {
   for (const item of scored) {
     const scriptScore = pageIndexScores.get(item.embedding.id);
     const sourceText = sourceTextByEmbeddingId.get(item.embedding.id) || "";
-    const semanticFallback = lexicalSimilarity(
-      queryTokens,
-      tokenize(buildNodeTitle({ path: item.path, symbol: item.symbol, text: sourceText }))
-    );
-    const lexicalFallback = lexicalSimilarity(
-      queryTokens,
-      tokenize(buildLexicalInput({ path: item.path, symbol: item.symbol, text: sourceText }))
-    );
-    item.semantic = pageIndexAvailable ? (scriptScore?.semantic ?? 0) : semanticFallback;
-    item.lexical = pageIndexAvailable ? (scriptScore?.lexical ?? 0) : lexicalFallback;
-    item.pathBoost = item.path
-      ? computePathBoost({
-          path: item.path,
-          changedPaths,
-          changedDirectories,
-          queryPathHints,
-          changedPathBoost: weights.changedPathBoost,
-          sameDirectoryBoost: weights.sameDirectoryBoost
-        })
-      : 0;
-    item.patternBoost = item.isPattern ? weights.patternBoost : 0;
-    item.kindBoost =
-      item.embedding.kind === "symbol"
-        ? weights.symbolBoost
-        : item.embedding.kind === "chunk"
-          ? weights.chunkBoost
-          : 0;
+    const semanticFallback = item.semantic;
+    const lexicalFallback = item.lexical;
+    item.semantic = pageIndexAvailable ? (scriptScore?.semantic ?? semanticFallback) : semanticFallback;
+    item.lexical = pageIndexAvailable ? (scriptScore?.lexical ?? lexicalFallback) : lexicalFallback;
     item.baseScore =
       item.semantic * weights.semanticWeight +
       item.lexical * weights.lexicalWeight +
@@ -299,6 +327,77 @@ export async function retrieveContext(params: {
   }));
 }
 
+async function loadEmbeddingBatchMetadata(
+  repoId: number,
+  batch: EmbeddingRow[]
+): Promise<EmbeddingBatchMetadata> {
+  const fileIds = Array.from(
+    new Set(
+      batch
+        .map((row) => row.fileId)
+        .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0)
+    )
+  );
+  const symbolIds = Array.from(
+    new Set(
+      batch
+        .map((row) => row.symbolId)
+        .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0)
+    )
+  );
+
+  const [files, symbols] = await Promise.all([
+    fileIds.length > 0
+      ? prisma.fileIndex.findMany({
+          where: { repoId, id: { in: fileIds } },
+          select: { id: true, path: true, isPattern: true }
+        })
+      : Promise.resolve([]),
+    symbolIds.length > 0
+      ? prisma.symbol.findMany({
+          where: { repoId, id: { in: symbolIds } },
+          select: { id: true, name: true }
+        })
+      : Promise.resolve([])
+  ]);
+
+  return {
+    fileMap: new Map(
+      files.map((file) => [
+        file.id,
+        {
+          path: normalizeRepoPath(file.path),
+          isPattern: file.isPattern
+        }
+      ])
+    ),
+    symbolMap: new Map(symbols.map((symbol) => [symbol.id, symbol.name]))
+  };
+}
+
+function computeRetrievalCandidateLimit(topK: number): number {
+  const requested = Math.max(0, Math.floor(topK)) * RETRIEVAL_CANDIDATES_PER_TOPK;
+  return Math.max(
+    MIN_RETRIEVAL_CANDIDATES,
+    Math.min(MAX_RETRIEVAL_CANDIDATES, requested)
+  );
+}
+
+function trimRetrievalCandidates(params: {
+  candidates: ScoredRetrievalItem[];
+  sourceTextByEmbeddingId: Map<number, string>;
+  limit: number;
+}): void {
+  params.candidates.sort((a, b) => b.baseScore - a.baseScore);
+  params.candidates.length = Math.min(params.candidates.length, params.limit);
+  const keepIds = new Set(params.candidates.map((item) => item.embedding.id));
+  for (const id of params.sourceTextByEmbeddingId.keys()) {
+    if (!keepIds.has(id)) {
+      params.sourceTextByEmbeddingId.delete(id);
+    }
+  }
+}
+
 async function scoreWithPageIndex(params: {
   query: string;
   topK: number;
@@ -319,6 +418,7 @@ async function scoreWithPageIndex(params: {
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-pageindex-"));
   const inputPath = path.join(tempDir, "input.json");
+  const limitedItems = limitPageIndexInputItems(params.items, MAX_PAGEINDEX_INPUT_BYTES);
 
   try {
     await fs.writeFile(
@@ -329,7 +429,7 @@ async function scoreWithPageIndex(params: {
           top_k: params.topK,
           changed_paths: params.changedPaths,
           pageindex_root: pageindexRoot,
-          items: params.items
+          items: limitedItems
         },
         null,
         2
@@ -387,6 +487,31 @@ function mergeWeights(overrides?: Partial<RetrievalWeights>): RetrievalWeights {
     symbolBoost: sanitizeWeight(overrides.symbolBoost, DEFAULT_WEIGHTS.symbolBoost),
     chunkBoost: sanitizeWeight(overrides.chunkBoost, DEFAULT_WEIGHTS.chunkBoost)
   };
+}
+
+function limitPageIndexInputItems(
+  items: PageIndexInputItem[],
+  maxBytes: number
+): PageIndexInputItem[] {
+  if (items.length === 0 || maxBytes <= 0) {
+    return [];
+  }
+
+  const kept: PageIndexInputItem[] = [];
+  let retainedBytes = 2;
+
+  for (const item of items) {
+    const serialized = JSON.stringify(item);
+    const entryBytes = Buffer.byteLength(serialized, "utf8");
+    const separatorBytes = kept.length > 0 ? 1 : 0;
+    if (kept.length > 0 && retainedBytes + separatorBytes + entryBytes > maxBytes) {
+      break;
+    }
+    kept.push(item);
+    retainedBytes += separatorBytes + entryBytes;
+  }
+
+  return kept;
 }
 
 function sanitizeWeight(input: number | undefined, fallback: number): number {
@@ -719,12 +844,7 @@ function directoryPath(value: string): string {
 }
 
 function normalizeRepoPath(pathValue: string): string {
-  return pathValue
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\.\//, "")
-    .replace(/^\//, "")
-    .replace(/\/+/g, "/");
+  return normalizePath(pathValue);
 }
 
 export const __retrievalInternals = {

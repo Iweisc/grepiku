@@ -2,6 +2,11 @@ import fs from "fs/promises";
 import path from "path";
 import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
+import {
+  execaAuthenticatedGit,
+  gitCheckoutSafetyEnv,
+  githubRemoteUrl
+} from "../github/gitAuth.js";
 
 const SAME_SHA_WORKTREE_TTL_MS = 6 * 60 * 60 * 1000;
 const SAME_SHA_WORKTREE_KEEP_RECENT = 2;
@@ -26,11 +31,6 @@ async function withRepoCheckoutLock<T>(repoKey: string, fn: () => Promise<T>): P
   }
 }
 
-function buildRemoteUrl(params: { owner: string; repo: string; token: string }) {
-  const encodedToken = encodeURIComponent(params.token);
-  return `https://x-access-token:${encodedToken}@github.com/${params.owner}/${params.repo}.git`;
-}
-
 function toWorktreeKey(ref: string): string {
   const trimmed = ref.trim();
   if (!trimmed) return "HEAD";
@@ -38,12 +38,38 @@ function toWorktreeKey(ref: string): string {
   return trimmed.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 96) || "HEAD";
 }
 
-async function resolveCheckoutRef(baseDir: string, requestedRef: string): Promise<string> {
-  const candidates = requestedRef === "HEAD" ? ["origin/HEAD", "HEAD"] : [requestedRef];
+function normalizePullRequestNumber(value: number | null | undefined): number | null {
+  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : null;
+}
+
+function pullRequestHeadRef(prNumber: number | null | undefined): string | null {
+  const normalized = normalizePullRequestNumber(prNumber);
+  if (!normalized) return null;
+  return `refs/remotes/origin/pull/${normalized}/head`;
+}
+
+function pullRequestHeadRefspec(prNumber: number | null | undefined): string | null {
+  const normalized = normalizePullRequestNumber(prNumber);
+  if (!normalized) return null;
+  return `+refs/pull/${normalized}/head:${pullRequestHeadRef(normalized)}`;
+}
+
+async function resolveCheckoutRef(
+  baseDir: string,
+  requestedRef: string,
+  pullRequestNumber?: number | null
+): Promise<string> {
+  const candidates =
+    requestedRef === "HEAD"
+      ? ["origin/HEAD", "HEAD"]
+      : [requestedRef, pullRequestHeadRef(pullRequestNumber)].filter(
+          (value): value is string => Boolean(value)
+        );
   for (const candidate of candidates) {
     try {
       const { stdout } = await execa("git", ["-C", baseDir, "rev-parse", "--verify", candidate], {
-        stdio: ["ignore", "pipe", "ignore"]
+        stdio: ["ignore", "pipe", "ignore"],
+        env: gitCheckoutSafetyEnv()
       });
       const resolved = stdout.trim();
       if (resolved) return resolved;
@@ -79,7 +105,8 @@ export function selectSameShaWorktreesForCleanup(params: {
 
 async function listRegisteredWorktrees(baseDir: string): Promise<Set<string>> {
   const { stdout } = await execa("git", ["-C", baseDir, "worktree", "list", "--porcelain"], {
-    stdio: ["ignore", "pipe", "ignore"]
+    stdio: ["ignore", "pipe", "ignore"],
+    env: gitCheckoutSafetyEnv()
   });
   const registered = new Set<string>();
   for (const line of stdout.split("\n")) {
@@ -98,7 +125,8 @@ async function pruneSameShaWorktrees(params: {
 }): Promise<void> {
   const { baseDir, worktreesDir, headSha } = params;
   await execa("git", ["-C", baseDir, "worktree", "prune", "--expire=now"], {
-    stdio: ["ignore", "ignore", "ignore"]
+    stdio: ["ignore", "ignore", "ignore"],
+    env: gitCheckoutSafetyEnv()
   }).catch(() => undefined);
 
   const registered = await listRegisteredWorktrees(baseDir).catch(() => new Set<string>());
@@ -127,7 +155,8 @@ async function pruneSameShaWorktrees(params: {
   for (const candidate of stale) {
     if (candidate.registered) {
       await execa("git", ["-C", baseDir, "worktree", "remove", "--force", candidate.path], {
-        stdio: ["ignore", "ignore", "ignore"]
+        stdio: ["ignore", "ignore", "ignore"],
+        env: gitCheckoutSafetyEnv()
       }).catch(() => undefined);
     }
     await fs.rm(candidate.path, { recursive: true, force: true }).catch(() => undefined);
@@ -139,8 +168,9 @@ export async function ensureGitRepoCheckout(params: {
   repo: string;
   headSha: string;
   token: string;
+  pullRequestNumber?: number | null;
 }): Promise<string> {
-  const { owner, repo, headSha, token } = params;
+  const { owner, repo, headSha, token, pullRequestNumber } = params;
   return withRepoCheckoutLock(`${owner}/${repo}`, async () => {
     const env = loadEnv();
     const baseDir = path.join(env.projectRoot, "var", "repos", owner, repo);
@@ -154,22 +184,38 @@ export async function ensureGitRepoCheckout(params: {
       .then(() => true)
       .catch(() => false);
 
-    const remoteUrl = buildRemoteUrl({ owner, repo, token });
+    const remoteUrl = githubRemoteUrl({ owner, repo });
 
     if (!repoExists) {
-      await execa("git", ["clone", remoteUrl, baseDir], { stdio: "inherit" });
+      await execaAuthenticatedGit(token, ["clone", remoteUrl, baseDir], {
+        stdio: "inherit",
+        env: gitCheckoutSafetyEnv()
+      });
     } else {
       await execa("git", ["-C", baseDir, "remote", "set-url", "origin", remoteUrl], {
-        stdio: "inherit"
+        stdio: "inherit",
+        env: gitCheckoutSafetyEnv()
       });
-      await execa("git", ["-C", baseDir, "fetch", "--all", "--prune"], { stdio: "inherit" });
+      await execaAuthenticatedGit(token, ["-C", baseDir, "fetch", "--all", "--prune"], {
+        stdio: "inherit",
+        env: gitCheckoutSafetyEnv()
+      });
+    }
+
+    const prHeadRefspec = pullRequestHeadRefspec(pullRequestNumber);
+    if (prHeadRefspec) {
+      await execaAuthenticatedGit(token, ["-C", baseDir, "fetch", "--prune", "origin", prHeadRefspec], {
+        stdio: "inherit",
+        env: gitCheckoutSafetyEnv()
+      });
     }
 
     await execa("git", ["-C", baseDir, "remote", "set-head", "origin", "-a"], {
-      stdio: ["ignore", "ignore", "ignore"]
+      stdio: ["ignore", "ignore", "ignore"],
+      env: gitCheckoutSafetyEnv()
     }).catch(() => undefined);
 
-    const checkoutRef = await resolveCheckoutRef(baseDir, headSha);
+    const checkoutRef = await resolveCheckoutRef(baseDir, headSha, pullRequestNumber);
     const worktreeKey = toWorktreeKey(checkoutRef);
 
     await pruneSameShaWorktrees({ baseDir, worktreesDir, headSha: worktreeKey });
@@ -180,7 +226,8 @@ export async function ensureGitRepoCheckout(params: {
       const worktreePath = path.join(worktreesDir, `${worktreeKey}-${suffix}`);
       try {
         await execa("git", ["-C", baseDir, "worktree", "add", "--detach", worktreePath, checkoutRef], {
-          stdio: "inherit"
+          stdio: "inherit",
+          env: gitCheckoutSafetyEnv()
         });
         return worktreePath;
       } catch (err: any) {

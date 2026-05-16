@@ -1,4 +1,5 @@
 import { prisma } from "../db/client.js";
+import { isTrustedFeedbackMetadata } from "./feedbackTrust.js";
 
 const POSITIVE_REACTIONS = new Set(["thumbs_up", "+1", "heart", "laugh", "hooray"]);
 const NEGATIVE_REACTIONS = new Set(["thumbs_down", "-1", "confused"]);
@@ -19,13 +20,42 @@ export async function getFeedbackPolicy(repoId: number): Promise<FeedbackPolicy>
     return { negativeCategories: [], positiveCategories: [] };
   }
 
-  const reviewComments = await prisma.reviewComment.findMany({
-    where: { createdAt: { gte: since }, pullRequest: { repoId } },
-    include: { finding: true }
+  const trustedFeedback = feedback.flatMap((item) => {
+    const commentId = typeof item.commentId === "string" ? item.commentId.trim() : "";
+    if (!isTrustedFeedbackMetadata(item.metadata) || !commentId) {
+      return [];
+    }
+    return [{ ...item, commentId }];
   });
+  if (trustedFeedback.length === 0) {
+    return { negativeCategories: [], positiveCategories: [] };
+  }
+
+  const feedbackCommentIds = Array.from(
+    new Set(trustedFeedback.map((item) => item.commentId))
+  );
+  const [reviewComments, findings] = await Promise.all([
+    prisma.reviewComment.findMany({
+      where: {
+        providerCommentId: { in: feedbackCommentIds },
+        pullRequest: { repoId }
+      },
+      include: { finding: true }
+    }),
+    prisma.finding.findMany({
+      where: {
+        commentId: { in: feedbackCommentIds },
+        pullRequest: { repoId }
+      },
+      select: { commentId: true, category: true }
+    })
+  ]);
 
   const providerToFinding = new Map<string, string>();
   const categoryByComment = new Map<string, string>();
+  for (const finding of findings) {
+    categoryByComment.set(finding.commentId, finding.category);
+  }
   for (const comment of reviewComments) {
     const finding = comment.finding;
     if (!finding) continue;
@@ -34,8 +64,7 @@ export async function getFeedbackPolicy(repoId: number): Promise<FeedbackPolicy>
   }
 
   const counts = new Map<string, { pos: number; neg: number }>();
-  for (const fb of feedback) {
-    if (!fb.commentId) continue;
+  for (const fb of trustedFeedback) {
     const commentId = providerToFinding.get(fb.commentId) || fb.commentId;
     const category = categoryByComment.get(commentId);
     if (!category) continue;

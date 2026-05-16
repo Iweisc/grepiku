@@ -28,6 +28,17 @@ const PY_RESOLVE_EXTS = [".py"];
 const GO_RESOLVE_EXTS = [".go"];
 const RUST_RESOLVE_EXTS = [".rs"];
 const DEFAULT_GRAPH_EXCLUDE_DIRS = ["internal_harness"];
+const DEFAULT_GRAPH_BUILD_BUDGET = {
+  maxFiles: 50_000,
+  maxSymbols: 250_000,
+  maxReferences: 500_000
+} as const;
+
+type GraphBuildCounts = {
+  fileCount: number;
+  symbolCount: number;
+  referenceCount: number;
+};
 
 function normalizeRepoPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/");
@@ -263,6 +274,29 @@ function hasDirectFileDepEdge(
   return edgeMap.has(`${edge.fromNodeId}:${edge.toNodeId}:file_dep`);
 }
 
+function evaluateGraphBuildBudget(
+  counts: GraphBuildCounts,
+  budget = DEFAULT_GRAPH_BUILD_BUDGET
+): { allowed: boolean; reason: string | null } {
+  const exceeded: string[] = [];
+  if (counts.fileCount > budget.maxFiles) {
+    exceeded.push(`file count ${counts.fileCount} exceeds ${budget.maxFiles}`);
+  }
+  if (counts.symbolCount > budget.maxSymbols) {
+    exceeded.push(`symbol count ${counts.symbolCount} exceeds ${budget.maxSymbols}`);
+  }
+  if (counts.referenceCount > budget.maxReferences) {
+    exceeded.push(`reference count ${counts.referenceCount} exceeds ${budget.maxReferences}`);
+  }
+  if (exceeded.length === 0) {
+    return { allowed: true, reason: null };
+  }
+  return {
+    allowed: false,
+    reason: `graph input exceeds safe limits (${exceeded.join(", ")})`
+  };
+}
+
 function findOwningSymbolId(
   symbolsByFile: Map<number, SymbolLite[]>,
   fileId: number,
@@ -299,14 +333,35 @@ export async function processGraphJob(job: GraphJob) {
   const repoConfig = await resolveRepoConfig(repoId).catch(() => null);
   const excludedDirs = resolveGraphExcludeDirs(repoConfig?.graph?.exclude_dirs);
 
+  const [indexedFileCount, symbolCount, referenceCount] = await Promise.all([
+    prisma.fileIndex.count({
+      where: { repoId, isPattern: false }
+    }),
+    prisma.symbol.count({
+      where: { repoId, file: { isPattern: false } }
+    }),
+    prisma.symbolReference.count({
+      where: { repoId, file: { isPattern: false } }
+    })
+  ]);
+  const budgetDecision = evaluateGraphBuildBudget({
+    fileCount: indexedFileCount,
+    symbolCount,
+    referenceCount
+  });
+
+  await prisma.graphEdge.deleteMany({ where: { repoId } });
+  await prisma.graphNode.deleteMany({ where: { repoId } });
+  if (!budgetDecision.allowed) {
+    console.warn(`[graph ${repoId}] skipped rebuild: ${budgetDecision.reason}`);
+    return;
+  }
+
   const indexedFiles = await prisma.fileIndex.findMany({
     where: { repoId, isPattern: false },
     select: { id: true, path: true }
   });
   const files = indexedFiles.filter((file) => !shouldExcludeFromGraph(file.path, excludedDirs));
-
-  await prisma.graphEdge.deleteMany({ where: { repoId } });
-  await prisma.graphNode.deleteMany({ where: { repoId } });
   if (files.length === 0) return;
 
   const fileIds = files.map((file) => file.id);
@@ -640,5 +695,6 @@ export async function processGraphJob(job: GraphJob) {
 }
 
 export const __graphInternals = {
+  evaluateGraphBuildBudget,
   hasDirectFileDepEdge
 };

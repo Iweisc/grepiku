@@ -1,5 +1,6 @@
 import { normalizePath } from "./diff.js";
 import type { ReviewComment, ReviewOutput } from "./schemas.js";
+import { classifyChangedFileRisk } from "./risk.js";
 
 export type CoverageTarget = {
   path: string;
@@ -81,10 +82,11 @@ export function buildCoveragePlan(params: {
     const existing = changedByPath.get(path);
     const additions = typeof file.additions === "number" ? file.additions : existing?.additions;
     const deletions = typeof file.deletions === "number" ? file.deletions : existing?.deletions;
-    const churn = (additions || 0) + (deletions || 0);
-    const risk: "low" | "medium" | "high" =
-      churn >= 250 ? "high" : churn >= 80 ? "medium" : existing?.risk || "low";
-    changedByPath.set(path, { additions, deletions, risk });
+    changedByPath.set(path, {
+      additions,
+      deletions,
+      risk: classifyChangedFileRisk({ path, additions, deletions }) || existing?.risk || "low"
+    });
   }
 
   for (const stat of params.changedFileStats || []) {

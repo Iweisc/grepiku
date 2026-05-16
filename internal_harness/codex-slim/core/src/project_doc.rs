@@ -18,6 +18,7 @@ use crate::features::Feature;
 use crate::skills::SkillMetadata;
 use crate::skills::render_skills_section;
 use dunce::canonicalize as normalize_path;
+use std::path::Path;
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 use tracing::error;
@@ -208,7 +209,7 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
         cursor = parent.to_path_buf();
     }
 
-    let search_dirs: Vec<PathBuf> = if let Some(root) = git_root {
+    let search_dirs: Vec<PathBuf> = if let Some(root) = git_root.clone() {
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut saw_root = false;
         for p in chain.iter().rev() {
@@ -225,6 +226,11 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
     } else {
         vec![config.cwd.clone()]
     };
+    let allowed_root = git_root
+        .as_ref()
+        .map(|root| normalize_path(root).unwrap_or_else(|_| root.clone()))
+        .or_else(|| normalize_path(&config.cwd).ok())
+        .unwrap_or_else(|| config.cwd.clone());
 
     let mut found: Vec<PathBuf> = Vec::new();
     let candidate_filenames = candidate_filenames(config);
@@ -234,10 +240,24 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
             match std::fs::symlink_metadata(&candidate) {
                 Ok(md) => {
                     let ft = md.file_type();
-                    // Allow regular files and symlinks; opening will later fail for dangling links.
-                    if ft.is_file() || ft.is_symlink() {
+                    if ft.is_file() {
                         found.push(candidate);
                         break;
+                    }
+                    if ft.is_symlink() {
+                        let resolved = match normalize_path(&candidate) {
+                            Ok(resolved) => resolved,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => return Err(e),
+                        };
+                        if is_path_within_root(&allowed_root, &resolved)
+                            && std::fs::metadata(&resolved)
+                                .map(|resolved_md| resolved_md.is_file())
+                                .unwrap_or(false)
+                        {
+                            found.push(candidate);
+                            break;
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -247,6 +267,11 @@ pub fn discover_project_doc_paths(config: &Config) -> std::io::Result<Vec<PathBu
     }
 
     Ok(found)
+}
+
+fn is_path_within_root(root: &Path, candidate: &Path) -> bool {
+    let relative = candidate.strip_prefix(root);
+    relative.is_ok()
 }
 
 fn candidate_filenames<'a>(config: &'a Config) -> Vec<&'a str> {
@@ -641,6 +666,35 @@ mod tests {
             .await
             .expect("instructions expected");
         assert_eq!(res, "base doc");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ignores_symlinked_project_doc_that_escapes_repo_root() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let outside_doc = outside.path().join("outside-agents.md");
+        fs::write(&outside_doc, "outside doc").unwrap();
+        std::os::unix::fs::symlink(&outside_doc, repo.path().join("AGENTS.md")).unwrap();
+
+        let res = get_user_instructions(&make_config(&repo, 4096, None).await, None).await;
+        assert_eq!(res, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn allows_symlinked_project_doc_that_stays_within_repo_root() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        let inside_doc = repo.path().join("repo-agents.md");
+        fs::write(&inside_doc, "inside doc").unwrap();
+        std::os::unix::fs::symlink(&inside_doc, repo.path().join("AGENTS.md")).unwrap();
+
+        let res = get_user_instructions(&make_config(&repo, 4096, None).await, None)
+            .await
+            .expect("instructions expected");
+        assert_eq!(res, "inside doc");
     }
 
     fn create_skill(codex_home: PathBuf, name: &str, description: &str) {

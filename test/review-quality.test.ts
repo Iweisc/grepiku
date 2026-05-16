@@ -235,3 +235,36 @@ test("quoted multiline suggestions are unescaped", () => {
   assert.equal(refined.comments.length, 1);
   assert.equal(refined.comments[0].suggested_patch, 'const message = "ok";\nreturn message;');
 });
+
+test("review quality sanitizes comment identifiers used in hidden markers", () => {
+  const refined = refineReviewComments({
+    comments: [
+      {
+        comment_id: "marker --> @release/team [click](https://evil.test)",
+        comment_key: "key --> @release/team [click](https://evil.test)",
+        path: "src/foo.ts",
+        side: "RIGHT",
+        line: 2,
+        severity: "important",
+        category: "security",
+        title: "Unsafe marker id",
+        body: "Keep hidden markers inert.",
+        evidence: "Quoted evidence",
+        suggested_patch: "const safe = true;",
+        comment_type: "inline",
+        confidence: "high"
+      }
+    ],
+    diffIndex,
+    changedFiles: [{ path: "src/foo.ts" }],
+    maxInlineComments: 5,
+    summaryOnly: false,
+    allowedTypes: ["inline", "summary"]
+  });
+
+  assert.equal(refined.comments.length, 1);
+  assert.match(refined.comments[0].comment_id, /^[A-Za-z0-9._-]+$/);
+  assert.match(refined.comments[0].comment_key, /^[A-Za-z0-9._-]+$/);
+  assert.doesNotMatch(refined.comments[0].comment_id, /@|>|<|\s|\/|\[|\]|\(|\)/);
+  assert.doesNotMatch(refined.comments[0].comment_key, /@|>|<|\s|\/|\[|\]|\(|\)/);
+});

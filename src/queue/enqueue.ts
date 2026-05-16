@@ -1,5 +1,11 @@
 import { reviewQueue, mentionQueue, indexQueue, graphQueue, analyticsQueue } from "./index.js";
-import { buildIndexJobId, buildReviewJobId } from "./jobId.js";
+import {
+  buildAnalyticsJobId,
+  buildCommentReplyJobId,
+  buildGraphJobId,
+  buildIndexJobId,
+  buildReviewJobId
+} from "./jobId.js";
 
 export async function enqueueReviewJob(data: any) {
   const forceRun = Boolean(data?.force);
@@ -14,7 +20,9 @@ export async function enqueueReviewJob(data: any) {
 }
 
 export async function enqueueCommentReplyJob(data: any) {
+  const jobId = buildCommentReplyJobId(data);
   await mentionQueue.add("comment-reply", data, {
+    jobId,
     removeOnComplete: true,
     removeOnFail: false,
     attempts: 2,
@@ -32,11 +40,21 @@ export async function enqueueIndexJob(data: any) {
 }
 
 export async function enqueueGraphJob(data: any) {
-  await graphQueue.add("graph", data, { removeOnComplete: true, removeOnFail: false });
+  const jobId = buildGraphJobId(data);
+  await graphQueue.add("graph", data, {
+    jobId,
+    removeOnComplete: true,
+    removeOnFail: false
+  });
 }
 
 export async function enqueueAnalyticsJob(data: any) {
-  await analyticsQueue.add("analytics", data, { removeOnComplete: true, removeOnFail: false });
+  const jobId = buildAnalyticsJobId(data);
+  await analyticsQueue.add("analytics", data, {
+    jobId,
+    removeOnComplete: true,
+    removeOnFail: false
+  });
 }
 
 export async function cancelReviewJobsForPr(pullRequestId: number): Promise<number> {

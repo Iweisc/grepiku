@@ -18,6 +18,77 @@ export function parsePatch(patch: string) {
   return parseDiff(patch);
 }
 
+function decodeGitQuotedPath(pathValue: string): string {
+  let output = "";
+  for (let index = 0; index < pathValue.length; index += 1) {
+    const char = pathValue[index];
+    if (char !== "\\") {
+      output += char;
+      continue;
+    }
+
+    const next = pathValue[index + 1];
+    if (next == null) {
+      output += "\\";
+      break;
+    }
+
+    index += 1;
+    if (/[0-7]/.test(next)) {
+      let octal = next;
+      while (octal.length < 3 && /[0-7]/.test(pathValue[index + 1] || "")) {
+        index += 1;
+        octal += pathValue[index];
+      }
+      output += String.fromCharCode(parseInt(octal, 8));
+      continue;
+    }
+
+    switch (next) {
+      case "a":
+        output += "\u0007";
+        break;
+      case "b":
+        output += "\b";
+        break;
+      case "f":
+        output += "\f";
+        break;
+      case "n":
+        output += "\n";
+        break;
+      case "r":
+        output += "\r";
+        break;
+      case "t":
+        output += "\t";
+        break;
+      case "v":
+        output += "\v";
+        break;
+      case "\\":
+        output += "\\";
+        break;
+      case "\"":
+        output += "\"";
+        break;
+      default:
+        output += next;
+        break;
+    }
+  }
+
+  return output;
+}
+
+function unwrapGitPath(pathValue: string): string {
+  const normalized = pathValue.trim();
+  if (normalized.length >= 2 && normalized.startsWith("\"") && normalized.endsWith("\"")) {
+    return decodeGitQuotedPath(normalized.slice(1, -1));
+  }
+  return decodeGitQuotedPath(pathValue.replace(/\r$/, ""));
+}
+
 function hashText(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
@@ -149,9 +220,7 @@ export function contextHashForComment(index: DiffIndex, comment: ReviewComment):
 }
 
 export function normalizePath(path: string): string {
-  return path
-    .trim()
-    .replace(/\\/g, "/")
+  return unwrapGitPath(path)
     .replace(/^\.\//, "")
     .replace(/^\/+/, "")
     .replace(/\/+/g, "/");

@@ -1,4 +1,7 @@
+import crypto from "crypto";
 import { execa } from "execa";
+import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
+import { normalizePath } from "./diff.js";
 
 export function resolveFollowUpPrBaseBranch(params: {
   pullRequestHeadRef?: string | null;
@@ -23,12 +26,13 @@ function sanitizeBranchSegment(value: string): string {
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+/, "")
     .replace(/-+$/, "")
-    .slice(0, 48);
+    .slice(0, 32);
 }
 
 export function mentionBranchName(commentId: string): string {
   const cleaned = sanitizeBranchSegment(commentId) || "task";
-  return `grepiku/mention-${cleaned}-${Date.now().toString(36)}`;
+  const suffix = crypto.createHash("sha1").update(commentId).digest("hex").slice(0, 8);
+  return `grepiku/mention-${cleaned}-${suffix}`;
 }
 
 export async function prepareMentionBranch(params: {
@@ -37,26 +41,29 @@ export async function prepareMentionBranch(params: {
   gitUserName: string;
   gitUserEmail: string;
 }): Promise<void> {
-  const { repoPath, branchName, gitUserName, gitUserEmail } = params;
-  await execa("git", ["-C", repoPath, "switch", "--create", branchName], { stdio: "inherit" });
-  await execa("git", ["-C", repoPath, "config", "user.name", gitUserName], { stdio: "inherit" });
-  await execa("git", ["-C", repoPath, "config", "user.email", gitUserEmail], { stdio: "inherit" });
+  const { repoPath, gitUserName, gitUserEmail } = params;
+  const env = gitCheckoutSafetyEnv();
+  await execa("git", ["-C", repoPath, "switch", "--detach"], { stdio: "inherit", env });
+  await execa("git", ["-C", repoPath, "config", "user.name", gitUserName], { stdio: "inherit", env });
+  await execa("git", ["-C", repoPath, "config", "user.email", gitUserEmail], { stdio: "inherit", env });
 }
 
 export async function hasWorkingTreeChanges(repoPath: string): Promise<boolean> {
   const { stdout } = await execa("git", ["-C", repoPath, "status", "--porcelain"], {
-    stdio: ["ignore", "pipe", "ignore"]
+    stdio: ["ignore", "pipe", "ignore"],
+    env: gitCheckoutSafetyEnv()
   });
   return stdout.trim().length > 0;
 }
 
 export async function changedPaths(repoPath: string): Promise<string[]> {
-  const { stdout } = await execa("git", ["-C", repoPath, "diff", "--name-only"], {
-    stdio: ["ignore", "pipe", "ignore"]
+  const { stdout } = await execa("git", ["-C", repoPath, "diff", "--no-ext-diff", "--name-only", "-z"], {
+    stdio: ["ignore", "pipe", "ignore"],
+    env: gitCheckoutSafetyEnv()
   });
   return stdout
-    .split("\n")
-    .map((line) => line.trim())
+    .split("\0")
+    .map((line) => normalizePath(line))
     .filter((line) => line.length > 0);
 }
 
@@ -65,10 +72,12 @@ export async function commitWorkingTree(params: {
   message: string;
 }): Promise<string> {
   const message = params.message.trim() || "chore: apply grepiku requested changes";
-  await execa("git", ["-C", params.repoPath, "add", "-A"], { stdio: "inherit" });
-  await execa("git", ["-C", params.repoPath, "commit", "-m", message], { stdio: "inherit" });
+  const env = gitCheckoutSafetyEnv();
+  await execa("git", ["-C", params.repoPath, "add", "-A"], { stdio: "inherit", env });
+  await execa("git", ["-C", params.repoPath, "commit", "-m", message], { stdio: "inherit", env });
   const { stdout } = await execa("git", ["-C", params.repoPath, "rev-parse", "HEAD"], {
-    stdio: ["ignore", "pipe", "ignore"]
+    stdio: ["ignore", "pipe", "ignore"],
+    env
   });
   return stdout.trim();
 }
@@ -78,7 +87,8 @@ export async function pushBranch(params: {
   branchName: string;
 }): Promise<void> {
   await execa("git", ["-C", params.repoPath, "push", "origin", `HEAD:refs/heads/${params.branchName}`], {
-    stdio: "inherit"
+    stdio: "inherit",
+    env: gitCheckoutSafetyEnv()
   });
 }
 

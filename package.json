@@ -45,7 +45,6 @@
     "parse-diff": "^0.11.1",
     "pg": "^8.12.0",
     "pino": "^9.2.0",
-    "simple-git": "^3.26.0",
     "tree-sitter": "^0.21.0",
     "tree-sitter-go": "^0.21.0",
     "tree-sitter-javascript": "^0.21.3",

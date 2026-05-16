@@ -38,6 +38,25 @@ test("buildDiffIndex keeps real top-level directories from diff headers", () => 
   assert.equal(index.files.has("b/lib/util.ts"), true);
 });
 
+test("buildDiffIndex unescapes git-quoted filenames with escaped control characters", () => {
+  const weirdPath = `dir/evil\nname\tfile.ts`;
+  const patch = [
+    'diff --git "a/dir/evil\\nname\\tfile.ts" "b/dir/evil\\nname\\tfile.ts"',
+    '--- "a/dir/evil\\nname\\tfile.ts"',
+    '+++ "b/dir/evil\\nname\\tfile.ts"',
+    "@@ -1 +1 @@",
+    "-old",
+    "+new"
+  ].join("\n");
+
+  const index = buildDiffIndex(patch);
+  assert.equal(index.files.has(weirdPath), true);
+});
+
+test("normalizePath preserves spaces inside git-quoted filenames", () => {
+  assert.equal(normalizePath('" dir/spaced name.ts "'), " dir/spaced name.ts ");
+});
+
 test("parseChangedLinesByPath preserves top-level b directory paths", () => {
   const patch = [
     "diff --git a/b/lib/util.ts b/b/lib/util.ts",
@@ -51,6 +70,22 @@ test("parseChangedLinesByPath preserves top-level b directory paths", () => {
   const changed = __contextInternals.parseChangedLinesByPath(patch);
   assert.equal(changed.has("b/lib/util.ts"), true);
   assert.equal(changed.has("lib/util.ts"), false);
+});
+
+test("parseChangedLinesByPath unescapes git-quoted filenames with escaped control characters", () => {
+  const weirdPath = `dir/evil\nname\tfile.ts`;
+  const patch = [
+    'diff --git "a/dir/evil\\nname\\tfile.ts" "b/dir/evil\\nname\\tfile.ts"',
+    '--- "a/dir/evil\\nname\\tfile.ts"',
+    '+++ "b/dir/evil\\nname\\tfile.ts"',
+    "@@ -2 +2 @@",
+    "-old",
+    "+new"
+  ].join("\n");
+
+  const changed = __contextInternals.parseChangedLinesByPath(patch);
+  assert.equal(changed.has(weirdPath), true);
+  assert.deepEqual(Array.from(changed.get(weirdPath) || []).sort((a, b) => a - b), [2]);
 });
 
 test("retrieval normalization preserves top-level a and b directories", () => {

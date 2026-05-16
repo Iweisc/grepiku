@@ -127,6 +127,7 @@ impl SkillsManager {
                 .map(|path| SkillRoot {
                     path,
                     scope: SkillScope::User,
+                    boundary: None,
                 }),
         );
         let mut outcome = load_skills_from_roots(roots);

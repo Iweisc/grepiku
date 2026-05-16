@@ -6,6 +6,7 @@ import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
 
 export type CodexStage = "reviewer" | "editor" | "verifier" | "mention";
+export type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export type CodexRunParams = {
   stage: CodexStage;
@@ -19,6 +20,23 @@ export type CodexRunParams = {
   reviewRunId: number;
   prNumber: number;
   captureLastMessage?: boolean;
+  reasoningEffort?: CodexReasoningEffort;
+};
+
+export type CodexTokenUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+};
+
+export type CodexStageMetrics = {
+  stage: CodexStage;
+  reasoningEffort: CodexReasoningEffort;
+  durationMs: number;
+  promptChars: number;
+  promptBytes: number;
+  estimatedPromptTokens: number;
+  usage: CodexTokenUsage | null;
 };
 
 const env = loadEnv();
@@ -26,7 +44,6 @@ let resolvedCodexExecPath: string | null = null;
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const STAGE_ENV_ALLOWLIST = [
   "PATH",
-  "HOME",
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
@@ -40,16 +57,28 @@ const STAGE_ENV_ALLOWLIST = [
   "TZ"
 ] as const;
 
+function applyIsolatedHomeEnv(output: NodeJS.ProcessEnv, homeDir: string): NodeJS.ProcessEnv {
+  output.HOME = homeDir;
+  output.XDG_CONFIG_HOME = path.join(homeDir, ".config");
+  output.XDG_CACHE_HOME = path.join(homeDir, ".cache");
+  output.XDG_STATE_HOME = path.join(homeDir, ".state");
+  const tempDir = path.join(homeDir, ".tmp");
+  output.TMPDIR = tempDir;
+  output.TMP = tempDir;
+  output.TEMP = tempDir;
+  return output;
+}
+
 function systemPrompt(stage: CodexStage, roots: string[]): string {
   const toolNote = (() => {
     if (stage === "verifier") return "Available tool names: read_file, search, lint, build, test.";
-    if (stage === "mention") return "Available tool names: read_file, search, retrieve_context, shell, apply_patch.";
+    if (stage === "mention") return "Available tool names: read_file, search, retrieve_context, apply_patch.";
     return "Available tool names: read_file, search, retrieve_context.";
   })();
   const writeInstruction =
     stage === "mention"
-      ? "You may modify files under the repo root and write required outputs to the output root."
-      : `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt.`;
+      ? `You may modify files under the repo root and write required outputs to the output root. The current working directory is not the repo checkout; when editing repository files, target absolute paths under ${roots[0]}.`
+      : `Only write outputs to ${roots[roots.length - 1]} as instructed by the prompt. If no write-capable tool is available, return the required JSON as your final response instead; the runner captures it.`;
   const allowedRoots = roots.join(", ");
   return [
     "SYSTEM: You are a code-review agent running inside a sandboxed repo checkout.",
@@ -71,7 +100,7 @@ async function writeAuthFile(codexHomeDir: string): Promise<void> {
   await fs.writeFile(codexAuthPath, authPayload, { encoding: "utf8", mode: 0o600 });
 }
 
-async function resolveCodexExecPath(): Promise<string> {
+export async function resolveCodexExecPath(): Promise<string> {
   if (resolvedCodexExecPath) return resolvedCodexExecPath;
   const candidates = Array.from(new Set([env.codexExecPath, "codex-exec"]));
   for (const candidate of candidates) {
@@ -129,20 +158,29 @@ function mcpServerBlock(
   return lines.join("\n");
 }
 
-function baseConfig(params?: { shellTool?: boolean; applyPatchFreeform?: boolean }): string {
+function baseConfig(params?: {
+  shellTool?: boolean;
+  applyPatchFreeform?: boolean;
+  reasoningEffort?: CodexReasoningEffort;
+}): string {
   const shellTool = params?.shellTool === true;
   const applyPatchFreeform = params?.applyPatchFreeform === true;
+  const reasoningEffort = params?.reasoningEffort ?? env.codexModelReasoningEffort;
   return [
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
-    `model_reasoning_effort = "high"`,
+    `model_reasoning_effort = ${tomlString(reasoningEffort)}`,
+    `project_doc_max_bytes = 0`,
     "",
     "[features]",
     `shell_tool = ${shellTool ? "true" : "false"}`,
     `apply_patch_freeform = ${applyPatchFreeform ? "true" : "false"}`,
     "web_search_request = false",
     "web_search_cached = false",
+    "",
+    "[tools]",
+    "view_image = false",
     ""
   ].join("\n");
 }
@@ -154,7 +192,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     WORK_OUT_ROOT: params.outDir
   };
   if (stage === "reviewer") {
-    const base = baseConfig();
+    const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -166,7 +204,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "editor") {
-    const base = baseConfig();
+    const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -178,13 +216,14 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "verifier") {
-    const base = baseConfig();
+    const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     const verifierToolTimeoutSec = Math.max(30, Math.ceil(env.codexStageTimeoutMs / 1000));
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
       mcpServerBlock("verifier", "verifier_mcp.js", {
         WORK_REPO_ROOT: params.repoPath,
+        WORK_BUNDLE_ROOT: params.bundleDir,
         WORK_OUT_ROOT: params.outDir,
         DATABASE_URL: env.databaseUrl,
         REVIEW_RUN_ID: String(params.reviewRunId)
@@ -192,7 +231,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     );
   }
   if (stage === "mention") {
-    const base = baseConfig({ shellTool: true, applyPatchFreeform: true });
+    const base = baseConfig({ applyPatchFreeform: true, reasoningEffort: params.reasoningEffort });
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
@@ -217,6 +256,93 @@ function baseStageEnv(): NodeJS.ProcessEnv {
   return output;
 }
 
+function buildStageEnv(params: CodexRunParams, stageHomeDir: string): NodeJS.ProcessEnv {
+  return applyIsolatedHomeEnv({
+    ...baseStageEnv(),
+    OPENAI_BASE_URL: env.openaiBaseUrl,
+    OPENAI_TIMEOUT_MS: String(env.openaiTimeoutMs),
+    OPENAI_MAX_RETRIES: String(env.openaiMaxRetries),
+    CODEX_HOME: stageHomeDir,
+    CODEX_DISABLE_PROJECT_DOC: "1",
+    CODEX_QUIET_MODE: "1"
+  }, stageHomeDir);
+}
+
+function buildStageLaunch(params: CodexRunParams): {
+  codexArgs: string[];
+  fullPrompt: string;
+  stageCwd: string;
+} {
+  const stageCwd = params.outDir;
+  const codexArgs = [
+    "--json",
+    "--sandbox",
+    "workspace-write",
+    "--skip-git-repo-check",
+    "--model",
+    env.openaiModel
+  ];
+
+  if (params.stage === "mention") {
+    const extraReadableWritableRoots = Array.from(
+      new Set(
+        [params.repoPath, params.bundleDir]
+          .filter((dir): dir is string => Boolean(dir && dir !== stageCwd))
+      )
+    );
+    for (const dir of extraReadableWritableRoots) {
+      codexArgs.push("--add-dir", dir);
+    }
+  }
+
+  if (params.captureLastMessage !== false) {
+    codexArgs.push("--output-last-message", path.join(params.outDir, `last_message_${params.stage}.txt`));
+  }
+  codexArgs.push("-");
+
+  const roots = [params.repoPath, params.bundleDir, params.outDir].filter(
+    (value): value is string => Boolean(value)
+  );
+  const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
+
+  return {
+    codexArgs,
+    fullPrompt,
+    stageCwd
+  };
+}
+
+function estimatePromptTokens(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(Buffer.byteLength(text, "utf8") / 4);
+}
+
+function parseCodexUsageLine(line: string): CodexTokenUsage | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const event = parsed as { type?: unknown; usage?: unknown };
+  if (event.type !== "turn.completed" || !event.usage || typeof event.usage !== "object") {
+    return null;
+  }
+  const usage = event.usage as Record<string, unknown>;
+  const inputTokens = Number(usage.input_tokens);
+  const cachedInputTokens = Number(usage.cached_input_tokens);
+  const outputTokens = Number(usage.output_tokens);
+  if (![inputTokens, cachedInputTokens, outputTokens].every(Number.isFinite)) {
+    return null;
+  }
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens
+  };
+}
+
 function forwardStageStream(params: {
   stream: NodeJS.ReadableStream | null | undefined;
   stageTag: string;
@@ -238,80 +364,107 @@ function forwardStageStream(params: {
   });
 }
 
-export async function runCodexStage(params: CodexRunParams): Promise<void> {
+function scanCodexJsonStream(params: {
+  stream: NodeJS.ReadableStream | null | undefined;
+  stageTag: string;
+  logLines: boolean;
+  onUsage: (usage: CodexTokenUsage) => void;
+}): Promise<void> {
+  if (!params.stream) return Promise.resolve();
+  const rl = createInterface({
+    input: params.stream,
+    crlfDelay: Infinity
+  });
+  rl.on("line", (line) => {
+    if (line.length === 0) return;
+    const usage = parseCodexUsageLine(line);
+    if (usage) {
+      params.onUsage(usage);
+    }
+    if (params.logLines) {
+      console.log(`${params.stageTag} stdout: ${line}`);
+    }
+  });
+  return new Promise((resolve, reject) => {
+    rl.once("close", () => resolve());
+    rl.once("error", reject);
+  });
+}
+
+async function writeStageMetrics(params: {
+  outDir: string;
+  stage: CodexStage;
+  startedAt: number;
+  metrics: CodexStageMetrics;
+}): Promise<void> {
+  const safeStage = params.stage.replace(/[^a-z0-9_-]/gi, "_");
+  const metricsPath = path.join(params.outDir, `stage_metrics_${safeStage}_${params.startedAt}.json`);
+  const latestPath = path.join(params.outDir, `stage_metrics_latest_${safeStage}.json`);
+  const raw = JSON.stringify(params.metrics, null, 2);
+  await fs.writeFile(metricsPath, raw, "utf8");
+  await fs.writeFile(latestPath, raw, "utf8");
+}
+
+function formatTokenUsageForLog(usage: CodexTokenUsage | null): string {
+  if (!usage) return "";
+  return ` tokens input=${usage.inputTokens} cached=${usage.cachedInputTokens} output=${usage.outputTokens}`;
+}
+
+export async function runCodexStage(params: CodexRunParams): Promise<CodexStageMetrics> {
   const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}]`;
+  const reasoningEffort = params.reasoningEffort ?? env.codexModelReasoningEffort;
   const codexExecPath = await resolveCodexExecPath();
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
+  await fs.mkdir(path.join(stageHomeDir, ".tmp"), { recursive: true });
   await writeAuthFile(stageHomeDir);
   const configToml = configForStage(params.stage, params);
   const configPath = path.join(stageHomeDir, "config.toml");
   await fs.writeFile(configPath, configToml, "utf8");
-  const codexArgs = [
-    "--json",
-    "--sandbox",
-    "workspace-write",
-    "--skip-git-repo-check",
-    "--model",
-    env.openaiModel
-  ];
-  if (params.stage === "mention" && params.repoPath) {
-    codexArgs.push("--cd", params.repoPath);
-    const extraWritableRoots = Array.from(
-      new Set([params.bundleDir, params.outDir].filter((dir) => dir && dir !== params.repoPath))
-    );
-    for (const dir of extraWritableRoots) {
-      codexArgs.push("--add-dir", dir);
-    }
-  }
-  if (params.captureLastMessage !== false) {
-    codexArgs.push("--output-last-message", path.join(params.outDir, `last_message_${params.stage}.txt`));
-  }
-  codexArgs.push("-");
-
-  const stageEnv: NodeJS.ProcessEnv = {
-    ...baseStageEnv(),
-    OPENAI_BASE_URL: env.openaiBaseUrl,
-    OPENAI_TIMEOUT_MS: String(env.openaiTimeoutMs),
-    OPENAI_MAX_RETRIES: String(env.openaiMaxRetries),
-    CODEX_HOME: stageHomeDir,
-    CODEX_DISABLE_PROJECT_DOC: "1",
-    CODEX_QUIET_MODE: "1",
-    DATABASE_URL: env.databaseUrl,
-    REVIEW_RUN_ID: String(params.reviewRunId),
-    REVIEW_REPO_ID: String(params.repoId),
-    TOOLRUN_PR_NUMBER: String(params.prNumber),
-    TOOLRUN_HEAD_SHA: params.headSha,
-    INTERNAL_API_URL: env.internalApiUrl,
-    INTERNAL_API_KEY: env.internalApiKey,
-    WORK_BUNDLE_ROOT: params.bundleDir,
-    WORK_OUT_ROOT: params.outDir
-  };
-  if (params.repoPath) {
-    stageEnv.WORK_REPO_ROOT = params.repoPath;
-  }
-
-  const roots = [params.repoPath, params.bundleDir, params.outDir].filter(
-    (value): value is string => Boolean(value)
-  );
-  const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
+  const stageEnv = buildStageEnv(params, stageHomeDir);
+  const { codexArgs, fullPrompt, stageCwd } = buildStageLaunch(params);
   const startedAt = Date.now();
-  const stageCwd = params.stage === "mention" && params.repoPath ? params.repoPath : params.outDir;
+  const tokenUsageRef: { current: CodexTokenUsage | null } = { current: null };
   let forwarders: Promise<void>[] = [];
   console.log(`${stageTag} starting`);
   try {
     if (!env.codexStageLogOutput) {
-      await execa(codexExecPath, codexArgs, {
+      const subprocess = execa(codexExecPath, codexArgs, {
         input: fullPrompt,
-        stdio: ["pipe", "ignore", "inherit"],
+        stdout: "pipe",
+        stderr: "inherit",
+        buffer: false,
         cwd: stageCwd,
         env: stageEnv,
         timeout: env.codexStageTimeoutMs,
         killSignal: "SIGTERM",
         forceKillAfterDelay: 10_000
       });
-      console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
-      return;
+      forwarders = [
+        scanCodexJsonStream({
+          stream: subprocess.stdout,
+          stageTag,
+          logLines: false,
+          onUsage: (usage) => {
+            tokenUsageRef.current = usage;
+          }
+        })
+      ];
+      await subprocess;
+      await Promise.allSettled(forwarders);
+      const durationMs = Date.now() - startedAt;
+      const metrics = {
+        stage: params.stage,
+        reasoningEffort,
+        durationMs,
+        promptChars: fullPrompt.length,
+        promptBytes: Buffer.byteLength(fullPrompt, "utf8"),
+        estimatedPromptTokens: estimatePromptTokens(fullPrompt),
+        usage: tokenUsageRef.current
+      };
+      await writeStageMetrics({ outDir: params.outDir, stage: params.stage, startedAt, metrics });
+      console.log(`${stageTag} completed in ${durationMs}ms${formatTokenUsageForLog(tokenUsageRef.current)}`);
+      return metrics;
     }
 
     const subprocess = execa(codexExecPath, codexArgs, {
@@ -327,10 +480,13 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     });
 
     forwarders = [
-      forwardStageStream({
+      scanCodexJsonStream({
         stream: subprocess.stdout,
         stageTag,
-        channel: "stdout"
+        logLines: true,
+        onUsage: (usage) => {
+          tokenUsageRef.current = usage;
+        }
       }),
       forwardStageStream({
         stream: subprocess.stderr,
@@ -341,7 +497,19 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
 
     await subprocess;
     await Promise.allSettled(forwarders);
-    console.log(`${stageTag} completed in ${Date.now() - startedAt}ms`);
+    const durationMs = Date.now() - startedAt;
+    const metrics = {
+      stage: params.stage,
+      reasoningEffort,
+      durationMs,
+      promptChars: fullPrompt.length,
+      promptBytes: Buffer.byteLength(fullPrompt, "utf8"),
+      estimatedPromptTokens: estimatePromptTokens(fullPrompt),
+      usage: tokenUsageRef.current
+    };
+    await writeStageMetrics({ outDir: params.outDir, stage: params.stage, startedAt, metrics });
+    console.log(`${stageTag} completed in ${durationMs}ms${formatTokenUsageForLog(tokenUsageRef.current)}`);
+    return metrics;
   } catch (err) {
     if (forwarders.length > 0) {
       await Promise.allSettled(forwarders);
@@ -350,3 +518,11 @@ export async function runCodexStage(params: CodexRunParams): Promise<void> {
     throw err;
   }
 }
+
+export const __codexRunnerInternals = {
+  buildStageEnv,
+  configForStage,
+  buildStageLaunch,
+  estimatePromptTokens,
+  parseCodexUsageLine
+};

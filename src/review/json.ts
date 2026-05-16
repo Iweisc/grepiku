@@ -2,6 +2,9 @@ import fs from "fs/promises";
 import { jsonrepair } from "jsonrepair";
 import { ZodSchema } from "zod";
 
+const MAX_STAGE_OUTPUT_JSON_BYTES = 1_000_000;
+const OUTPUT_FILE_LIMIT_ERROR_PREFIX = "output file exceeded byte limit";
+
 function trySchema<T>(
   value: unknown,
   schema: ZodSchema<T>
@@ -156,6 +159,25 @@ function parseCandidate(candidate: string): unknown {
   }
 }
 
+function outputFileLimitError(filePath: string, maxBytes: number): Error {
+  return new Error(`${OUTPUT_FILE_LIMIT_ERROR_PREFIX} (${maxBytes} bytes): ${filePath}`);
+}
+
+async function readUtf8FileWithinLimit(filePath: string, maxBytes: number): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size > maxBytes) {
+      throw outputFileLimitError(filePath, maxBytes);
+    }
+    const buffer = Buffer.alloc(Math.max(0, Number(stat.size)));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 export function parseAndValidateJson<T>(raw: string, schema: ZodSchema<T>): T {
   let lastError: unknown;
   for (const candidate of extractJsonCandidates(raw)) {
@@ -178,7 +200,7 @@ export async function readAndValidateJson<T>(
   filePath: string,
   schema: ZodSchema<T>
 ): Promise<T> {
-  const raw = await fs.readFile(filePath, "utf8");
+  const raw = await readUtf8FileWithinLimit(filePath, MAX_STAGE_OUTPUT_JSON_BYTES);
   return parseAndValidateJson(raw, schema);
 }
 
@@ -195,7 +217,7 @@ export async function readAndValidateJsonWithFallback<T>(
   }
 
   try {
-    const raw = await fs.readFile(fallbackPath, "utf8");
+    const raw = await readUtf8FileWithinLimit(fallbackPath, MAX_STAGE_OUTPUT_JSON_BYTES);
     return parseAndValidateJson(raw, schema);
   } catch (fallbackError) {
     if ((fallbackError as NodeJS.ErrnoException)?.code === "ENOENT") {

@@ -2,25 +2,29 @@ import { prisma } from "../db/client.js";
 import { ensureInstallation, ensureProvider, ensureRepo, ensureRepoInstallation, ensureUser, upsertPullRequest } from "../db/records.js";
 import { cancelReviewJobsForPr, enqueueCommentReplyJob, enqueueIndexJob, enqueueReviewJob } from "../queue/enqueue.js";
 import { ProviderWebhookEvent } from "./types.js";
-import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger } from "../review/triggers.js";
+import { resolveRepoConfig, shouldTriggerReview, detectCommentTrigger, extractMentionDoTask } from "../review/triggers.js";
 import { getProviderAdapter } from "./registry.js";
 import { resolveGithubBotLogin } from "./github/adapter.js";
 import { rememberRepoInstruction } from "../services/repoMemory.js";
-import { isGeneratedMentionReply, isSelfBotComment } from "./commentGuards.js";
+import {
+  isGeneratedMentionReply,
+  isPullRequestAuthorComment,
+  isPrivilegedCommentActionAllowed,
+  isReviewThreadReplyAllowed,
+  resolveTrackedFeedbackCommentId,
+  shouldCaptureRepoMemory,
+  isSelfBotComment,
+  isTrustedCommentAuthorAssociation
+} from "./commentGuards.js";
 import { isResolutionReply } from "./commentResolution.js";
-import { shouldDeleteClosedBotPrBranch, shouldSkipBotAuthoredReview, shouldSkipSelfBotFollowUpPrReview } from "./pullRequestGuards.js";
+import {
+  headCommitReviewSkipReason,
+  shouldDeleteClosedBotPrBranch,
+  shouldSkipBotAuthoredReview,
+  shouldSkipSelfBotFollowUpPrReview
+} from "./pullRequestGuards.js";
 import { detectOutcomesOnClose } from "../services/outcomes.js";
-
-function isSuggestionCommitMessage(message: string): boolean {
-  const normalized = message.toLowerCase().trim();
-  if (!normalized) return false;
-  return (
-    normalized.startsWith("apply suggestion") ||
-    normalized.startsWith("apply suggestions") ||
-    normalized.includes("apply suggestions from code review") ||
-    normalized.includes("suggestions from code review")
-  );
-}
+import { selectBootstrapIndexSha } from "./bootstrapIndex.js";
 
 async function fetchHeadCommitSkipReason(params: {
   installationId: string | null;
@@ -38,13 +42,23 @@ async function fetchHeadCommitSkipReason(params: {
       pullRequest: params.pullRequest
     });
     const commit = await client.fetchCommit(params.headSha);
-    if (isSuggestionCommitMessage(commit.message || "")) return "suggestion-commit";
-    if (isSelfBotComment({ authorLogin: commit.authorLogin || "", botLogin: params.botLogin })) return "bot-commit";
-    if (commit.parentCount != null && commit.parentCount > 1) return "merge-commit";
-    return null;
+    return headCommitReviewSkipReason({
+      commitMessage: commit.message || "",
+      authorLogin: commit.authorLogin || "",
+      parentCount: commit.parentCount ?? null,
+      botLogin: params.botLogin
+    });
   } catch {
     return null;
   }
+}
+
+function reactionSentimentForFeedback(
+  event: Extract<ProviderWebhookEvent, { type: "reaction" }>
+): string | null {
+  if (event.action !== "created") return null;
+  const sentiment = event.reactionContent?.trim();
+  return sentiment ? sentiment : null;
 }
 
 async function resolveTargetReviewComment(params: {
@@ -68,10 +82,16 @@ async function maybeBootstrapRepoGraph(params: {
   provider: string;
   installationExternalId: string | null;
   repoId: number;
+  baseSha?: string | null;
   headSha: string;
   action: string;
 }) {
   if (params.action !== "opened") return;
+  const bootstrapSha = selectBootstrapIndexSha({
+    baseSha: params.baseSha,
+    headSha: params.headSha
+  });
+  if (!bootstrapSha) return;
   const [indexRuns, graphNodes] = await Promise.all([
     prisma.indexRun.count({
       where: {
@@ -88,11 +108,11 @@ async function maybeBootstrapRepoGraph(params: {
     provider: params.provider,
     installationId: params.installationExternalId,
     repoId: params.repoId,
-    headSha: params.headSha,
+    headSha: bootstrapSha,
     force: true
   });
   console.log(
-    `[repo ${params.repoId}] queued initial full-codebase index bootstrap for first PR open at ${params.headSha}`
+    `[repo ${params.repoId}] queued initial full-codebase index bootstrap for first PR open at trusted base ${bootstrapSha}`
   );
 }
 
@@ -232,6 +252,7 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       provider: event.provider,
       installationExternalId: installation.externalId,
       repoId: repo.id,
+      baseSha: event.pullRequest.baseSha,
       headSha: event.pullRequest.headSha,
       action: event.action
     });
@@ -283,6 +304,7 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   if (event.type === "comment") {
     const commentBody = event.comment.body || "";
     const botLogin = await resolveGithubBotLogin().catch(() => "");
+    const trustedCommentAuthor = isTrustedCommentAuthorAssociation(event.author.association);
     if (isSelfBotComment({ authorLogin: event.author.login || "", botLogin })) {
       return;
     }
@@ -290,6 +312,12 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       return;
     }
     const commentTrigger = detectCommentTrigger(commentBody, config);
+    const mentionTask = commentTrigger === "mention" ? extractMentionDoTask(commentBody, config) : null;
+    const privilegedCommentActionAllowed = isPrivilegedCommentActionAllowed({
+      trigger: commentTrigger,
+      mentionTask,
+      authorAssociation: event.author.association
+    });
 
     const latestRun = await prisma.reviewRun.findFirst({
       where: { pullRequestId: pullRequest.id },
@@ -301,27 +329,50 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       providerCommentId,
       inReplyToId: event.comment.inReplyToId
     });
+    const pullRequestAuthor = pullRequest.authorId
+      ? await prisma.user.findUnique({
+          where: { id: pullRequest.authorId },
+          select: { externalId: true, login: true }
+        })
+      : null;
+    const commentAuthorIsPullRequestAuthor = isPullRequestAuthorComment({
+      commentAuthorExternalId: event.author.externalId,
+      commentAuthorLogin: event.author.login,
+      pullRequestAuthorExternalId: pullRequestAuthor?.externalId || null,
+      pullRequestAuthorLogin: pullRequestAuthor?.login || null
+    });
+    const allowReviewThreadReply = isReviewThreadReplyAllowed({
+      hasTargetComment: Boolean(targetComment),
+      trustedCommentAuthor,
+      isPullRequestAuthor: commentAuthorIsPullRequestAuthor
+    });
 
-    if (latestRun) {
-      const canonicalCommentId =
-        targetComment?.finding?.commentId || event.comment.inReplyToId || providerCommentId;
-      const action = isResolutionReply(commentBody) ? "resolved" : null;
-      await prisma.feedback.create({
-        data: {
-          reviewRunId: latestRun.id,
-          type: "reply",
-          action,
-          commentId: canonicalCommentId,
-          metadata: {
-            author: event.author.login,
-            body: commentBody,
-            providerCommentId
+    if (latestRun && trustedCommentAuthor) {
+      const canonicalCommentId = resolveTrackedFeedbackCommentId(targetComment);
+      if (canonicalCommentId) {
+        const action = isResolutionReply(commentBody) ? "resolved" : null;
+        await prisma.feedback.create({
+          data: {
+            reviewRunId: latestRun.id,
+            type: "reply",
+            action,
+            commentId: canonicalCommentId,
+            metadata: {
+              author: event.author.login,
+              authorAssociation: event.author.association || null,
+              body: commentBody,
+              providerCommentId
+            }
           }
-        }
-      });
+        });
+      }
     }
 
-    const shouldAttemptMemory = Boolean(targetComment) || commentTrigger === "mention";
+    const shouldAttemptMemory = shouldCaptureRepoMemory({
+      trustedCommentAuthor,
+      commentTrigger,
+      hasTargetComment: Boolean(targetComment)
+    });
     if (shouldAttemptMemory) {
       await rememberRepoInstruction({
         repoId: repo.id,
@@ -332,7 +383,9 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
       }).catch(() => undefined);
     }
 
-    const shouldAcknowledge = Boolean(commentTrigger) || Boolean(targetComment);
+    const shouldAcknowledge =
+      allowReviewThreadReply ||
+      (Boolean(commentTrigger) && privilegedCommentActionAllowed);
     if (installation.externalId && shouldAcknowledge) {
       try {
         const adapter = getProviderAdapter(event.provider);
@@ -350,9 +403,17 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
     }
 
     const shouldReply =
-      commentTrigger === "mention" ||
-      (Boolean(targetComment) && !isResolutionReply(commentBody) && commentBody.trim().length > 0);
+      (commentTrigger === "mention" &&
+        (privilegedCommentActionAllowed || Boolean(mentionTask))) ||
+      (allowReviewThreadReply &&
+        !isResolutionReply(commentBody) &&
+        commentBody.trim().length > 0);
     if (shouldReply) {
+      if (Boolean(mentionTask) && !privilegedCommentActionAllowed) {
+        console.warn(
+          `[comment ${providerCommentId}] denied privileged trigger from ${event.author.login || "unknown"} (association=${event.author.association || "unknown"})`
+        );
+      }
       const replyInThread =
         Boolean(event.comment.path) ||
         Boolean(event.comment.inReplyToId) ||
@@ -369,14 +430,19 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
         commentId: event.comment.id,
         commentBody,
         commentAuthor: event.author.login,
+        commentAuthorAssociation: event.author.association || null,
         commentUrl: event.comment.url,
-        replyInThread
+        replyInThread,
+        denyImplementation: Boolean(mentionTask) && !privilegedCommentActionAllowed
       });
     }
 
     if (!commentTrigger) return;
 
     if (commentTrigger === "review") {
+      if (!privilegedCommentActionAllowed) {
+        return;
+      }
       if (event.pullRequest.state === "closed") {
         console.log(
           `[pr#${event.pullRequest.number}] ignoring /review command on closed PR`
@@ -399,32 +465,38 @@ export async function handleWebhookEvent(event: ProviderWebhookEvent): Promise<v
   }
 
   if (event.type === "reaction") {
+    const sentiment = reactionSentimentForFeedback(event);
+    if (!sentiment) {
+      return;
+    }
     const latestRun = await prisma.reviewRun.findFirst({
       where: { pullRequestId: pullRequest.id },
       orderBy: { createdAt: "desc" }
     });
-    if (latestRun) {
+    if (latestRun && isTrustedCommentAuthorAssociation(event.author.association)) {
       const providerCommentId = event.comment.id;
       const reviewComment = await resolveTargetReviewComment({
         pullRequestId: pullRequest.id,
         providerCommentId,
         inReplyToId: event.comment.inReplyToId
       });
-      const canonicalCommentId =
-        reviewComment?.finding?.commentId || event.comment.inReplyToId || providerCommentId;
-      await prisma.feedback.create({
-        data: {
-          reviewRunId: latestRun.id,
-          type: "reaction",
-          sentiment: event.action,
-          commentId: canonicalCommentId,
-          metadata: {
-            provider: event.provider,
-            author: event.author.login,
-            providerCommentId
+      const canonicalCommentId = resolveTrackedFeedbackCommentId(reviewComment);
+      if (canonicalCommentId) {
+        await prisma.feedback.create({
+          data: {
+            reviewRunId: latestRun.id,
+            type: "reaction",
+            sentiment,
+            commentId: canonicalCommentId,
+            metadata: {
+              provider: event.provider,
+              author: event.author.login,
+              authorAssociation: event.author.association || null,
+              providerCommentId
+            }
           }
-        }
-      });
+        });
+      }
     }
   }
 }

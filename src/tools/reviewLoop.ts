@@ -5,6 +5,8 @@ import { prisma } from "../db/client.js";
 import { loadEnv } from "../config/env.js";
 import { enqueueIndexJob, enqueueReviewJob } from "../queue/enqueue.js";
 import type { RepoConfig } from "../review/config.js";
+import { selectTrustedPullRequestIndexSha } from "../providers/bootstrapIndex.js";
+import { summarizeTrackedTrustedFeedback } from "../services/feedbackMetrics.js";
 
 const env = loadEnv();
 
@@ -33,9 +35,6 @@ type CycleMetrics = {
   retrieval: RepoConfig["retrieval"];
   tuned: boolean;
 };
-
-const POSITIVE = new Set(["thumbs_up", "+1", "heart", "hooray", "resolved"]);
-const NEGATIVE = new Set(["thumbs_down", "-1", "confused"]);
 
 const DEFAULT_RETRIEVAL: RepoConfig["retrieval"] = {
   topK: 18,
@@ -235,19 +234,11 @@ async function collectFeedback(repoId: number) {
     orderBy: { createdAt: "desc" },
     take: 400
   });
-
-  let positive = 0;
-  let negative = 0;
-  for (const item of feedback) {
-    if (item.type === "reaction" && item.sentiment) {
-      if (POSITIVE.has(item.sentiment)) positive += 1;
-      if (NEGATIVE.has(item.sentiment)) negative += 1;
-    }
-    if (item.type === "reply" && item.action && POSITIVE.has(item.action)) {
-      positive += 1;
-    }
-  }
-  return { positive, negative };
+  const summary = await summarizeTrackedTrustedFeedback(feedback, { repoId });
+  return {
+    positive: summary.positive,
+    negative: summary.negative
+  };
 }
 
 async function upsertRepoConfig(repoId: number, config: RepoConfig) {
@@ -368,14 +359,22 @@ async function main() {
     }
 
     if (cycle % forceIndexEvery === 0) {
-      await enqueueIndexJob({
-        provider: "github",
-        installationId,
-        repoId: target.repo.id,
-        headSha: pr.headSha,
-        force: true
+      const trustedRepoIndexSha = selectTrustedPullRequestIndexSha({
+        baseSha: pr.baseSha,
+        headSha: pr.headSha
       });
-      console.log(`[review-loop] cycle=${cycle} queued forced re-index for sha=${pr.headSha}`);
+      if (trustedRepoIndexSha) {
+        await enqueueIndexJob({
+          provider: "github",
+          installationId,
+          repoId: target.repo.id,
+          headSha: trustedRepoIndexSha,
+          force: true
+        });
+        console.log(
+          `[review-loop] cycle=${cycle} queued forced re-index for trusted sha=${trustedRepoIndexSha}`
+        );
+      }
     }
 
     const metric: CycleMetrics = {

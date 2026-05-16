@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+const MAX_IDE_PATTERN_QUERY_CHARS = 200;
+
 // ---------------------------------------------------------------------------
 // Tool argument schemas – pure definitions, no side effects
 // ---------------------------------------------------------------------------
@@ -14,18 +16,23 @@ export const toolSchemas = {
     prNumber: z.number().int().positive().describe("Pull request number")
   },
   pr_applySuggestion: {
+    repo: z.string().describe("Repository full name (owner/repo)"),
     findingId: z.number().int().positive().describe("Finding ID")
   },
   patterns_search: {
     repo: z.string().describe("Repository full name (owner/repo)"),
-    query: z.string().describe("Search query for pattern matching")
+    query: z
+      .string()
+      .min(1)
+      .max(MAX_IDE_PATTERN_QUERY_CHARS)
+      .describe("Search query for pattern matching")
   },
   standards_list: {
     repo: z.string().describe("Repository full name (owner/repo)")
   },
   standards_add: {
     repo: z.string().describe("Repository full name (owner/repo)"),
-    text: z.string().min(1).describe("Standard text to add")
+    text: z.string().min(1).max(220).describe("Standard text to add")
   },
   reports_weekly: {
     repo: z.string().describe("Repository full name (owner/repo)")
@@ -64,7 +71,7 @@ export const toolDefinitions = [
   },
   {
     name: "standards_add",
-    description: "Add a new repo standard",
+    description: "Submit a new repo standard for approval",
     schema: toolSchemas.standards_add
   },
   {

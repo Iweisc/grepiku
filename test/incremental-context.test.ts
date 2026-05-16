@@ -28,6 +28,7 @@ test("buildIncrementalReviewContext carries prior summary and open findings", ()
         summary: {
           overview: "Whole PR adds API and docs changes.",
           risk: "medium",
+          confidence: 0.81,
           key_concerns: ["API surface changed"],
           what_to_test: ["Custom tag flow"],
           file_breakdown: [{ path: "src/api.ts", summary: "Adds endpoint", risk: "medium" }]
@@ -73,10 +74,28 @@ test("buildIncrementalReviewContext carries prior summary and open findings", ()
   });
 
   assert.ok(context);
-  assert.equal(context.previous_run.summary?.overview, "Whole PR adds API and docs changes.");
-  assert.equal(context.previous_run.comments[0]?.title, "Validate metadata shape");
-  assert.equal(context.carried_open_findings[0]?.severity, "blocking");
-  assert.equal(context.carried_open_findings[0]?.rule_id, "api-contract");
+  assert.deepEqual(context.previous_run.summary, {
+    risk: "medium",
+    confidence: 0.81,
+    file_paths: ["src/api.ts"]
+  });
+  assert.deepEqual(context.previous_run.comments[0], {
+    path: "src/api.ts",
+    line: 12,
+    severity: "important",
+    category: "bug",
+    comment_type: "summary",
+    confidence: "high"
+  });
+  assert.deepEqual(context.carried_open_findings[0], {
+    path: "src/api.ts",
+    line: 12,
+    severity: "blocking",
+    category: "bug"
+  });
+  assert.equal("overview" in (context.previous_run.summary || {}), false);
+  assert.equal("title" in (context.previous_run.comments[0] || {}), false);
+  assert.equal("body" in (context.carried_open_findings[0] || {}), false);
 });
 
 test("buildIncrementalReviewContext falls back to summaryJson when finalJson is invalid", () => {
@@ -98,6 +117,10 @@ test("buildIncrementalReviewContext falls back to summaryJson when finalJson is 
   });
 
   assert.ok(context);
-  assert.equal(context.previous_run.summary?.overview, "Fallback whole-PR summary.");
+  assert.deepEqual(context.previous_run.summary, {
+    risk: "low",
+    confidence: null,
+    file_paths: []
+  });
   assert.deepEqual(context.previous_run.comments, []);
 });

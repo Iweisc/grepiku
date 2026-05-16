@@ -57,6 +57,33 @@ function normalizeSingleLine(value: string): string {
   return normalizeWhitespace(value).replace(/\s+/g, " ");
 }
 
+function trimIdentifierSeparators(value: string): string {
+  return value.replace(/^[-._]+/, "").replace(/[-._]+$/, "");
+}
+
+export function sanitizeCommentIdentifier(
+  value: string,
+  fallbackSeed: string,
+  maxLength = 64
+): string {
+  const normalized = normalizeSingleLine(value);
+  const candidate = trimIdentifierSeparators(
+    normalized.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[-._]{2,}/g, "-")
+  );
+  if (!candidate) {
+    return sha1(fallbackSeed).slice(0, Math.max(8, Math.min(maxLength, 12)));
+  }
+  if (candidate === normalized && candidate.length <= maxLength) {
+    return candidate;
+  }
+  const suffix = sha1(normalized || fallbackSeed).slice(0, 8);
+  const prefixLimit = Math.max(1, maxLength - suffix.length - 1);
+  const prefix =
+    trimIdentifierSeparators(candidate.slice(0, prefixLimit)) ||
+    sha1(fallbackSeed).slice(0, prefixLimit);
+  return `${prefix}-${suffix}`;
+}
+
 function isMeaningful(value: string): boolean {
   const normalized = normalizeWhitespace(value).toLowerCase();
   return !PLACEHOLDER_VALUES.has(normalized);
@@ -77,6 +104,8 @@ function normalizeSuggestedPatch(value?: string): string | undefined {
 }
 
 function normalizeComment(input: ReviewComment): ReviewComment {
+  const normalizedCommentId = normalizeSingleLine(input.comment_id);
+  const normalizedCommentKey = normalizeSingleLine(input.comment_key);
   const normalized: ReviewComment = {
     ...input,
     path: normalizePath(input.path),
@@ -85,19 +114,19 @@ function normalizeComment(input: ReviewComment): ReviewComment {
     evidence: normalizeWhitespace(input.evidence),
     suggested_patch: normalizeSuggestedPatch(input.suggested_patch),
     comment_type: commentTypeFor(input),
-    comment_id: normalizeSingleLine(input.comment_id),
-    comment_key: normalizeSingleLine(input.comment_key)
+    comment_id: normalizedCommentId,
+    comment_key: normalizedCommentKey
   };
-  if (!normalized.comment_id) {
-    normalized.comment_id = sha1(
-      `${normalized.path}|${normalized.side}|${normalized.line}|${normalized.title}`
-    ).slice(0, 12);
-  }
-  if (!normalized.comment_key) {
-    normalized.comment_key = sha1(
-      `${normalized.path}|${normalized.line}|${normalized.category}|${normalized.title}`
-    ).slice(0, 16);
-  }
+  normalized.comment_id = sanitizeCommentIdentifier(
+    normalized.comment_id,
+    `${normalized.path}|${normalized.side}|${normalized.line}|${normalized.title}`,
+    64
+  );
+  normalized.comment_key = sanitizeCommentIdentifier(
+    normalized.comment_key,
+    `${normalized.path}|${normalized.line}|${normalized.category}|${normalized.title}`,
+    80
+  );
   return normalized;
 }
 
