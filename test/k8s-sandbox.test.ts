@@ -220,6 +220,7 @@ test("Kubernetes sandbox does not upload prior out artifacts for reviewer stage"
 
 test("sandbox tar validation rejects traversal and external symlinks", () => {
   assert.equal(validateTarEntryPath("./src/index.ts"), "src/index.ts");
+  assert.equal(validateTarEntryPath("./.verifier-cache/"), ".verifier-cache");
   assert.throws(() => validateTarEntryPath("../secret"), /escapes target/);
   assert.throws(() => validateTarEntryPath("/etc/passwd"), /absolute/);
   assert.doesNotThrow(() =>

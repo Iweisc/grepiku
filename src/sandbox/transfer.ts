@@ -18,7 +18,10 @@ function isWithinRoot(root: string, candidate: string): boolean {
 }
 
 function normalizeRelativePath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/^\.\//, "");
+  return value
+    .replace(/\\/g, "/")
+    .replace(/^(?:\.\/)+/, "")
+    .replace(/\/+$/, "");
 }
 
 export function validateTarEntryPath(name: string): string {
