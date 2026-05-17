@@ -3,6 +3,7 @@ import { retrieveContext } from "../services/retrieval.js";
 import { normalizeDiffPath, normalizePath } from "./diff.js";
 import type { RepoConfig } from "./config.js";
 import { classifyChangedFileRisk, isStatefulReviewPath } from "./risk.js";
+import { buildGraphifyImpact } from "./graphifyContext.js";
 
 export type ContextPack = {
   query: string;
@@ -814,6 +815,8 @@ async function collectGraphImpact(params: {
 export async function buildContextPack(params: {
   repoId: number;
   diffPatch: string;
+  repoPath?: string;
+  headSha?: string | null;
   changedFiles: Array<{
     filename?: string;
     path?: string;
@@ -864,13 +867,33 @@ export async function buildContextPack(params: {
   });
 
   const graphStart = Date.now();
-  const graphImpact = await collectGraphImpact({
-    repoId: params.repoId,
-    changedPaths,
-    diffPatch: params.diffPatch,
-    traversal: params.graph?.traversal,
-    excludeDirs: params.graph?.exclude_dirs
-  });
+  const graphImpact =
+    params.repoPath && params.repoPath.trim().length > 0
+      ? await buildGraphifyImpact({
+          repoPath: params.repoPath,
+          headSha: params.headSha,
+          changedFiles: changedPaths,
+          graph: params.graph
+        }).catch((error: unknown) => {
+          console.warn("[context] graphify impact failed; falling back to internal graph", {
+            repoId: params.repoId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          return collectGraphImpact({
+            repoId: params.repoId,
+            changedPaths,
+            diffPatch: params.diffPatch,
+            traversal: params.graph?.traversal,
+            excludeDirs: params.graph?.exclude_dirs
+          });
+        })
+      : await collectGraphImpact({
+          repoId: params.repoId,
+          changedPaths,
+          diffPatch: params.diffPatch,
+          traversal: params.graph?.traversal,
+          excludeDirs: params.graph?.exclude_dirs
+        });
   graphImpact.debug.traversalMs = Date.now() - graphStart;
 
   const changedPathSet = new Set(changedPaths);

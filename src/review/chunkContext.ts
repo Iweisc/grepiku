@@ -206,6 +206,8 @@ export function chunkHasHighImpactHotspot(contextPack: ContextPack, chunk: Revie
 
 export async function buildContextPackForChunk(params: {
   repoId: number;
+  repoPath?: string;
+  headSha?: string | null;
   chunk: ReviewDiffChunk;
   config: RepoConfig;
   prTitle?: string | null;
@@ -218,6 +220,8 @@ export async function buildContextPackForChunk(params: {
     const contextPack = await buildContextPack({
       repoId: params.repoId,
       diffPatch: params.chunk.diffPatch,
+      repoPath: params.repoPath,
+      headSha: params.headSha,
       changedFiles: params.chunk.changedFiles as Array<{
         filename?: string;
         path?: string;

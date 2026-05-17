@@ -1195,6 +1195,8 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   const contextPack = await buildContextPack({
     repoId: repo.id,
     diffPatch,
+    repoPath,
+    headSha: refreshedPullRequestState.headSha,
     changedFiles: changedFiles as Array<{
       filename?: string;
       path?: string;

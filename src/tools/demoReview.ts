@@ -330,6 +330,8 @@ async function runDemoReviewerChunk(params: {
     params.contextMode === "production" && params.repoId > 0
       ? await buildContextPackForChunk({
           repoId: params.repoId,
+          repoPath: params.repoPath,
+          headSha: params.headSha,
           chunk: params.chunk,
           config: params.config,
           prTitle: params.prTitle,
@@ -502,6 +504,8 @@ async function main() {
     contextPack = await buildContextPack({
       repoId: args.repoId,
       diffPatch,
+      repoPath,
+      headSha,
       changedFiles: sanitizedChangedFiles as Array<{
         filename?: string;
         path?: string;

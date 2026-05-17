@@ -898,6 +898,8 @@ async function runReviewerChunk(params: {
   await fs.mkdir(chunkCodexHomeDir, { recursive: true });
   const chunkContextPack = await buildContextPackForChunk({
     repoId: params.repoId,
+    repoPath: params.repoPath,
+    headSha: params.headSha,
     chunk: params.chunk,
     config: params.resolvedConfig,
     prTitle: params.prTitle,
@@ -1377,6 +1379,8 @@ export async function processReviewJob(
     const contextPack = await buildContextPack({
       repoId: repo.id,
       diffPatch,
+      repoPath,
+      headSha: refreshedPullRequestState.headSha,
       changedFiles: changedFiles as Array<{
         filename?: string;
         path?: string;
