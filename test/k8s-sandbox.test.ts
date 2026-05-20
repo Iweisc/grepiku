@@ -96,6 +96,23 @@ test("Kubernetes sandbox pod spec is restricted and short lived", () => {
   assert.equal(envByName.get("GITHUB_PRIVATE_KEY"), "unused");
 });
 
+test("mention-check sandbox pod spec does not receive model credentials", () => {
+  const pod = buildSandboxPodSpec({
+    name: "grepiku-sandbox-checks",
+    image: "grepiku-sandbox:test",
+    serviceAccountName: "grepiku-sandbox",
+    env: sampleEnv(),
+    taskKind: "mention-checks"
+  });
+
+  const container = pod.spec?.containers?.[0];
+  const envByName = new Map((container?.env || []).map((item) => [item.name, item.value]));
+  assert.equal(envByName.get("OPENAI_COMPAT_API_KEY"), undefined);
+  assert.equal(envByName.get("OPENAI_COMPAT_BASE_URL"), undefined);
+  assert.equal(envByName.get("OPENAI_COMPAT_MODEL"), undefined);
+  assert.equal(envByName.get("DATABASE_URL"), "unused://sandbox");
+});
+
 test("Kubernetes sandbox task rewriting remaps prompt paths into /work roots", () => {
   const task = {
     kind: "codex-stage" as const,
@@ -165,7 +182,7 @@ test("Kubernetes sandbox seeds verifier out artifacts into /work/out", () => {
     {
       sourceDir: "/app/var/repos/demo",
       targetDir: SANDBOX_REPO_PATH,
-      excludeGit: false
+      excludeGit: true
     },
     {
       sourceDir: "/app/var/runs/9/bundle",
@@ -223,11 +240,20 @@ test("sandbox tar validation rejects traversal and external symlinks", () => {
   assert.equal(validateTarEntryPath("./.verifier-cache/"), ".verifier-cache");
   assert.throws(() => validateTarEntryPath("../secret"), /escapes target/);
   assert.throws(() => validateTarEntryPath("/etc/passwd"), /absolute/);
+  assert.throws(() => validateTarEntryPath("///"), /absolute/);
+  assert.throws(() => validateTarEntryPath("\\rooted"), /absolute/);
+  assert.throws(() => validateTarEntryPath("\\\\server\\share\\secret"), /absolute/);
+  assert.throws(() => validateTarEntryPath("C:\\tmp\\secret"), /absolute/);
+  assert.throws(() => validateTarEntryPath("src\\..\\secret"), /escapes target/);
   assert.doesNotThrow(() =>
     validateSymlinkTarget({ entryPath: "src/current", linkTarget: "../README.md" })
   );
   assert.throws(
-    () => validateSymlinkTarget({ entryPath: "src/current", linkTarget: "../../secret" }),
+    () => validateSymlinkTarget({ entryPath: "src/current", linkTarget: "..\\..\\secret" }),
+    /points outside/
+  );
+  assert.throws(
+    () => validateSymlinkTarget({ entryPath: "src/current", linkTarget: "\\\\server\\share\\secret" }),
     /points outside/
   );
 });

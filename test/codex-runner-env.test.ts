@@ -182,7 +182,7 @@ test("Kubernetes sandbox stage config uses local caches instead of backend secre
   assert.match(reviewerConfig, /RETRIEVAL_CONTEXT_PACK_PATH/);
   assert.doesNotMatch(reviewerConfig, /INTERNAL_API_KEY/);
   assert.match(verifierConfig, /VERIFIER_CACHE_DIR/);
-  assert.match(verifierConfig, /VERIFIER_REPO_COMMAND_MODE/);
+  assert.doesNotMatch(verifierConfig, /VERIFIER_REPO_COMMAND_MODE/);
   assert.doesNotMatch(verifierConfig, /DATABASE_URL/);
 });
 

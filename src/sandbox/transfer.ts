@@ -30,12 +30,22 @@ export function validateTarEntryPath(name: string): string {
     .replace(/\/+$/, "");
 }
 
+function isAbsoluteArchivePath(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return (
+    path.isAbsolute(value) ||
+    path.posix.isAbsolute(normalized) ||
+    /^[A-Za-z]:\//.test(normalized)
+  );
+}
+
 export function validateTarEntryPath(name: string): string {
-  const normalized = normalizeRelativePath(name.trim());
-  if (!normalized || normalized === ".") return ".";
-  if (path.isAbsolute(normalized)) {
+  const raw = name.trim();
+  if (isAbsoluteArchivePath(raw)) {
     throw new Error(`sandbox tar entry path is absolute: ${name}`);
   }
+  const normalized = normalizeRelativePath(raw);
+  if (!normalized || normalized === ".") return ".";
   const parts = normalized.split("/");
   if (parts.some((part) => part === ".." || part.length === 0)) {
     throw new Error(`sandbox tar entry path escapes target: ${name}`);
@@ -48,11 +58,11 @@ export function validateSymlinkTarget(params: {
   linkTarget: string;
 }): void {
   const normalizedEntry = validateTarEntryPath(params.entryPath);
-  if (path.isAbsolute(params.linkTarget)) {
+  if (isAbsoluteArchivePath(params.linkTarget)) {
     throw new Error(`sandbox tar symlink ${normalizedEntry} points outside target`);
   }
   const parent = normalizedEntry === "." ? "." : path.posix.dirname(normalizedEntry);
-  const resolved = path.posix.normalize(path.posix.join(parent, params.linkTarget));
+  const resolved = path.posix.normalize(path.posix.join(parent, params.linkTarget.replace(/\\/g, "/")));
   if (resolved === ".." || resolved.startsWith("../")) {
     throw new Error(`sandbox tar symlink ${normalizedEntry} points outside target`);
   }
@@ -219,6 +229,7 @@ export async function syncSandboxRepoBack(params: {
 
 export const __sandboxTransferInternals = {
   isWithinRoot,
+  isAbsoluteArchivePath,
   normalizeRelativePath,
   shouldSkipRelativePath
 };

@@ -3,16 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildGraphifyImpact, __graphifyContextInternals } from "../src/review/graphifyContext.js";
 
-test("graphifyGraphPath resolves under repo graphify-out", () => {
-  assert.equal(
-    __graphifyContextInternals.graphifyGraphPath("/tmp/demo-repo"),
-    "/tmp/demo-repo/graphify-out/graph.json"
-  );
-});
-
-test("buildGraphifyImpact converts review-context output into Grepiku graph impact shape", async () => {
+function setupGraphifyTestEnv() {
   process.env.DATABASE_URL ||= "postgresql://unused";
   process.env.REDIS_URL ||= "redis://unused";
   process.env.GITHUB_APP_ID ||= "0";
@@ -20,36 +12,63 @@ test("buildGraphifyImpact converts review-context output into Grepiku graph impa
   process.env.GITHUB_WEBHOOK_SECRET ||= "unused";
   process.env.OPENAI_COMPAT_BASE_URL ||= "https://example.test/v1";
   process.env.OPENAI_COMPAT_API_KEY ||= "unused";
-  process.env.PROJECT_ROOT ||= "/tmp/grepiku-test";
+  process.env.PROJECT_ROOT ||= path.join(os.tmpdir(), "grepiku-test");
+}
 
+async function loadGraphifyContext() {
+  setupGraphifyTestEnv();
+  return await import("../src/review/graphifyContext.js");
+}
+
+test("graphifyGraphPath resolves outside the repo checkout", async () => {
+  const { __graphifyContextInternals } = await loadGraphifyContext();
+  const repoPath = "/tmp/demo-repo";
+  const outDir = __graphifyContextInternals.graphifyOutDir(repoPath);
+  const graphPath = __graphifyContextInternals.graphifyGraphPath(repoPath);
+
+  assert.equal(graphPath, path.join(outDir, "graph.json"));
+  assert.equal(path.relative(repoPath, outDir).startsWith(".."), true);
+  assert.match(outDir, /var\/graphify\//);
+});
+
+test("buildGraphifyImpact converts review-context output into Grepiku graph impact shape", async () => {
+  const { buildGraphifyImpact, __graphifyContextInternals } = await loadGraphifyContext();
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-graphify-impact-"));
   const repoPath = path.join(root, "repo");
-  const outDir = path.join(repoPath, "graphify-out");
-  await fs.mkdir(outDir, { recursive: true });
+  const graphPath = __graphifyContextInternals.graphifyGraphPath(repoPath);
+  const graphDir = path.dirname(graphPath);
+  const fakePythonBin = path.join(root, "fake-graphify-python.js");
+  const previousPythonBin = process.env.GRAPHIFY_PYTHON_BIN;
 
-  const graph = {
-    directed: true,
-    multigraph: false,
-    graph: {},
-    built_at_commit: "abc123",
-    nodes: [
-      { id: "api_file", label: "api.py", source_file: "src/api.py", community: 0 },
-      { id: "api_handler", label: "handle_pr", source_file: "src/api.py", community: 0 },
-      { id: "service_file", label: "service.py", source_file: "src/service.py", community: 0 },
-      { id: "service_fn", label: "plan_context", source_file: "src/service.py", community: 0 },
-      { id: "db_file", label: "db.py", source_file: "src/db.py", community: 1 },
-      { id: "db_fn", label: "load_graph", source_file: "src/db.py", community: 1 }
-      ,{ id: "helper_file", label: "helper.py", source_file: "internal_harness/helper.py", community: 2 }
-    ],
-    links: [
-      { source: "api_handler", target: "service_fn", relation: "calls", confidence: "EXTRACTED" },
-      { source: "service_fn", target: "db_fn", relation: "imports", confidence: "EXTRACTED" },
-      { source: "api_file", target: "service_file", relation: "imports", confidence: "EXTRACTED" },
-      { source: "service_file", target: "db_file", relation: "imports", confidence: "EXTRACTED" },
-      { source: "api_file", target: "helper_file", relation: "calls", confidence: "EXTRACTED" }
-    ]
-  };
-  await fs.writeFile(path.join(outDir, "graph.json"), JSON.stringify(graph, null, 2), "utf8");
+  await fs.mkdir(repoPath, { recursive: true });
+  await fs.mkdir(graphDir, { recursive: true });
+  await fs.writeFile(
+    graphPath,
+    JSON.stringify({ built_at_commit: "abc123", nodes: [], links: [] }, null, 2),
+    "utf8"
+  );
+  await fs.writeFile(
+    fakePythonBin,
+    `#!/usr/bin/env node
+const output = {
+  changed_files: ["src/api.py"],
+  summary: { seed_nodes: 1, visited_nodes: 3, max_depth: 4, max_related_files: 8 },
+  related_files: [
+    { path: "src/service.py", score: 0.9, depth: 1, via: ["src/api.py -> src/service.py"] },
+    { path: "src/db.py", score: 0.6, depth: 2, via: ["src/service.py -> src/db.py"] },
+    { path: "internal_harness/helper.py", score: 0.8, depth: 1, via: [] }
+  ],
+  graph_links: [
+    { from: "src/api.py", to: "src/service.py", relation: "imports", score: 0.9 },
+    { from: "src/service.py", to: "src/db.py", relation: "imports", score: 0.6 },
+    { from: "src/api.py", to: "internal_harness/helper.py", relation: "calls", score: 0.8 }
+  ]
+};
+process.stdout.write(JSON.stringify(output));
+`,
+    { mode: 0o755 }
+  );
+  process.env.GRAPHIFY_PYTHON_BIN = fakePythonBin;
 
   try {
     const impact = await buildGraphifyImpact({
@@ -78,6 +97,12 @@ test("buildGraphifyImpact converts review-context output into Grepiku graph impa
     assert.equal(impact.debug.minScore, 0.5);
     assert.equal(impact.options.max_related_files, 8);
   } finally {
+    if (previousPythonBin === undefined) {
+      delete process.env.GRAPHIFY_PYTHON_BIN;
+    } else {
+      process.env.GRAPHIFY_PYTHON_BIN = previousPythonBin;
+    }
+    await fs.rm(graphDir, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });
   }
 });

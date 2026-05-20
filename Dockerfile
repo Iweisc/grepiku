@@ -3,7 +3,12 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-FROM rust:1.91-slim-bookworm AS codex-build
+FROM node:20-trixie AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+FROM rust:1.93-slim-bookworm AS codex-build
 WORKDIR /app
 RUN apt-get update \
   && apt-get install -y build-essential pkg-config libcap-dev libssl-dev perl ca-certificates \
@@ -22,14 +27,15 @@ FROM node:20-trixie AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV GRAPHIFY_PYTHON_BIN=/opt/graphify-venv/bin/python
+ARG GRAPHIFY_REF=96c757496cfe8dae027639c7c8a53d874c3d7e5b
 RUN apt-get update \
   && apt-get install -y ripgrep git ca-certificates libcap2 python3 python3-pip python3-venv \
   && python3 -m venv /opt/graphify-venv \
   && /opt/graphify-venv/bin/pip install --no-cache-dir --upgrade pip \
-  && /opt/graphify-venv/bin/pip install --no-cache-dir "git+https://github.com/Iweisc/graphify.git@grepiku-review-context#egg=graphifyy" \
+  && /opt/graphify-venv/bin/pip install --no-cache-dir "git+https://github.com/Iweisc/graphify.git@${GRAPHIFY_REF}#egg=graphifyy" \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=codex-build /app/internal_harness/codex-slim/target/release/codex-exec /usr/local/bin/codex-exec
-COPY --from=deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=build /app/dist ./dist

@@ -59,20 +59,33 @@ function asText(text) {
   return { content: [{ type: "text", text }] };
 }
 
+async function pathExists(filePath) {
+  try {
+    await fs.stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function copyRepoTreeWithoutGit() {
+  await fs.mkdir(workspacePaths.stateRoot, { recursive: true });
+  await fs.rm(repoRw, { recursive: true, force: true }).catch(() => undefined);
+  await fs.cp(repoRoot, repoRw, {
+    recursive: true,
+    force: true,
+    dereference: false,
+    errorOnExist: false,
+    preserveTimestamps: true,
+    verbatimSymlinks: true
+  });
+  await fs.rm(path.join(repoRw, ".git"), { recursive: true, force: true }).catch(() => undefined);
+  await assertWorkspaceHasNoExternalSymlinks(repoRw, "verifier workspace");
+}
+
 async function ensureRepoWritable() {
-  if (directRepoCommandMode) {
-    await fs.mkdir(workspacePaths.stateRoot, { recursive: true });
-    await fs.rm(repoRw, { recursive: true, force: true }).catch(() => undefined);
-    await fs.cp(repoRoot, repoRw, {
-      recursive: true,
-      force: true,
-      dereference: false,
-      errorOnExist: false,
-      preserveTimestamps: true,
-      verbatimSymlinks: true
-    });
-    await fs.rm(path.join(repoRw, ".git"), { recursive: true, force: true }).catch(() => undefined);
-    await assertWorkspaceHasNoExternalSymlinks(repoRw, "verifier workspace");
+  if (directRepoCommandMode || !(await pathExists(path.join(repoRoot, ".git")))) {
+    await copyRepoTreeWithoutGit();
     return;
   }
   try {

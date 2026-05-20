@@ -251,9 +251,7 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
               WORK_REPO_ROOT: params.repoPath,
               WORK_BUNDLE_ROOT: params.bundleDir,
               WORK_OUT_ROOT: params.outDir,
-              VERIFIER_CACHE_DIR: path.join(params.outDir, ".verifier-cache"),
-              VERIFIER_REPO_COMMAND_MODE: "direct",
-              REVIEW_RUN_ID: String(params.reviewRunId)
+              VERIFIER_CACHE_DIR: path.join(params.outDir, ".verifier-cache")
             }
           : {
               WORK_REPO_ROOT: params.repoPath,

@@ -90,8 +90,8 @@ async function resolveNamespace(env: Env): Promise<string> {
   throw new Error("K8S_NAMESPACE is required outside an in-cluster service account");
 }
 
-function baseSandboxEnv(env: Env): Array<{ name: string; value: string }> {
-  return [
+function baseSandboxEnv(env: Env, taskKind: string): Array<{ name: string; value: string }> {
+  const values = [
     { name: "NODE_ENV", value: "production" },
     { name: "SANDBOX_EXECUTION_MODE", value: "local" },
     { name: "PROJECT_ROOT", value: "/app" },
@@ -100,16 +100,21 @@ function baseSandboxEnv(env: Env): Array<{ name: string; value: string }> {
     { name: "GITHUB_APP_ID", value: "0" },
     { name: "GITHUB_PRIVATE_KEY", value: "unused" },
     { name: "GITHUB_WEBHOOK_SECRET", value: "unused" },
-    { name: "OPENAI_COMPAT_BASE_URL", value: env.openaiBaseUrl },
-    { name: "OPENAI_COMPAT_API_KEY", value: env.openaiApiKey },
-    { name: "OPENAI_COMPAT_MODEL", value: env.openaiModel },
-    { name: "OPENAI_TIMEOUT_MS", value: String(env.openaiTimeoutMs) },
-    { name: "OPENAI_MAX_RETRIES", value: String(env.openaiMaxRetries) },
     { name: "CODEX_STAGE_TIMEOUT_MS", value: String(env.codexStageTimeoutMs) },
     { name: "CODEX_MODEL_REASONING_EFFORT", value: env.codexModelReasoningEffort },
     { name: "CODEX_STAGE_LOG_OUTPUT", value: String(env.codexStageLogOutput) },
     { name: "CODEX_EXEC_PATH", value: "/usr/local/bin/codex-exec" }
   ];
+  if (taskKind !== "mention-checks") {
+    values.push(
+      { name: "OPENAI_COMPAT_BASE_URL", value: env.openaiBaseUrl },
+      { name: "OPENAI_COMPAT_API_KEY", value: env.openaiApiKey },
+      { name: "OPENAI_COMPAT_MODEL", value: env.openaiModel },
+      { name: "OPENAI_TIMEOUT_MS", value: String(env.openaiTimeoutMs) },
+      { name: "OPENAI_MAX_RETRIES", value: String(env.openaiMaxRetries) }
+    );
+  }
+  return values;
 }
 
 export function buildSandboxPodSpec(params: {
@@ -160,7 +165,7 @@ export function buildSandboxPodSpec(params: {
           image: params.image,
           imagePullPolicy: "IfNotPresent",
           command: ["sh", "-lc", "mkdir -p /work/repo /work/bundle /work/out /work/codex-home /work/tool-home/.tmp && sleep 3600"],
-          env: baseSandboxEnv(params.env),
+          env: baseSandboxEnv(params.env, params.taskKind),
           volumeMounts: [
             {
               name: SANDBOX_WORK_VOLUME_NAME,
@@ -360,7 +365,16 @@ async function tarToPod(params: {
   const listDir = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-sandbox-tar-list-"));
   const listPath = path.join(listDir, "files");
   await fs.writeFile(listPath, `${entries.map((entry) => entry.path).join("\0")}\0`, "utf8");
-  const tarArgs = ["-cf", "-", "-C", params.sourceDir, "--null", "--files-from", listPath];
+  const tarArgs = [
+    "--no-recursion",
+    "-cf",
+    "-",
+    "-C",
+    params.sourceDir,
+    "--null",
+    "--files-from",
+    listPath
+  ];
   if (params.excludeGit) {
     tarArgs.splice(0, 0, "--exclude=.git");
   }
@@ -560,13 +574,17 @@ function shouldSeedSandboxOutDir(task: SandboxTask): boolean {
   return task.kind === "codex-stage" && task.params.stage === "verifier";
 }
 
+function shouldPreserveGitMetadata(request: KubernetesSandboxRequest): boolean {
+  return Boolean(request.includeGit && request.task.kind === "mention-implementation-sync");
+}
+
 function buildSandboxUploadPlan(request: KubernetesSandboxRequest): SandboxUploadPlanEntry[] {
   const uploads: SandboxUploadPlanEntry[] = [];
   if (request.localRepoPath) {
     uploads.push({
       sourceDir: request.localRepoPath,
       targetDir: SANDBOX_REPO_PATH,
-      excludeGit: !request.includeGit
+      excludeGit: !shouldPreserveGitMetadata(request)
     });
   }
   if (request.localBundleDir) {
@@ -656,7 +674,7 @@ async function runKubernetesSandbox(request: KubernetesSandboxRequest): Promise<
       originalEntries = await collectLocalTreeEntries({
         root: request.localRepoPath,
         maxBytes: env.k8sSandboxTarMaxBytes,
-        excludeGit: !request.includeGit
+        excludeGit: !shouldPreserveGitMetadata(request)
       });
     }
     for (const upload of buildSandboxUploadPlan(request)) {
@@ -740,7 +758,7 @@ export async function runCodexStageInKubernetes(params: CodexRunParams): Promise
     localBundleDir: params.bundleDir,
     localOutDir: params.outDir,
     syncRepoBack: params.stage === "mention",
-    includeGit: params.stage !== "mention"
+    includeGit: false
   });
   if (!result.metrics) {
     throw new Error("sandbox codex stage did not return metrics");
@@ -770,7 +788,7 @@ export async function runMentionChecksInKubernetes(params: {
     task: { kind: "mention-checks", tools: params.tools },
     localRepoPath: params.repoPath,
     localOutDir: params.outDir,
-    includeGit: true
+    includeGit: false
   });
   if (!result.mentionChecks) {
     throw new Error("sandbox mention checks did not return results");
@@ -789,5 +807,6 @@ export const __k8sSandboxInternals = {
   rewriteTaskForPod,
   rewritePromptPaths,
   shouldSeedSandboxOutDir,
+  shouldPreserveGitMetadata,
   buildSandboxUploadPlan
 };

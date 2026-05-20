@@ -3,4 +3,5 @@ dist/
 .env
 prisma/dev.db
 var/
+graphify-out/
 codex/

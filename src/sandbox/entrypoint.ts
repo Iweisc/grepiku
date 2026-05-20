@@ -1,8 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
-import { runCodexStageLocal } from "../runner/codexRunner.js";
-import { runDirectModelStageLocal } from "../runner/directModelRunner.js";
 import type { MentionChecksOutput } from "../review/schemas.js";
 import type { RepoConfig, ToolConfig } from "../review/config.js";
 import {
@@ -81,13 +79,22 @@ async function runTool(toolConfig: ToolConfig | undefined): Promise<MentionToolR
     const child = spawn("/bin/sh", ["-lc", toolConfig.cmd], {
       cwd: SANDBOX_REPO_PATH,
       env: buildToolEnv(),
+      detached: true,
       stdio: ["ignore", "ignore", "pipe"]
     });
     let hadStderr = false;
     let settled = false;
     const timeout = setTimeout(() => {
       settled = true;
-      child.kill("SIGKILL");
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      } else {
+        child.kill("SIGKILL");
+      }
       resolve(resultForExit({ exitCode: child.exitCode, timedOut: true, hadStderr, timeoutSec }));
     }, timeoutSec * 1000);
     child.stderr.on("data", () => {
@@ -123,8 +130,10 @@ async function main(): Promise<void> {
   const task = JSON.parse(await fs.readFile(SANDBOX_TASK_PATH, "utf8")) as SandboxTask;
   let result: SandboxTaskResult;
   if (task.kind === "codex-stage" || task.kind === "mention-implementation-sync") {
+    const { runCodexStageLocal } = await import("../runner/codexRunner.js");
     result = { metrics: await runCodexStageLocal(task.params) };
   } else if (task.kind === "direct-model-stage") {
+    const { runDirectModelStageLocal } = await import("../runner/directModelRunner.js");
     result = { metrics: await runDirectModelStageLocal(task.params) };
   } else if (task.kind === "mention-checks") {
     result = { mentionChecks: await runMentionChecks(task.tools) };

@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
@@ -50,7 +51,7 @@ export type GraphifyImpact = {
   options: NonNullable<RepoConfig["graph"]["traversal"]>;
 };
 
-const GRAPHIFY_OUT_DIR = "graphify-out";
+const GRAPHIFY_CACHE_DIR = "graphify";
 const GRAPHIFY_COMMIT_STAMP = ".grepiku-graphify-head";
 const inflightGraphBuilds = new Map<string, Promise<string>>();
 
@@ -59,12 +60,21 @@ function graphifyPythonBin(): string {
   return configured && configured.length > 0 ? configured : "python3";
 }
 
+function graphifyOutDir(repoPath: string): string {
+  const cacheKey = crypto
+    .createHash("sha256")
+    .update(path.resolve(repoPath))
+    .digest("hex")
+    .slice(0, 24);
+  return path.join(loadEnv().projectRoot, "var", GRAPHIFY_CACHE_DIR, cacheKey);
+}
+
 function graphifyGraphPath(repoPath: string): string {
-  return path.join(repoPath, GRAPHIFY_OUT_DIR, "graph.json");
+  return path.join(graphifyOutDir(repoPath), "graph.json");
 }
 
 function graphifyCommitStampPath(repoPath: string): string {
-  return path.join(repoPath, GRAPHIFY_OUT_DIR, GRAPHIFY_COMMIT_STAMP);
+  return path.join(graphifyOutDir(repoPath), GRAPHIFY_COMMIT_STAMP);
 }
 
 async function readGraphCommit(graphPath: string): Promise<string | null> {
@@ -117,7 +127,7 @@ async function ensureGraphifyGraph(params: { repoPath: string; headSha?: string 
       timeout: env.codexStageTimeoutMs,
       env: {
         ...process.env,
-        GRAPHIFY_OUT: GRAPHIFY_OUT_DIR,
+        GRAPHIFY_OUT: graphifyOutDir(repoPath),
         PYTHONUNBUFFERED: "1"
       }
     });
@@ -224,7 +234,7 @@ export async function buildGraphifyReviewContext(params: {
         timeout: loadEnv().codexStageTimeoutMs,
         env: {
           ...process.env,
-          GRAPHIFY_OUT: GRAPHIFY_OUT_DIR,
+          GRAPHIFY_OUT: graphifyOutDir(params.repoPath),
           PYTHONUNBUFFERED: "1"
         }
       }
@@ -283,6 +293,7 @@ export async function buildGraphifyImpact(params: {
 }
 
 export const __graphifyContextInternals = {
+  graphifyOutDir,
   graphifyGraphPath,
   graphifyCommitStampPath,
   graphifyPythonBin,
