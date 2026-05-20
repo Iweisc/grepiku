@@ -280,13 +280,11 @@ spec:
           env:
             - name: NODE_ENV
               value: production
-            - name: REDIS_PASSWORD
+            - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: grepiku-env
-                  key: REDIS_PASSWORD
-            - name: REDIS_URL
-              value: redis://:$(REDIS_PASSWORD)@grepiku-redis:6379
+                  key: REDIS_URL
           envFrom:
             - secretRef:
                 name: grepiku-env
@@ -341,13 +339,11 @@ spec:
           env:
             - name: NODE_ENV
               value: production
-            - name: REDIS_PASSWORD
+            - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: grepiku-env
-                  key: REDIS_PASSWORD
-            - name: REDIS_URL
-              value: redis://:$(REDIS_PASSWORD)@grepiku-redis:6379
+                  key: REDIS_URL
             - name: REVIEW_WORKER_CONCURRENCY
               value: "1"
             - name: SANDBOX_EXECUTION_MODE
