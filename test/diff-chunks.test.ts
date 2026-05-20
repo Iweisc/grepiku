@@ -359,3 +359,55 @@ test("mergeChunkReviewDrafts preserves full chunk comments with unique ids", () 
     "chunk-02:same-id"
   ]);
 });
+
+test("mergeChunkReviewDrafts produces a compact overview for large chunked reviews", () => {
+  const chunks: ReviewDiffChunk[] = [
+    {
+      id: "chunk-01",
+      ordinal: 0,
+      paths: ["docker-compose.yml", "Dockerfile"],
+      diffPatch: "",
+      changedFiles: [],
+      changedLines: 200,
+      additions: 200,
+      deletions: 0,
+      risk: "high"
+    },
+    {
+      id: "chunk-02",
+      ordinal: 1,
+      paths: ["src/review/pipeline.ts"],
+      diffPatch: "",
+      changedFiles: [],
+      changedLines: 120,
+      additions: 120,
+      deletions: 0,
+      risk: "high"
+    },
+    {
+      id: "chunk-03",
+      ordinal: 2,
+      paths: ["src/review/diffChunks.ts"],
+      diffPatch: "",
+      changedFiles: [],
+      changedLines: 80,
+      additions: 80,
+      deletions: 0,
+      risk: "medium"
+    }
+  ];
+
+  const merged = mergeChunkReviewDrafts({
+    drafts: [
+      { chunk: chunks[0]!, review: makeReview("a", "high") },
+      { chunk: chunks[1]!, review: makeReview("b", "high") },
+      { chunk: chunks[2]!, review: makeReview("c", "medium") }
+    ],
+    maxKeyConcerns: 4
+  });
+
+  assert.match(merged.summary.overview, /^Top review findings: issue a; issue b; issue c\.$/);
+  assert.doesNotMatch(merged.summary.overview, /Large PR reviewed/);
+  assert.doesNotMatch(merged.summary.overview, /Highest-risk areas:/);
+  assert.doesNotMatch(merged.summary.overview, /chunk-01 \(/);
+});

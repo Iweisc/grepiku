@@ -1,0 +1,435 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: grepiku-postgres
+  namespace: ns-0kkzfz
+  labels:
+    app: grepiku
+    component: postgres
+spec:
+  selector:
+    app: grepiku
+    component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: grepiku-postgres
+  namespace: ns-0kkzfz
+spec:
+  serviceName: grepiku-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grepiku
+      component: postgres
+  template:
+    metadata:
+      labels:
+        app: grepiku
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: postgres
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-db
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-db
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-db
+                  key: POSTGRES_DB
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-lc", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-lc", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grepiku-redis
+  namespace: ns-0kkzfz
+  labels:
+    app: grepiku
+    component: redis
+spec:
+  selector:
+    app: grepiku
+    component: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grepiku-redis
+  namespace: ns-0kkzfz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grepiku
+      component: redis
+  template:
+    metadata:
+      labels:
+        app: grepiku
+        component: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          imagePullPolicy: IfNotPresent
+          args: ["--appendonly", "yes", "--appendfsync", "everysec", "--requirepass", "$(REDIS_PASSWORD)"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-env
+                  key: REDIS_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: grepiku-redis-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grepiku-redis-data
+  namespace: ns-0kkzfz
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grepiku-web
+  namespace: ns-0kkzfz
+  labels:
+    app: grepiku
+    component: web
+spec:
+  selector:
+    app: grepiku
+    component: web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grepiku-migrate-dev-829e0f5-20260517175546
+  namespace: ns-0kkzfz
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: grepiku
+        component: migrate
+    spec:
+      imagePullSecrets:
+        - name: grepiku-regcred
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -lc
+            - until pg_isready -h grepiku-postgres -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 2; done
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-db
+                  key: POSTGRES_USER
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-db
+                  key: POSTGRES_DB
+      containers:
+        - name: migrate
+          image: ghcr.io/iweisc/grepiku:dev-829e0f5-20260517175546
+          imagePullPolicy: Always
+          command: ["sh", "-lc", "node_modules/.bin/prisma migrate deploy"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          envFrom:
+            - secretRef:
+                name: grepiku-env
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grepiku-web
+  namespace: ns-0kkzfz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grepiku
+      component: web
+  template:
+    metadata:
+      labels:
+        app: grepiku
+        component: web
+    spec:
+      imagePullSecrets:
+        - name: grepiku-regcred
+      containers:
+        - name: web
+          image: ghcr.io/iweisc/grepiku:dev-829e0f5-20260517175546
+          imagePullPolicy: Always
+          command: ["node", "dist/server.js"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-env
+                  key: REDIS_URL
+          envFrom:
+            - secretRef:
+                name: grepiku-env
+          ports:
+            - containerPort: 3000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grepiku-worker
+  namespace: ns-0kkzfz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grepiku
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: grepiku
+        component: worker
+    spec:
+      serviceAccountName: grepiku-worker
+      imagePullSecrets:
+        - name: grepiku-regcred
+      containers:
+        - name: worker
+          image: ghcr.io/iweisc/grepiku:dev-829e0f5-20260517175546
+          imagePullPolicy: Always
+          command: ["node", "dist/worker.js"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: grepiku-env
+                  key: REDIS_URL
+            - name: REVIEW_WORKER_CONCURRENCY
+              value: "1"
+            - name: SANDBOX_EXECUTION_MODE
+              value: kubernetes
+            - name: K8S_NAMESPACE
+              value: ns-0kkzfz
+            - name: K8S_SANDBOX_IMAGE
+              value: ghcr.io/iweisc/grepiku-sandbox:dev-829e0f5-20260517175546
+            - name: K8S_SANDBOX_SERVICE_ACCOUNT
+              value: grepiku-sandbox
+            - name: K8S_SANDBOX_IMAGE_PULL_SECRET
+              value: grepiku-regcred
+          envFrom:
+            - secretRef:
+                name: grepiku-env
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grepiku-worker
+  namespace: ns-0kkzfz
+imagePullSecrets:
+  - name: grepiku-regcred
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grepiku-sandbox
+  namespace: ns-0kkzfz
+imagePullSecrets:
+  - name: grepiku-regcred
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grepiku-sandbox-pods
+  namespace: ns-0kkzfz
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grepiku-worker-sandbox-pods
+  namespace: ns-0kkzfz
+subjects:
+  - kind: ServiceAccount
+    name: grepiku-worker
+    namespace: ns-0kkzfz
+roleRef:
+  kind: Role
+  name: grepiku-sandbox-pods
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grepiku-ingress
+  namespace: ns-0kkzfz
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: 20m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grepiku-ns-0kkzfz.usw-1.sealos.app
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grepiku-web
+                port:
+                  number: 3000
+  tls:
+    - hosts:
+        - grepiku-ns-0kkzfz.usw-1.sealos.app

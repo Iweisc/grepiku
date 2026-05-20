@@ -43,6 +43,7 @@ import { ReviewOutput, VerdictsOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
 import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
+import { buildReviewJobId } from "../queue/jobId.js";
 import { resolveRules } from "./triggers.js";
 import { buildContextPack, type ContextPack } from "./context.js";
 import { getFeedbackPolicy, FeedbackPolicy } from "../services/feedback.js";
@@ -65,7 +66,7 @@ import {
 } from "./coverage.js";
 import { sanitizeGitHubMarkdownText } from "./githubMarkdown.js";
 import { normalizeSuggestedPatchText, stripEdgeBlankLines } from "./text.js";
-import { shouldRunVerifierForPullRequest } from "../providers/pullRequestGuards.js";
+import { shouldRunVerifierForPullRequest, shouldSkipReviewForSelfAuthoredPullRequest } from "../providers/pullRequestGuards.js";
 import { selectTrustedPullRequestIndexSha } from "../providers/bootstrapIndex.js";
 import { resolveGithubBotLogin } from "../providers/github/adapter.js";
 import { mergeStoredPullRequestState } from "./pullRequestState.js";
@@ -91,6 +92,74 @@ const CHUNKED_REVIEW_MIN_CHANGED_LINES = 16_000;
 const CHUNKED_REVIEW_TARGET_CHANGED_LINES = 6_000;
 const CHUNKED_REVIEW_MAX_CHANGED_LINES = 7_000;
 const CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 3_000;
+
+function shouldRecoverRunningDuplicateRun(params: {
+  duplicateRunStatus: string;
+  currentJobId?: string | null;
+  expectedJobId?: string | null;
+}): boolean {
+  return (
+    params.duplicateRunStatus === "running" &&
+    Boolean(params.currentJobId) &&
+    Boolean(params.expectedJobId) &&
+    params.currentJobId === params.expectedJobId
+  );
+}
+
+function shouldSkipDuplicateReviewRun(params: {
+  duplicateRunStatus: string;
+  currentJobId?: string | null;
+  expectedJobId?: string | null;
+}): boolean {
+  if (params.duplicateRunStatus === "completed") {
+    return true;
+  }
+  if (params.duplicateRunStatus === "running") {
+    return !shouldRecoverRunningDuplicateRun(params);
+  }
+  return false;
+}
+
+async function failInterruptedDuplicateRun(params: {
+  runId: number;
+  client: { updateStatusCheck: (checkId: string, check: ProviderStatusCheck) => Promise<ProviderStatusCheck> };
+}): Promise<void> {
+  const completedAt = new Date();
+  const staleChecks = await prisma.statusCheck.findMany({
+    where: { reviewRunId: params.runId, status: "in_progress" }
+  });
+
+  for (const statusCheck of staleChecks) {
+    if (statusCheck.providerCheckId) {
+      try {
+        await params.client.updateStatusCheck(statusCheck.providerCheckId, {
+          name: statusCheck.name,
+          status: "completed",
+          conclusion: "failure",
+          summary: "Review interrupted",
+          text: "A previous review worker stopped before finishing this run. Grepiku is retrying the review.",
+          detailsUrl: statusCheck.detailsUrl || undefined
+        });
+      } catch (error) {
+        console.warn(
+          `[run ${params.runId}] failed to close interrupted check ${statusCheck.providerCheckId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+    await prisma.statusCheck.update({
+      where: { id: statusCheck.id },
+      data: { status: "completed", conclusion: "failure" }
+    });
+  }
+
+  await prisma.reviewRun.update({
+    where: { id: params.runId },
+    data: { status: "failed", completedAt }
+  });
+}
+
 const CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 3_800;
 const CHUNKED_REVIEW_MAX_FILES = 240;
 const CHUNKED_REVIEW_MAX_PARALLEL = 48;
@@ -361,35 +430,43 @@ function renderStatusComment(params: {
     return `**${name}**: ${result.status} - ${sanitizeGitHubMarkdownText(result.summary)}\n${errors}`;
   };
 
-  return [
+  const lines = [
     "## AI Review Status",
     "",
-    `**Overview:** ${sanitizeGitHubMarkdownText(summary.overview)}`,
-    `**Risk:** ${sanitizeGitHubMarkdownText(summary.risk)}`,
-    summary.confidence !== undefined ? `**Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : "",
-    params.run ? `**Run:** #${params.run.id} (\`${params.run.headSha.slice(0, 12)}\`)` : "",
+    `- **Overview:** ${sanitizeGitHubMarkdownText(summary.overview)}`,
+    `- **Risk:** ${sanitizeGitHubMarkdownText(summary.risk)}`,
+    summary.confidence !== undefined ? `- **Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : "",
+    params.run ? `- **Run:** #${params.run.id} (\`${params.run.headSha.slice(0, 12)}\`)` : "",
+    ""
+  ].filter(Boolean);
+
+  lines.push("### New Findings", renderList(newFindings), "");
+
+  if (openFindings.length > 0) {
+    lines.push("### Open Findings", renderList(openFindings), "");
+  }
+
+  if (fixedFindings.length > 0) {
+    lines.push("### Fixed Findings", renderFixed(), "");
+  }
+
+  if (warnings && warnings.length > 0) {
+    lines.push("### Config Warnings", warnings.map((w) => `- ${sanitizeGitHubMarkdownText(w)}`).join("\n"), "");
+  }
+
+  lines.push(
+    "<details>",
+    "<summary>Checks</summary>",
     "",
-    "### New Findings",
-    renderList(newFindings),
-    "",
-    "### Open Findings",
-    renderList(openFindings),
-    "",
-    "### Fixed Findings",
-    renderFixed(),
-    "",
-    warnings && warnings.length > 0
-      ? "### Config Warnings\n" +
-        warnings.map((w) => `- ${sanitizeGitHubMarkdownText(w)}`).join("\n")
-      : "",
-    "",
-    "### Checks",
     renderCheck("lint", checks.lint),
     "",
     renderCheck("build", checks.build),
     "",
-    renderCheck("test", checks.test)
-  ].join("\n");
+    renderCheck("test", checks.test),
+    "</details>"
+  );
+
+  return lines.join("\n");
 }
 
 function renderReviewingComment(): string {
@@ -547,44 +624,71 @@ function buildSummaryBlock(
   const start = "<!-- grepiku-summary:start -->";
   const end = "<!-- grepiku-summary:end -->";
   const severityOrder = { blocking: 0, important: 1, nit: 2 } as const;
-  const notable = [...comments].sort(
+  const allFindings = [...comments, ...summaryComments].sort(
     (a, b) => severityOrder[a.severity] - severityOrder[b.severity]
-  )[0];
+  );
+  const notable = allFindings[0];
+  const topFindings =
+    allFindings.length > 0
+      ? allFindings
+          .slice(0, 5)
+          .map(
+            (item) =>
+              `- [${sanitizeGitHubMarkdownText(item.severity)}] ${sanitizeGitHubMarkdownText(item.title)}`
+          )
+          .join("\n")
+      : "- (none)";
   const keyConcerns =
     summary.key_concerns.length > 0
-      ? summary.key_concerns.map((c) => `- ${sanitizeGitHubMarkdownText(c)}`).join("\n")
+      ? summary.key_concerns
+          .slice(0, 6)
+          .map((c) => `- ${sanitizeGitHubMarkdownText(c)}`)
+          .join("\n")
       : "- (none)";
   const whatToTest =
     summary.what_to_test.length > 0
-      ? summary.what_to_test.map((c) => `- ${sanitizeGitHubMarkdownText(c)}`).join("\n")
+      ? summary.what_to_test
+          .slice(0, 6)
+          .map((c) => `- ${sanitizeGitHubMarkdownText(c)}`)
+          .join("\n")
       : "- (none)";
 
   const notableLine = notable
-    ? `Notable issue: ${sanitizeGitHubMarkdownText(notable.title)} (${notable.severity})`
-    : "Notable issue: (none)";
+    ? sanitizeGitHubMarkdownText(`${notable.title} (${notable.severity})`)
+    : "(none)";
 
+  const fileBreakdownEntries = summary.file_breakdown || [];
+  const shownFileBreakdown = fileBreakdownEntries
+    .slice(0, 12)
+    .map(
+      (file) =>
+        `- ${sanitizeGitHubMarkdownText(file.path)}: ${sanitizeGitHubMarkdownText(file.summary)}${
+          file.risk ? ` (risk: ${sanitizeGitHubMarkdownText(file.risk)})` : ""
+        }`
+    );
+  const omittedFileBreakdown = Math.max(0, fileBreakdownEntries.length - shownFileBreakdown.length);
   const fileBreakdown =
-    summary.file_breakdown?.length
-      ? summary.file_breakdown
-          .map(
-            (file) =>
-              `- ${sanitizeGitHubMarkdownText(file.path)}: ${sanitizeGitHubMarkdownText(file.summary)}${
-                file.risk ? ` (risk: ${sanitizeGitHubMarkdownText(file.risk)})` : ""
-              }`
-          )
-          .join("\n")
+    shownFileBreakdown.length > 0
+      ? [
+          ...shownFileBreakdown,
+          ...(omittedFileBreakdown > 0 ? [`- [${omittedFileBreakdown} additional file summary item(s) hidden]`] : [])
+        ].join("\n")
       : "- (none)";
 
   const summaryFindings =
     summaryComments.length > 0
       ? summaryComments
+          .slice(0, 8)
           .map((c) => `- ${sanitizeGitHubMarkdownText(c.title)}: ${sanitizeGitHubMarkdownText(c.body)}`)
           .join("\n")
       : "- (none)";
 
   const patternBlock =
     patternMatches.length > 0
-      ? patternMatches.map((match) => `- ${sanitizeGitHubMarkdownText(match)}`).join("\n")
+      ? patternMatches
+          .slice(0, 10)
+          .map((match) => `- ${sanitizeGitHubMarkdownText(match)}`)
+          .join("\n")
       : "- (none)";
   const fixPrompt =
     comments.length > 0
@@ -608,22 +712,12 @@ function buildSummaryBlock(
     "</details>"
   ].join("\n");
 
-  const summaryLines = [
-    sanitizeGitHubMarkdownText(summary.overview),
-    `Risk: ${sanitizeGitHubMarkdownText(summary.risk)}`,
-    summary.confidence !== undefined ? `Confidence: ${(summary.confidence * 100).toFixed(0)}%` : null,
-    notableLine
-  ]
-    .filter((line): line is string => Boolean(line))
-    .map((line) => `${line}  `);
-
-  return [
-    start,
-    "## Grepiku Summary",
+  const detailBlock = [
+    "<details>",
+    "<summary>Review details</summary>",
     "",
-    fixBlock,
-    "",
-    ...summaryLines,
+    "Key concerns:",
+    keyConcerns,
     "",
     "File breakdown:",
     fileBreakdown,
@@ -633,17 +727,32 @@ function buildSummaryBlock(
     "",
     "Pattern matches:",
     patternBlock,
+    ...(summary.diagram_mermaid ? ["", "Diagram:", ...buildFencedBlock(summary.diagram_mermaid, "mermaid")] : []),
+    "</details>"
+  ].join("\n");
+
+  return [
+    start,
+    "## Grepiku Summary",
     "",
-    "Key concerns:",
-    keyConcerns,
+    `- **Overview:** ${sanitizeGitHubMarkdownText(summary.overview)}`,
+    `- **Risk:** ${sanitizeGitHubMarkdownText(summary.risk)}`,
+    summary.confidence !== undefined ? `- **Confidence:** ${(summary.confidence * 100).toFixed(0)}%` : null,
+    `- **Notable issue:** ${notableLine}`,
     "",
-    "What to test:",
+    "### Top Findings",
+    topFindings,
+    "",
+    "### What to Test",
     whatToTest,
-    summary.diagram_mermaid ? "" : "",
-    summary.diagram_mermaid ? "Diagram:" : "",
-    ...(summary.diagram_mermaid ? buildFencedBlock(summary.diagram_mermaid, "mermaid") : []),
+    "",
+    fixBlock,
+    "",
+    detailBlock,
     end
-  ].filter((line) => line !== null).join("\n");
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
 }
 
 function computeConfidence(summary: ReviewOutput["summary"], comments: ReviewComment[]): number {
@@ -789,6 +898,8 @@ async function runReviewerChunk(params: {
   await fs.mkdir(chunkCodexHomeDir, { recursive: true });
   const chunkContextPack = await buildContextPackForChunk({
     repoId: params.repoId,
+    repoPath: params.repoPath,
+    headSha: params.headSha,
     chunk: params.chunk,
     config: params.resolvedConfig,
     prTitle: params.prTitle,
@@ -937,7 +1048,10 @@ async function runChunkedReviewer(params: {
   });
 }
 
-export async function processReviewJob(data: ReviewJobData) {
+export async function processReviewJob(
+  data: ReviewJobData,
+  options: { jobId?: string | null } = {}
+) {
   const { provider, installationId, repoId, pullRequestId, prNumber, headSha, trigger, rulesOverride } = data;
   const repo = await prisma.repo.findFirst({ where: { id: repoId } });
   const pullRequestRecord = await prisma.pullRequest.findFirst({ where: { id: pullRequestId } });
@@ -975,6 +1089,19 @@ export async function processReviewJob(data: ReviewJobData) {
   const refreshed = await client.fetchPullRequest();
   if (refreshed.state === "closed") {
     console.log(`[pr#${prNumber}] PR is closed; skipping review`);
+    return;
+  }
+  const skipSelfReviewBotLogin = provider === "github" ? await resolveGithubBotLogin().catch(() => "") : "";
+  if (
+    provider === "github" &&
+    shouldSkipReviewForSelfAuthoredPullRequest({
+      pullRequest: refreshed,
+      botLogin: skipSelfReviewBotLogin
+    })
+  ) {
+    console.log(
+      `[pr#${prNumber}] skipping review for self-authored bot PR (author=${refreshed.author?.login || "unknown"}, head=${refreshed.headRef || "unknown"})`
+    );
     return;
   }
   client = await adapter.createClient({
@@ -1042,10 +1169,29 @@ export async function processReviewJob(data: ReviewJobData) {
       orderBy: { createdAt: "desc" }
     });
     if (duplicateRun) {
-      console.log(
-        `[pr#${prNumber}] duplicate review request skipped: existing run #${duplicateRun.id} (${duplicateRun.status}) for ${refreshed.headSha.slice(0, 12)}`
-      );
-      return;
+      const expectedJobId = buildReviewJobId(data);
+      const recoverRunningDuplicate = shouldRecoverRunningDuplicateRun({
+        duplicateRunStatus: duplicateRun.status,
+        currentJobId: options.jobId,
+        expectedJobId
+      });
+      if (recoverRunningDuplicate) {
+        console.warn(
+          `[pr#${prNumber}] recovering interrupted run #${duplicateRun.id} for retried job ${options.jobId}`
+        );
+        await failInterruptedDuplicateRun({ runId: duplicateRun.id, client });
+      } else if (
+        shouldSkipDuplicateReviewRun({
+          duplicateRunStatus: duplicateRun.status,
+          currentJobId: options.jobId,
+          expectedJobId
+        })
+      ) {
+        console.log(
+          `[pr#${prNumber}] duplicate review request skipped: existing run #${duplicateRun.id} (${duplicateRun.status}) for ${refreshed.headSha.slice(0, 12)}`
+        );
+        return;
+      }
     }
   }
 
@@ -1233,6 +1379,8 @@ export async function processReviewJob(data: ReviewJobData) {
     const contextPack = await buildContextPack({
       repoId: repo.id,
       diffPatch,
+      repoPath,
+      headSha: refreshedPullRequestState.headSha,
       changedFiles: changedFiles as Array<{
         filename?: string;
         path?: string;
@@ -1474,6 +1622,7 @@ export async function processReviewJob(data: ReviewJobData) {
     const shouldRunCoveragePass =
       coveragePlan.shouldRun &&
       !shouldUseChunkedReviewer &&
+      env.sandboxExecutionMode !== "kubernetes" &&
       coveragePlan.targets.length > 0 &&
       !resolvedConfig.output.summaryOnly &&
       resolvedConfig.commentTypes.allow.includes("inline");
@@ -2119,10 +2268,13 @@ export async function processReviewJob(data: ReviewJobData) {
 export const __pipelineInternals = {
   buildExistingInlineCommentLookup,
   buildSummaryBlock,
+  failInterruptedDuplicateRun,
   formatInlineComment,
   hasFailingVerifierChecks,
   hasBlockingVisibleFindings,
   renderStatusComment,
   resolveStatusCheckConclusion,
+  shouldRecoverRunningDuplicateRun,
+  shouldSkipDuplicateReviewRun,
   upsertSummaryBlock
 };

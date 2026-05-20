@@ -9,16 +9,17 @@ type TrackedFeedbackComment = {
 };
 
 export function normalizeBotAwareLogin(login: string): string {
-  return login.trim().toLowerCase().replace(/\[bot\]$/i, "");
+  return login.trim().toLowerCase().replace(/^app\//i, "").replace(/\[bot\]$/i, "");
 }
 
 export function isSelfBotComment(params: { authorLogin: string; botLogin: string }): boolean {
+  const rawAuthor = params.authorLogin.trim();
   const author = normalizeBotAwareLogin(params.authorLogin);
   const bot = normalizeBotAwareLogin(params.botLogin);
   if (!author) return false;
   if (bot && author === bot) return true;
   if (bot) return false;
-  return /\[bot\]$/i.test(params.authorLogin.trim()) && author.startsWith("grepiku");
+  return (/\[bot\]$/i.test(rawAuthor) || /^app\//i.test(rawAuthor)) && author.startsWith("grepiku");
 }
 
 export function isGeneratedMentionReply(body: string): boolean {

@@ -1,39 +1,98 @@
 # Grepiku
 
-GitHub PR review bot powered by Codex.
+Grepiku is a GitHub PR review bot powered by Codex.
 
-## What It Does
+The short version: it reviews pull requests like a teammate, stays with the PR across pushes, answers questions in-thread, can turn `@grepiku do: ...` into a follow-up PR, and keeps getting sharper as your team reacts to its comments.
+
+## Why Grepiku is interesting
+
+Most review bots stop at "here are some comments on this diff."
+
+Grepiku is trying to do something bigger:
+
+- review the code with real repo context, not just the patch
+- track findings across pushes so the review evolves with the PR
+- let developers talk to the bot in the thread instead of leaving the GitHub flow
+- learn from reviewer feedback, team preferences, and rule decisions
+- surface what is happening in a dashboard instead of hiding everything in logs
+
+## What it can do
+
+### Review like a teammate
 
 - Handles GitHub PR, comment, review-comment, and reaction webhooks
-- Runs auto reviews on PR updates plus manual `/review` triggers
-- Applies trigger filters for labels, branches, authors, keywords, and manual-only mode
-- Executes a 3-stage Codex pipeline: reviewer, editor, execution verifier
+- Runs automatic reviews on PR updates and manual reviews from `/review`
+- Uses a 3-stage pipeline: reviewer, editor, execution verifier
 - Runs a supplemental coverage pass when changed-file coverage is low
 - Posts inline comments plus a status summary comment
-- Creates/updates GitHub check-runs and can make blocking findings fail required checks
-- Tracks finding lifecycle across pushes: `new`, `open`, `fixed`, `obsolete`
-- Auto-resolves fixed inline review threads when provider permissions allow
-- Syncs a "Grepiku Summary" block into the PR body (with optional incremental update control)
-- Mention workflow:
-  - `@grepiku ...` Q&A replies on PR comment threads
-  - `@grepiku do: ...` implementation path that commits code to a bot branch and opens a follow-up PR
-- Runs repo-configured lint/build/test checks for mention `do:` changes and drafts the follow-up PR when checks fail
-- Learns from reviewer reactions/replies:
-  - feedback-aware prioritization
-  - per-category/per-rule adaptive weights
-  - auto-generated rule suggestions
-- Stores "team preference" memory suggestions from comment directives (e.g. remember/avoid/always), reviewable in dashboard
-- Local-first diff and changed-file collection via git worktree checkout, with provider API fallback
-- First PR bootstrap: full-codebase index + graph build when repo has no prior index
-- First completed review run includes a one-time full-repo static audit mode
-- Vectorless indexing of files/symbols/chunks (Tree-sitter + import/export reference extraction)
-- Graph builder for file/symbol/module/directory relationships and dependency traversal
-- Hybrid retrieval with PageIndex scoring + lexical fallback + RRF + path/directory/kind boosts
-- Pattern repository indexing and retrieval boosts for reusable standards/examples
-- Dashboard analytics (reviews, traversal quality, findings, weights, rule suggestions)
-- Optional MCP IDE server with tools for comments/findings/patterns/standards/reports
+- Creates and updates GitHub check-runs, including blocking outcomes when configured
 
-## Architecture
+### Stay with the PR across pushes
+
+- Tracks findings through `new`, `open`, `fixed`, and `obsolete`
+- Auto-resolves fixed inline review threads when provider permissions allow
+- Syncs a "Grepiku Summary" block into the PR body
+- Supports incremental whole-PR review updates instead of treating every push like a brand-new conversation
+
+### Work inside the conversation
+
+- `@grepiku ...` answers questions inside PR threads
+- `@grepiku do: ...` can take an implementation request, commit code to a bot branch, and open a follow-up PR
+- Mention-driven implementation runs repo-configured `lint`, `build`, and `test` checks
+- If checks fail, Grepiku drafts the follow-up PR with the failure context instead of pretending everything is fine
+
+### Learn what your team cares about
+
+- Uses reactions and replies to adjust prioritization over time
+- Maintains adaptive weights by category and rule
+- Generates review rule suggestions from observed feedback
+- Stores team preference memory suggestions from comment directives like `remember`, `avoid`, or `always`
+- Exposes those decisions in the dashboard so the learning loop is inspectable
+
+### Understand the codebase, not just the patch
+
+- Local-first diff and changed-file collection via git worktrees, with provider API fallback
+- First-PR bootstrap path that builds a full codebase index and graph when needed
+- First completed review includes a one-time full-repo static audit mode
+- Vectorless indexing of files, symbols, and chunks using Tree-sitter plus reference extraction
+- Graph traversal over file, symbol, module, and directory relationships
+- Graphify-backed PR review context expansion from changed files into related code paths
+- Hybrid retrieval with PageIndex scoring, lexical fallback, RRF, and path-aware boosts
+- Pattern repository indexing and retrieval boosts for reusable standards and examples
+
+### Show its work
+
+- Dashboard analytics for reviews, traversal quality, findings, weights, and rule suggestions
+- Optional MCP IDE server with tools for comments, findings, patterns, standards, and reports
+- Per-run artifacts under `var/runs/<runId>` so reviews are debuggable instead of opaque
+
+## A typical Grepiku workflow
+
+1. A PR opens or gets a new push.
+2. Grepiku reviews it automatically and posts inline findings plus a summary.
+3. The author pushes fixes.
+4. Grepiku updates the review, marks fixed findings as fixed, and can resolve old threads.
+5. A teammate asks `@grepiku why is this risky?` in the thread.
+6. Grepiku answers in context.
+7. Someone says `@grepiku do: add the missing retry logic`.
+8. Grepiku makes the change on a bot branch, runs checks, and opens a follow-up PR.
+9. Reviewer reactions and replies feed back into future prioritization.
+
+That is the core idea: review, conversation, implementation, and learning all in one loop.
+
+## What makes it different from a basic PR bot
+
+| Basic bot | Grepiku |
+| --- | --- |
+| One-shot diff comments | Multi-stage review pipeline with reviewer, editor, and verifier |
+| Stateless between pushes | Tracks finding lifecycle across the whole PR |
+| Separate bot for Q&A | Q&A happens directly in the PR thread with `@grepiku` |
+| No action path | `@grepiku do:` can produce code and a follow-up PR |
+| Flat diff-only context | Uses indexing, graph traversal, and hybrid retrieval |
+| Fixed rules forever | Learns from reactions, replies, and rule approval decisions |
+| Hidden internals | Dashboard analytics and persisted run artifacts |
+
+## Architecture at a glance
 
 - Fastify webhook server
 - BullMQ workers:
@@ -43,7 +102,7 @@ GitHub PR review bot powered by Codex.
   - `graph-builder`
   - `analytics-ingest`
 - Postgres for state
-- Redis for queue
+- Redis for queueing
 - Direct `codex-exec` integration from `internal_harness/codex-slim`
 - Optional MCP stdio server (`start:mcp-ide`)
 
@@ -54,32 +113,42 @@ GitHub PR review bot powered by Codex.
 
 ## Setup
 
-1) Create a GitHub App
-- Permissions (minimum):
-  - Pull requests: read & write
-  - Issues: read & write
-  - Reactions: write
-  - Contents: read
-  - Checks: read
-- For `@grepiku do:` follow-up PR creation, use:
-  - Contents: read & write
-  - Pull requests: read & write
-- Subscribe to webhook events:
-  - `pull_request`, `issue_comment`, `pull_request_review_comment`, `reaction`
+### 1) Create a GitHub App
 
-Important:
+Permissions required by the current implementation:
+
+- Pull requests: read & write
+- Issues: read & write
+- Contents: read & write
+- Checks: read & write
+- Metadata: read-only
+
+Subscribe to these webhook events:
+
+- `pull_request`
+- `issue_comment`
+- `pull_request_review_comment`
+
+Important notes:
+
 - `pull_request_review_comment` is required for replies on inline review threads.
-- After changing webhook subscriptions or permissions, re-install/update the GitHub App on the target repo/org so changes take effect.
+- GitHub's current GitHub App permissions and events UI for this app does not expose a separate `Reactions` permission or `reaction` webhook subscription.
+- After changing webhook subscriptions or permissions, re-install or update the GitHub App on the target repo or org.
 
-2) Configure environment
+### 2) Configure the environment
 
-Copy `.env.example` to `.env` and set values. `PROJECT_ROOT` must be an absolute path to this repo.
-Additional vars:
-- `INTERNAL_API_KEY` (required for internal APIs and retrieval tool access)
-- `CODEX_EXEC_PATH` (path to `codex-exec`; Docker worker uses `/usr/local/bin/codex-exec`)
-- `INTERNAL_API_KEY` is also used for dashboard auth (Basic or Bearer token)
+Copy `.env.example` to `.env` and set values.
 
-3) Start services
+`PROJECT_ROOT` must be an absolute path to this repo.
+
+Additional variables:
+
+- `INTERNAL_API_KEY` is required for internal APIs and retrieval tool access
+- `CODEX_EXEC_PATH` points to `codex-exec` locally
+- Docker worker uses `/usr/local/bin/codex-exec`
+- `INTERNAL_API_KEY` also protects dashboard access through Basic or Bearer auth
+
+### 3) Start services
 
 ```bash
 docker compose up -d postgres redis
@@ -89,11 +158,13 @@ npm run prisma:migrate
 docker compose up -d --build web worker
 ```
 
-## Repo Configuration
+## Repo configuration
 
-Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.yml` still supported):
+Preferred config file: `grepiku.json` in the repo root.
 
-```yaml
+Legacy `greptile.json` and `.prreviewer.yml` are still supported.
+
+```json
 {
   "ignore": ["node_modules/**", "dist/**"],
   "graph": {
@@ -149,59 +220,65 @@ Preferred `grepiku.json` in repo root (legacy `greptile.json` and `.prreviewer.y
 }
 ```
 
-`graph.exclude_dirs` is a list of repo-relative directory prefixes excluded from graph generation and graph traversal seeding (indexing and retrieval remain unchanged).  
-`graph.traversal` tunes how aggressively graph traversal expands context during review.
-`retrieval` now uses a vectorless PageIndex tree search over file/symbol/chunk nodes; `semanticWeight` and `lexicalWeight` tune node-title vs node-content relevance in that scorer.
-`output.syncSummaryWithStatus` keeps the PR body "Grepiku Summary" synchronized with each AI review status run (default: `true`).  
-`output.allowIncrementalPrBodyUpdates` allows PR body summary updates on incremental/synchronize runs (default: `true`).
-Scoped per-path overrides are supported via `.grepiku/config.json` files (for `strictness`, `commentTypes`, `ignore`, `limits`, and `rules`).
+Notes:
 
-If missing, defaults are used and tools are marked as skipped.
+- `graph.exclude_dirs` excludes repo-relative directory prefixes from graph generation and traversal seeding.
+- `graph.traversal` controls how aggressively Grepiku expands review context.
+- `retrieval` uses a vectorless PageIndex tree search over file, symbol, and chunk nodes.
+- `output.syncSummaryWithStatus` keeps the PR body summary synchronized with review status runs.
+- `output.allowIncrementalPrBodyUpdates` enables PR body summary updates on incremental runs.
+- Scoped per-path overrides are supported via `.grepiku/config.json` for `strictness`, `commentTypes`, `ignore`, `limits`, and `rules`.
+- If config is missing, defaults are used and tools are marked as skipped.
 
-## Runtime Notes
+## Runtime notes
 
 - Each run writes artifacts under `var/runs/<runId>`.
-- Worker executes `codex-exec` directly and injects MCP roots for repo/bundle/out paths.
-- Review and mention pipelines are local-first: diff/changed-file context is computed from local git checkout by default, with GitHub API as fallback.
-- Review and mention-reply workloads run on separate BullMQ queues, so `@grepiku` Q&A / `do:` jobs do not wait behind long PR review runs.
-- When changed-file coverage is low, Grepiku runs a supplemental coverage pass focused on uncovered changed files to improve bug recall.
+- Worker executes `codex-exec` directly and injects MCP roots for repo, bundle, and output paths.
+- Review and mention pipelines are local-first by default, with GitHub API fallback.
+- Review and mention-reply workloads run on separate BullMQ queues, so long reviews do not block `@grepiku` replies.
+- On low changed-file coverage, Grepiku runs a supplemental coverage pass focused on uncovered files.
 - On PR close, queued review jobs are cancelled and outcome signals are applied to finding weights.
-- Bot-authored/suggestion-only push scenarios are filtered to avoid noisy self-reviews.
-- Worker concurrency can be tuned with:
+- Bot-authored or suggestion-only push scenarios are filtered to avoid noisy self-reviews.
+- Worker concurrency is tunable:
   - `REVIEW_WORKER_CONCURRENCY` (default `3`)
   - `MENTION_WORKER_CONCURRENCY` (default `3`)
-- Tool runs are cached in Postgres per (review run, tool).
+- Tool runs are cached in Postgres per review run and tool.
 
 ## Endpoints
 
-- Public:
-  - `POST /webhooks` GitHub App webhook receiver
-  - `GET /healthz` health check
-- Dashboard (auth via `INTERNAL_API_KEY`):
-  - `GET /dashboard`
-  - `GET /dashboard/repo/:id`
-  - `GET /api/repos`
-  - `GET /api/repos/:id/graph`
-  - `GET /api/reviews/recent`
-  - `GET /api/analytics/summary`
-  - `GET /api/analytics/traversal`
-  - `GET /api/analytics/insights`
-  - `GET /api/analytics/findings-by-severity`
-  - `GET /api/analytics/weights`
-  - `GET /api/analytics/export`
-  - `GET /api/rules/suggestions`
-  - `POST /api/rules/suggestions/:id/approve`
-  - `POST /api/rules/suggestions/:id/reject`
-- Internal API (auth via `INTERNAL_API_KEY`):
-  - `POST /internal/review/enqueue`
-  - `POST /internal/index/enqueue`
-  - `POST /internal/rules/resolve`
-  - `POST /internal/retrieval`
-  - `POST /internal/triggers/update`
+### Public
+
+- `POST /webhooks` GitHub App webhook receiver
+- `GET /healthz` health check
+
+### Dashboard (`INTERNAL_API_KEY` auth)
+
+- `GET /dashboard`
+- `GET /dashboard/repo/:id`
+- `GET /api/repos`
+- `GET /api/repos/:id/graph`
+- `GET /api/reviews/recent`
+- `GET /api/analytics/summary`
+- `GET /api/analytics/traversal`
+- `GET /api/analytics/insights`
+- `GET /api/analytics/findings-by-severity`
+- `GET /api/analytics/weights`
+- `GET /api/analytics/export`
+- `GET /api/rules/suggestions`
+- `POST /api/rules/suggestions/:id/approve`
+- `POST /api/rules/suggestions/:id/reject`
+
+### Internal API (`INTERNAL_API_KEY` auth)
+
+- `POST /internal/review/enqueue`
+- `POST /internal/index/enqueue`
+- `POST /internal/rules/resolve`
+- `POST /internal/retrieval`
+- `POST /internal/triggers/update`
 
 ## Development
 
-Run the server and worker locally:
+Run the main server and worker locally:
 
 ```bash
 npm install
@@ -220,21 +297,21 @@ npm run dev:graph
 npm run dev:analytics
 ```
 
-## PageIndex Migration
+## PageIndex migration
 
-To migrate existing indexed repos to the new PageIndex retrieval model:
+To migrate existing indexed repos to the PageIndex retrieval model:
 
 ```bash
 npm run migrate:pageindex
 ```
 
-Use `--dry-run` first to preview impact:
+Preview the impact first:
 
 ```bash
 npm run migrate:pageindex -- --dry-run
 ```
 
-## Overnight Loop
+## Overnight loop
 
 Run repeated manual review cycles with automatic retrieval tuning:
 
@@ -247,9 +324,9 @@ npm run start:review-loop
 
 Cycle logs are written to `var/loop/*.jsonl`.
 
-## Traversal Quality Loop
+## Traversal quality loop
 
-Replay evaluator over historical completed runs:
+Replay the evaluator over historical completed runs:
 
 ```bash
 npm run check:traversal-quality
@@ -261,17 +338,17 @@ Optional filters and thresholds:
 tsx src/tools/traversalQuality.ts --ci --replay --repo-id=2 --since-days=14 --limit=500 --concurrency=4
 ```
 
-The command exits non-zero in `--ci` mode when recall/precision or p95 SLO thresholds are violated.
+The command exits non-zero in `--ci` mode when recall, precision, or p95 SLO thresholds are violated.
 
-## Optional Tools
+## Optional tools
 
-- MCP IDE server:
+### MCP IDE server
 
 ```bash
 npm run start:mcp-ide
 ```
 
-- Local demo review runner (without webhook flow):
+### Local demo review runner
 
 ```bash
 npm run start:demo -- --repo-path /absolute/path/to/repo

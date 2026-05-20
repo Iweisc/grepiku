@@ -217,6 +217,7 @@ async function buildReplayContext(run: ReviewRunRow, repoConfigCache: Map<number
     repoId: run.pullRequest.repoId,
     diffPatch: bundle.diffPatch,
     changedFiles: bundle.changedFiles,
+    headSha: run.headSha,
     prTitle: run.pullRequest.title,
     prBody: run.pullRequest.body,
     retrieval: repoConfig.retrieval,

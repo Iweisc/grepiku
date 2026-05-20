@@ -1,5 +1,11 @@
 node_modules
+web
+web/node_modules
 dist
+.venv-pageindex
+.firecrawl
+artifacts
+graphify-out
 .git
 .github
 .env

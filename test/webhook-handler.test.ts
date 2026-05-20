@@ -17,6 +17,7 @@ import {
   shouldDeleteClosedBotPrBranch,
   shouldRunVerifierForPullRequest,
   shouldSkipBotAuthoredReview,
+  shouldSkipReviewForSelfAuthoredPullRequest,
   shouldSkipSelfBotFollowUpPrReview
 } from "../src/providers/pullRequestGuards.js";
 import {
@@ -24,15 +25,23 @@ import {
   selectTrustedPullRequestIndexSha
 } from "../src/providers/bootstrapIndex.js";
 
-test("normalizeBotAwareLogin strips [bot] suffix", () => {
+test("normalizeBotAwareLogin strips app/ and [bot] wrappers", () => {
   assert.equal(normalizeBotAwareLogin("grepiku-dev[bot]"), "grepiku-dev");
+  assert.equal(normalizeBotAwareLogin("app/grepiku-dev"), "grepiku-dev");
   assert.equal(normalizeBotAwareLogin("grepiku-dev"), "grepiku-dev");
 });
 
-test("isSelfBotComment matches bot login with or without [bot] suffix", () => {
+test("isSelfBotComment matches bot login with [bot] or app/ wrappers", () => {
   assert.equal(
     isSelfBotComment({
       authorLogin: "grepiku-dev[bot]",
+      botLogin: "grepiku-dev"
+    }),
+    true
+  );
+  assert.equal(
+    isSelfBotComment({
+      authorLogin: "app/grepiku-dev",
       botLogin: "grepiku-dev"
     }),
     true
@@ -410,6 +419,42 @@ test("shouldSkipSelfBotFollowUpPrReview fails closed when bot identity cannot be
       pullRequest: {
         headRef: "grepiku/mention-123",
         author: { login: "grepiku-helper[bot]", externalId: "1" }
+      }
+    }),
+    false
+  );
+});
+
+test("shouldSkipReviewForSelfAuthoredPullRequest skips bot-authored PRs regardless of enqueue path", () => {
+  assert.equal(
+    shouldSkipReviewForSelfAuthoredPullRequest({
+      botLogin: "grepiku-dev",
+      pullRequest: {
+        headRef: "feature/some-branch",
+        author: { login: "app/grepiku-dev", externalId: "1" }
+      }
+    }),
+    true
+  );
+});
+
+test("shouldSkipReviewForSelfAuthoredPullRequest falls back to follow-up branch pattern for app-authored mention PRs", () => {
+  assert.equal(
+    shouldSkipReviewForSelfAuthoredPullRequest({
+      botLogin: "",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "app/grepiku-dev", externalId: "1" }
+      }
+    }),
+    true
+  );
+  assert.equal(
+    shouldSkipReviewForSelfAuthoredPullRequest({
+      botLogin: "",
+      pullRequest: {
+        headRef: "grepiku/mention-123",
+        author: { login: "octocat", externalId: "2" }
       }
     }),
     false

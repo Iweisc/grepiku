@@ -109,6 +109,56 @@ test("non-required status checks surface verifier failures as neutral", async ()
   }
 });
 
+test("retrying the same auto review job recovers a stale running duplicate instead of skipping", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    assert.equal(
+      (__pipelineInternals as any).shouldRecoverRunningDuplicateRun({
+        duplicateRunStatus: "running",
+        currentJobId: "review_1_1_deadbeef_auto",
+        expectedJobId: "review_1_1_deadbeef_auto"
+      }),
+      true
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipDuplicateReviewRun({
+        duplicateRunStatus: "running",
+        currentJobId: "review_1_1_deadbeef_auto",
+        expectedJobId: "review_1_1_deadbeef_auto"
+      }),
+      false
+    );
+  } finally {
+    await closeQueueClients();
+  }
+});
+
+test("different or completed duplicate runs are still skipped", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipDuplicateReviewRun({
+        duplicateRunStatus: "running",
+        currentJobId: "review_1_1_deadbeef_auto",
+        expectedJobId: "review_1_1_cafebabe_auto"
+      }),
+      true
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipDuplicateReviewRun({
+        duplicateRunStatus: "completed",
+        currentJobId: "review_1_1_deadbeef_auto",
+        expectedJobId: "review_1_1_deadbeef_auto"
+      }),
+      true
+    );
+  } finally {
+    await closeQueueClients();
+  }
+});
+
 test("inline comment sync ignores spoofed marker comments from non-bot authors", async () => {
   ensureReviewRenderTestEnv();
   const { __pipelineInternals } = await import("../src/review/pipeline.js");

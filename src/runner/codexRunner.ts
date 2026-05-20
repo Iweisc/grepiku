@@ -4,6 +4,10 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "url";
 import { execa } from "execa";
 import { loadEnv } from "../config/env.js";
+import {
+  runCodexStageInKubernetes,
+  shouldUseKubernetesSandbox
+} from "../sandbox/k8sRunner.js";
 
 export type CodexStage = "reviewer" | "editor" | "verifier" | "mention";
 export type CodexReasoningEffort = "low" | "medium" | "high" | "xhigh";
@@ -21,6 +25,7 @@ export type CodexRunParams = {
   prNumber: number;
   captureLastMessage?: boolean;
   reasoningEffort?: CodexReasoningEffort;
+  executionMode?: "local" | "kubernetes-sandbox";
 };
 
 export type CodexTokenUsage = {
@@ -186,6 +191,7 @@ function baseConfig(params?: {
 }
 
 function configForStage(stage: CodexStage, params: CodexRunParams): string {
+  const runningInKubernetesSandbox = params.executionMode === "kubernetes-sandbox";
   const readonlyEnv = {
     WORK_REPO_ROOT: params.repoPath,
     WORK_BUNDLE_ROOT: params.bundleDir,
@@ -196,11 +202,19 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
-      mcpServerBlock("retrieval", "retrieval_mcp.js", {
-        INTERNAL_API_URL: env.internalApiUrl,
-        INTERNAL_API_KEY: env.internalApiKey,
-        REVIEW_REPO_ID: String(params.repoId)
-      })
+      mcpServerBlock(
+        "retrieval",
+        "retrieval_mcp.js",
+        runningInKubernetesSandbox
+          ? {
+              RETRIEVAL_CONTEXT_PACK_PATH: path.join(params.bundleDir, "context_pack.json")
+            }
+          : {
+              INTERNAL_API_URL: env.internalApiUrl,
+              INTERNAL_API_KEY: env.internalApiKey,
+              REVIEW_REPO_ID: String(params.repoId)
+            }
+      )
     );
   }
   if (stage === "editor") {
@@ -208,11 +222,19 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
-      mcpServerBlock("retrieval", "retrieval_mcp.js", {
-        INTERNAL_API_URL: env.internalApiUrl,
-        INTERNAL_API_KEY: env.internalApiKey,
-        REVIEW_REPO_ID: String(params.repoId)
-      })
+      mcpServerBlock(
+        "retrieval",
+        "retrieval_mcp.js",
+        runningInKubernetesSandbox
+          ? {
+              RETRIEVAL_CONTEXT_PACK_PATH: path.join(params.bundleDir, "context_pack.json")
+            }
+          : {
+              INTERNAL_API_URL: env.internalApiUrl,
+              INTERNAL_API_KEY: env.internalApiKey,
+              REVIEW_REPO_ID: String(params.repoId)
+            }
+      )
     );
   }
   if (stage === "verifier") {
@@ -221,13 +243,25 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
-      mcpServerBlock("verifier", "verifier_mcp.js", {
-        WORK_REPO_ROOT: params.repoPath,
-        WORK_BUNDLE_ROOT: params.bundleDir,
-        WORK_OUT_ROOT: params.outDir,
-        DATABASE_URL: env.databaseUrl,
-        REVIEW_RUN_ID: String(params.reviewRunId)
-      }, { toolTimeoutSec: verifierToolTimeoutSec })
+      mcpServerBlock(
+        "verifier",
+        "verifier_mcp.js",
+        runningInKubernetesSandbox
+          ? {
+              WORK_REPO_ROOT: params.repoPath,
+              WORK_BUNDLE_ROOT: params.bundleDir,
+              WORK_OUT_ROOT: params.outDir,
+              VERIFIER_CACHE_DIR: path.join(params.outDir, ".verifier-cache")
+            }
+          : {
+              WORK_REPO_ROOT: params.repoPath,
+              WORK_BUNDLE_ROOT: params.bundleDir,
+              WORK_OUT_ROOT: params.outDir,
+              DATABASE_URL: env.databaseUrl,
+              REVIEW_RUN_ID: String(params.reviewRunId)
+            },
+        { toolTimeoutSec: verifierToolTimeoutSec }
+      )
     );
   }
   if (stage === "mention") {
@@ -235,11 +269,19 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     return (
       `${base}\n` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
-      mcpServerBlock("retrieval", "retrieval_mcp.js", {
-        INTERNAL_API_URL: env.internalApiUrl,
-        INTERNAL_API_KEY: env.internalApiKey,
-        REVIEW_REPO_ID: String(params.repoId)
-      })
+      mcpServerBlock(
+        "retrieval",
+        "retrieval_mcp.js",
+        runningInKubernetesSandbox
+          ? {
+              RETRIEVAL_CONTEXT_PACK_PATH: path.join(params.bundleDir, "context_pack.json")
+            }
+          : {
+              INTERNAL_API_URL: env.internalApiUrl,
+              INTERNAL_API_KEY: env.internalApiKey,
+              REVIEW_REPO_ID: String(params.repoId)
+            }
+      )
     );
   }
   return baseConfig();
@@ -411,6 +453,13 @@ function formatTokenUsageForLog(usage: CodexTokenUsage | null): string {
 }
 
 export async function runCodexStage(params: CodexRunParams): Promise<CodexStageMetrics> {
+  if (shouldUseKubernetesSandbox(env) && params.executionMode !== "kubernetes-sandbox") {
+    return runCodexStageInKubernetes(params);
+  }
+  return runCodexStageLocal(params);
+}
+
+export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexStageMetrics> {
   const stageTag = `[run ${params.reviewRunId} pr#${params.prNumber} ${params.stage}]`;
   const reasoningEffort = params.reasoningEffort ?? env.codexModelReasoningEffort;
   const codexExecPath = await resolveCodexExecPath();

@@ -14,7 +14,7 @@ import {
 import { writeBundleFiles } from "./bundle.js";
 import { buildMentionImplementPrompt, buildMentionPrompt } from "./prompts.js";
 import { resolveCodexExecPath, runCodexStage } from "../runner/codexRunner.js";
-import { readAndValidateJson } from "./json.js";
+import { readAndValidateJson, readAndValidateJsonWithFallback } from "./json.js";
 import { MentionActionSchema, MentionChecksOutput, ReplySchema } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
 import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
@@ -45,6 +45,10 @@ import {
 } from "./localCompare.js";
 import { renderPrMarkdown } from "./prMarkdown.js";
 import { sanitizeModelVisibleReviewData } from "./sensitiveReviewData.js";
+import {
+  runMentionChecksInKubernetes,
+  shouldUseKubernetesSandbox
+} from "../sandbox/k8sRunner.js";
 import {
   neutralizeGitHubClosingKeywords,
   neutralizeGitHubIssueReferences,
@@ -284,6 +288,14 @@ async function runMentionChecks(params: {
   tools: RepoConfig["tools"];
   homeDir?: string;
 }): Promise<MentionChecksOutput> {
+  if (shouldUseKubernetesSandbox(env)) {
+    const outDir = path.join(path.dirname(params.repoPath), "out");
+    return runMentionChecksInKubernetes({
+      repoPath: params.repoPath,
+      tools: params.tools,
+      outDir
+    });
+  }
   const lint = await runMentionTool({
     repoPath: params.repoPath,
     toolName: "lint",
@@ -743,11 +755,14 @@ async function runAnswerOnlyPath(params: {
     headSha: params.refreshedHeadSha,
     repoId: params.repoId,
     reviewRunId: 0,
-    prNumber: params.prNumber,
-    captureLastMessage: false
+    prNumber: params.prNumber
   });
 
-  const reply = await readAndValidateJson(path.join(params.outDir, "reply.json"), ReplySchema);
+  const reply = await readAndValidateJsonWithFallback(
+    path.join(params.outDir, "reply.json"),
+    path.join(params.outDir, "last_message_reviewer.txt"),
+    ReplySchema
+  );
   const body = withMentionMarker(
     ensureMentionPrefix(sanitizeGitHubMarkdownText(reply.body), params.commentAuthor),
     params.commentId
@@ -1180,6 +1195,8 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
   const contextPack = await buildContextPack({
     repoId: repo.id,
     diffPatch,
+    repoPath,
+    headSha: refreshedPullRequestState.headSha,
     changedFiles: changedFiles as Array<{
       filename?: string;
       path?: string;
@@ -1346,6 +1363,7 @@ export async function processCommentReplyJob(data: CommentReplyJobData) {
       permissionDenied: true,
       finishedAt: new Date().toISOString()
     });
+  }
   } finally {
     await lockHandle.close();
     await fs.rm(lockPath, { force: true });

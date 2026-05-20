@@ -25,6 +25,19 @@ const EnvSchema = z.object({
   CODEX_STAGE_LOG_OUTPUT: z.string().default("false"),
   CODEX_MODEL_REASONING_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
   INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
+  SANDBOX_EXECUTION_MODE: z.enum(["local", "kubernetes"]).default("local"),
+  K8S_NAMESPACE: z.string().default(""),
+  K8S_SANDBOX_IMAGE: z.string().default(""),
+  K8S_SANDBOX_SERVICE_ACCOUNT: z.string().default("default"),
+  K8S_SANDBOX_IMAGE_PULL_SECRET: z.string().default(""),
+  K8S_SANDBOX_CPU_REQUEST: z.string().default("500m"),
+  K8S_SANDBOX_CPU_LIMIT: z.string().default("2"),
+  K8S_SANDBOX_MEMORY_REQUEST: z.string().default("512Mi"),
+  K8S_SANDBOX_MEMORY_LIMIT: z.string().default("2Gi"),
+  K8S_SANDBOX_ACTIVE_DEADLINE_SECONDS: z.string().default("1200"),
+  K8S_SANDBOX_POD_READY_TIMEOUT_MS: z.string().default("120000"),
+  K8S_SANDBOX_TAR_MAX_BYTES: z.string().default("104857600"),
+  K8S_SANDBOX_SYNC_MAX_BYTES: z.string().default("10485760"),
   LOG_LEVEL: z.string().default("info")
 });
 
@@ -52,6 +65,19 @@ export type Env = {
   codexStageLogOutput: boolean;
   codexModelReasoningEffort: "low" | "medium" | "high" | "xhigh";
   internalApiUrl: string;
+  sandboxExecutionMode: "local" | "kubernetes";
+  k8sNamespace: string;
+  k8sSandboxImage: string;
+  k8sSandboxServiceAccount: string;
+  k8sSandboxImagePullSecret: string;
+  k8sSandboxCpuRequest: string;
+  k8sSandboxCpuLimit: string;
+  k8sSandboxMemoryRequest: string;
+  k8sSandboxMemoryLimit: string;
+  k8sSandboxActiveDeadlineSeconds: number;
+  k8sSandboxPodReadyTimeoutMs: number;
+  k8sSandboxTarMaxBytes: number;
+  k8sSandboxSyncMaxBytes: number;
   logLevel: string;
 };
 
@@ -59,6 +85,11 @@ let cached: Env | null = null;
 
 function parseBooleanFlag(value: string): boolean {
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function parsePositiveInteger(value: string, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 export function loadEnv(): Env {
@@ -110,6 +141,25 @@ export function loadEnv(): Env {
     codexStageLogOutput: parseBooleanFlag(parsed.CODEX_STAGE_LOG_OUTPUT),
     codexModelReasoningEffort: parsed.CODEX_MODEL_REASONING_EFFORT,
     internalApiUrl: parsed.INTERNAL_API_URL.trim(),
+    sandboxExecutionMode: parsed.SANDBOX_EXECUTION_MODE,
+    k8sNamespace: parsed.K8S_NAMESPACE.trim(),
+    k8sSandboxImage: parsed.K8S_SANDBOX_IMAGE.trim(),
+    k8sSandboxServiceAccount: parsed.K8S_SANDBOX_SERVICE_ACCOUNT.trim() || "default",
+    k8sSandboxImagePullSecret: parsed.K8S_SANDBOX_IMAGE_PULL_SECRET.trim(),
+    k8sSandboxCpuRequest: parsed.K8S_SANDBOX_CPU_REQUEST.trim() || "500m",
+    k8sSandboxCpuLimit: parsed.K8S_SANDBOX_CPU_LIMIT.trim() || "2",
+    k8sSandboxMemoryRequest: parsed.K8S_SANDBOX_MEMORY_REQUEST.trim() || "512Mi",
+    k8sSandboxMemoryLimit: parsed.K8S_SANDBOX_MEMORY_LIMIT.trim() || "2Gi",
+    k8sSandboxActiveDeadlineSeconds: parsePositiveInteger(
+      parsed.K8S_SANDBOX_ACTIVE_DEADLINE_SECONDS,
+      1200
+    ),
+    k8sSandboxPodReadyTimeoutMs: parsePositiveInteger(
+      parsed.K8S_SANDBOX_POD_READY_TIMEOUT_MS,
+      120000
+    ),
+    k8sSandboxTarMaxBytes: parsePositiveInteger(parsed.K8S_SANDBOX_TAR_MAX_BYTES, 104857600),
+    k8sSandboxSyncMaxBytes: parsePositiveInteger(parsed.K8S_SANDBOX_SYNC_MAX_BYTES, 10485760),
     logLevel: parsed.LOG_LEVEL
   };
   return cached;

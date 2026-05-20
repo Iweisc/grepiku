@@ -1,42 +1,40 @@
-FROM rust:1.93-bookworm AS codex-build
-RUN apt-get update \
-  && apt-get install -y pkg-config libssl-dev libcap-dev ca-certificates build-essential clang libclang-dev \
-  && rm -rf /var/lib/apt/lists/*
-WORKDIR /opt/codex
-COPY internal_harness/codex-slim/ ./
-ENV CARGO_PROFILE_RELEASE_LTO=true \
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
-  CARGO_PROFILE_RELEASE_STRIP=symbols \
-  CODEX_BWRAP_SOURCE_DIR=/opt/codex/vendor/bubblewrap
-RUN test -f /opt/codex/vendor/bubblewrap/bubblewrap.c \
-  || (echo "Missing vendored bubblewrap at /opt/codex/vendor/bubblewrap" && ls -la /opt/codex/vendor && exit 1)
-RUN cargo build -p codex-exec --release --locked
-
-FROM node:20-bookworm AS deps
+FROM node:20-trixie AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-FROM node:20-bookworm AS prod-deps
+FROM node:20-trixie AS prod-deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-FROM node:20-bookworm AS build
+FROM rust:1.93-slim-bookworm AS codex-build
+WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y build-essential pkg-config libcap-dev libssl-dev perl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+COPY internal_harness/codex-slim ./internal_harness/codex-slim
+RUN cd internal_harness/codex-slim && cargo build -p codex-exec --release --locked
+
+FROM node:20-trixie AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run prisma:generate
 RUN npm run build
 
-FROM node:20-bookworm AS runtime
+FROM node:20-trixie AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-# Runtime tools used by codex-exec and MCP helpers.
+ENV GRAPHIFY_PYTHON_BIN=/opt/graphify-venv/bin/python
+ARG GRAPHIFY_REF=96c757496cfe8dae027639c7c8a53d874c3d7e5b
 RUN apt-get update \
-  && apt-get install -y ripgrep git ca-certificates libcap2 \
+  && apt-get install -y ripgrep git ca-certificates libcap2 python3 python3-pip python3-venv \
+  && python3 -m venv /opt/graphify-venv \
+  && /opt/graphify-venv/bin/pip install --no-cache-dir --upgrade pip \
+  && /opt/graphify-venv/bin/pip install --no-cache-dir "git+https://github.com/Iweisc/graphify.git@${GRAPHIFY_REF}#egg=graphifyy" \
   && rm -rf /var/lib/apt/lists/*
-COPY --from=codex-build /opt/codex/target/release/codex-exec /usr/local/bin/codex-exec
+COPY --from=codex-build /app/internal_harness/codex-slim/target/release/codex-exec /usr/local/bin/codex-exec
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
@@ -45,3 +43,6 @@ COPY --from=build /app/prisma ./prisma
 COPY docker/codex-runner/tools ./docker/codex-runner/tools
 COPY package.json ./
 CMD ["node", "dist/server.js"]
+
+FROM runtime AS sandbox
+CMD ["node", "dist/sandbox/entrypoint.js"]

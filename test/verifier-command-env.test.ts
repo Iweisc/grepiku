@@ -211,3 +211,15 @@ test("verifier serializes repo tool commands through a shared execution gate", a
   assert.match(script, /const\s+runVerifierToolExclusive\s*=\s*createSerializedToolRunner\(\)/);
   assert.match(script, /await\s+runVerifierToolExclusive\(async\s*\(\)\s*=>\s*\{/);
 });
+
+test("verifier supports Kubernetes local cache mode without database credentials", async () => {
+  const script = await fs.readFile(
+    new URL("../docker/codex-runner/tools/verifier_mcp.js", import.meta.url),
+    "utf8"
+  );
+
+  assert.match(script, /VERIFIER_CACHE_DIR/);
+  assert.match(script, /cacheFileForTool/);
+  assert.match(script, /process\.env\.DATABASE_URL\s*\?/);
+  assert.match(script, /VERIFIER_REPO_COMMAND_MODE/);
+});

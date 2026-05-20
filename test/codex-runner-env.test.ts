@@ -166,6 +166,26 @@ test("Codex stage config can lower reasoning effort for targeted reviewer chunks
   assert.match(config, /model_reasoning_effort\s*=\s*"medium"/);
 });
 
+test("Kubernetes sandbox stage config uses local caches instead of backend secrets", async () => {
+  const { configForStage } = await loadRunnerInternals();
+  const reviewerConfig = configForStage("reviewer", {
+    ...sampleParams,
+    stage: "reviewer" as const,
+    executionMode: "kubernetes-sandbox" as const
+  });
+  const verifierConfig = configForStage("verifier", {
+    ...sampleParams,
+    stage: "verifier" as const,
+    executionMode: "kubernetes-sandbox" as const
+  });
+
+  assert.match(reviewerConfig, /RETRIEVAL_CONTEXT_PACK_PATH/);
+  assert.doesNotMatch(reviewerConfig, /INTERNAL_API_KEY/);
+  assert.match(verifierConfig, /VERIFIER_CACHE_DIR/);
+  assert.doesNotMatch(verifierConfig, /VERIFIER_REPO_COMMAND_MODE/);
+  assert.doesNotMatch(verifierConfig, /DATABASE_URL/);
+});
+
 test("mention stage launch uses an isolated cwd instead of the repo checkout", async () => {
   const { buildStageLaunch } = await loadRunnerInternals();
   const launch = buildStageLaunch(sampleParams);

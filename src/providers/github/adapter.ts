@@ -198,8 +198,7 @@ function normalizeGithubChangedFile(file: any): ProviderFileChange | null {
     path,
     status: typeof file?.status === "string" ? file.status : undefined,
     additions,
-    deletions,
-    patch: typeof file?.patch === "string" ? file.patch : null
+    deletions
   };
 }
 
