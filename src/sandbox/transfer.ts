@@ -19,13 +19,7 @@ function isWithinRoot(root: string, candidate: string): boolean {
 
 function normalizeRelativePath(value: string): string {
   return value
-export function validateTarEntryPath(name: string): string {
-  const raw = name.trim().replace(/\\/g, "/");
-  if (path.isAbsolute(raw)) {
-    throw new Error(`sandbox tar entry path is absolute: ${name}`);
-  }
-  const normalized = normalizeRelativePath(raw);
-  if (!normalized || normalized === ".") return ".";
+    .replace(/\\/g, "/")
     .replace(/^(?:\.\/)+/, "")
     .replace(/\/+$/, "");
 }
