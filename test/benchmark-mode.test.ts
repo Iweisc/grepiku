@@ -11,7 +11,9 @@ const {
   buildBenchmarkRoot,
   createBenchmarkProviderAdapter,
   resolveBaseSha,
-  resolveHeadSha
+  resolveHeadSha,
+  collectBenchmarkAgenticArtifacts,
+  formatBenchmarkTextOutput
 } = __benchmarkModeInternals;
 
 test("parseCliArgs parses --repo-path correctly", () => {
@@ -247,4 +249,67 @@ test("benchmark mode rejects option-like head refs instead of passing them to gi
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+
+test("benchmark mode collects agentic chunk diagnostics artifacts", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-benchmark-agentic-"));
+  const runId = 900000 + Math.floor(Math.random() * 100000);
+  const runDir = path.join(root, "var", "runs", String(runId));
+  const diagDir = path.join(runDir, "out", "review_chunks", "chunk-01");
+  try {
+    await fs.mkdir(diagDir, { recursive: true });
+    await fs.writeFile(
+      path.join(diagDir, "agentic_reviewer_diagnostics.json"),
+      JSON.stringify(
+        {
+          chunkId: "chunk-01",
+          grCommands: ["gr retrieve auth"],
+          shellCommands: ["git diff HEAD -- src/app.ts"],
+          retrievalCalls: 1,
+          graphCalls: 0,
+          findingsCiteInspectedEvidence: true
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const artifacts = await collectBenchmarkAgenticArtifacts(runId, root);
+    assert.equal(artifacts.enabled, true);
+    assert.equal(artifacts.chunkDiagnostics.length, 1);
+    assert.equal(artifacts.chunkDiagnostics[0].chunkId, "chunk-01");
+    assert.deepEqual(artifacts.chunkDiagnostics[0].grCommands, ["gr retrieve auth"]);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("benchmark text output includes agentic artifact count when present", () => {
+  const output = formatBenchmarkTextOutput({
+    run: {
+      id: 1,
+      status: "completed",
+      headSha: "a".repeat(40),
+      trigger: "manual",
+      startedAt: null,
+      completedAt: null,
+      summaryJson: null,
+      finalJson: null,
+      checksJson: null
+    },
+    repoId: 1,
+    pullRequestId: 2,
+    prNumber: 3,
+    statusComment: null,
+    inlineComments: [],
+    findings: [],
+    agenticArtifacts: {
+      enabled: true,
+      chunkDiagnostics: [{ path: "var/runs/1/out/review_chunks/chunk-01/agentic_reviewer_diagnostics.json" }]
+    }
+  });
+
+  assert.match(output, /Agentic chunks: 1/);
 });

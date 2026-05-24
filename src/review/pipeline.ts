@@ -9,6 +9,7 @@ import { createRunDirs, writeBundleFiles } from "./bundle.js";
 import {
   buildReviewerPrompt,
   buildDirectReviewerPrompt,
+  buildAgenticReviewerPrompt,
   buildEditorPrompt,
   buildVerifierPrompt,
   buildCoverageReviewerPrompt,
@@ -161,6 +162,93 @@ async function failInterruptedDuplicateRun(params: {
 
 const CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 3_800;
 const CHUNKED_REVIEW_MAX_FILES = 240;
+
+type LargePrReviewMode = "direct" | "agentic";
+
+function largePrReviewMode(): LargePrReviewMode {
+  return env.largePrReviewMode;
+}
+
+function shouldUseAgenticChunkReviewer(params: {
+  mode?: LargePrReviewMode;
+  chunkCount: number;
+  totalChangedLines: number;
+}): boolean {
+  return (
+    (params.mode ?? largePrReviewMode()) === "agentic" &&
+    params.chunkCount > 1 &&
+    params.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES
+  );
+}
+
+function reviewHasInspectedEvidence(review: ReviewOutput, filesInspected: string[]): boolean {
+  if (review.comments.length === 0) return true;
+  const inspected = new Set(filesInspected.map((item) => normalizePath(item)));
+  return review.comments.every((comment) => {
+    const evidence = (comment.evidence || "").trim();
+    if (!evidence) return false;
+    return inspected.size === 0 || inspected.has(normalizePath(comment.path));
+  });
+}
+
+function errorMessage(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
+}
+
+async function writeAgenticReviewerDiagnostics(params: {
+  chunkId: string;
+  reviewMode: string;
+  chunkOutDir: string;
+  review?: ReviewOutput | null;
+  error?: unknown;
+}): Promise<void> {
+  const latestMetricsPath = path.join(params.chunkOutDir, "stage_metrics_latest_reviewer.json");
+  const stageMetrics = await fs
+    .readFile(latestMetricsPath, "utf8")
+    .then((raw) =>
+      JSON.parse(raw) as {
+        usage?: unknown;
+        durationMs?: unknown;
+        agentic?: {
+          shellCommands?: string[];
+          grCommands?: string[];
+          filesInspected?: string[];
+          retrievalCalls?: number;
+          graphCalls?: number;
+          fallbackDiagnostics?: string[];
+        };
+      }
+    )
+    .catch(() => null);
+  const agentic = stageMetrics?.agentic || null;
+  const filesInspected = agentic?.filesInspected || [];
+  await fs.writeFile(
+    path.join(params.chunkOutDir, "agentic_reviewer_diagnostics.json"),
+    JSON.stringify(
+      {
+        chunkId: params.chunkId,
+        mode: params.reviewMode,
+        status: params.error ? "failed" : "completed",
+        elapsedMs: stageMetrics?.durationMs ?? null,
+        tokenUsage: stageMetrics?.usage ?? null,
+        shellCommands: agentic?.shellCommands || [],
+        grCommands: agentic?.grCommands || [],
+        filesInspected,
+        retrievalCalls: agentic?.retrievalCalls || 0,
+        graphCalls: agentic?.graphCalls || 0,
+        contextFallbackDiagnostics: agentic?.fallbackDiagnostics || [],
+        findingsCiteInspectedEvidence: params.review
+          ? reviewHasInspectedEvidence(params.review, filesInspected)
+          : null,
+        error: params.error ? errorMessage(params.error) : null
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
 const CHUNKED_REVIEW_MAX_PARALLEL = 48;
 const CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS = 48;
 
@@ -904,6 +992,7 @@ async function runReviewerChunk(params: {
   feedbackPolicy: FeedbackPolicy;
   prTitle?: string | null;
   prBody?: string | null;
+  baseSha?: string | null;
   headSha: string;
   repoId: number;
   runId: number;
@@ -956,52 +1045,89 @@ async function runReviewerChunk(params: {
     }
   } satisfies ReviewPromptOptions;
   const reasoningEffort = reasoningEffortForChunk(params.chunk, chunkContextPack);
+  const reviewMode = largePrReviewMode();
 
   console.log(
     `[run ${params.runId} pr#${params.prNumber}] reviewer ${params.chunk.id} starting ` +
       `files=${params.chunk.paths.length} changedLines=${params.chunk.changedLines} risk=${params.chunk.risk}`
   );
-  try {
-    await runDirectModelStage({
-      stage: "reviewer",
-      outDir: chunkOutDir,
-      prompt:
-        buildDirectReviewerPrompt({
-          config: params.resolvedConfig,
-          prMarkdown: params.prMarkdown,
-          diffPatch: params.chunk.diffPatch,
-          changedFiles: params.chunk.changedFiles,
-          contextPack: chunkContextPack,
-          warnings: params.warnings,
-          options: chunkPromptOptions
-        }) + buildFeedbackHint(params.feedbackPolicy),
-      reviewRunId: params.runId,
-      prNumber: params.prNumber,
-      reasoningEffort,
-      outputFileName: "draft_review.json"
-    });
-  } catch (err) {
-    console.warn(
-      `[run ${params.runId} pr#${params.prNumber}] direct reviewer ${params.chunk.id} failed; falling back to codex: ${
-        err instanceof Error ? err.message : String(err)
-      }`
-    );
+  if (reviewMode === "agentic") {
     const reviewerPrompt =
-      buildReviewerPrompt(params.resolvedConfig, chunkPromptPaths, chunkPromptOptions) +
-      buildFeedbackHint(params.feedbackPolicy);
-    await runCodexStage({
-      stage: "reviewer",
-      repoPath: params.repoPath,
-      bundleDir: chunkBundleDir,
-      outDir: chunkOutDir,
-      codexHomeDir: chunkCodexHomeDir,
-      prompt: reviewerPrompt,
-      headSha: params.headSha,
-      repoId: params.repoId,
-      reviewRunId: params.runId,
-      prNumber: params.prNumber,
-      reasoningEffort
-    });
+      buildAgenticReviewerPrompt({
+        paths: chunkPromptPaths,
+        baseSha: params.baseSha,
+        headSha: params.headSha,
+        prNumber: params.prNumber,
+        chunkReview: chunkPromptOptions.chunkReview,
+        config: params.resolvedConfig
+      }) + buildFeedbackHint(params.feedbackPolicy);
+    try {
+      await runCodexStage({
+        stage: "reviewer",
+        repoPath: params.repoPath,
+        bundleDir: chunkBundleDir,
+        outDir: chunkOutDir,
+        codexHomeDir: chunkCodexHomeDir,
+        prompt: reviewerPrompt,
+        headSha: params.headSha,
+        repoId: params.repoId,
+        reviewRunId: params.runId,
+        prNumber: params.prNumber,
+        reasoningEffort,
+        reviewerMode: "agentic"
+      });
+    } catch (err) {
+      await writeAgenticReviewerDiagnostics({
+        chunkId: params.chunk.id,
+        reviewMode,
+        chunkOutDir,
+        error: err
+      }).catch(() => undefined);
+      throw err;
+    }
+  } else {
+    try {
+      await runDirectModelStage({
+        stage: "reviewer",
+        outDir: chunkOutDir,
+        prompt:
+          buildDirectReviewerPrompt({
+            config: params.resolvedConfig,
+            prMarkdown: params.prMarkdown,
+            diffPatch: params.chunk.diffPatch,
+            changedFiles: params.chunk.changedFiles,
+            contextPack: chunkContextPack,
+            warnings: params.warnings,
+            options: chunkPromptOptions
+          }) + buildFeedbackHint(params.feedbackPolicy),
+        reviewRunId: params.runId,
+        prNumber: params.prNumber,
+        reasoningEffort,
+        outputFileName: "draft_review.json"
+      });
+    } catch (err) {
+      console.warn(
+        `[run ${params.runId} pr#${params.prNumber}] direct reviewer ${params.chunk.id} failed; falling back to codex: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      const reviewerPrompt =
+        buildReviewerPrompt(params.resolvedConfig, chunkPromptPaths, chunkPromptOptions) +
+        buildFeedbackHint(params.feedbackPolicy);
+      await runCodexStage({
+        stage: "reviewer",
+        repoPath: params.repoPath,
+        bundleDir: chunkBundleDir,
+        outDir: chunkOutDir,
+        codexHomeDir: chunkCodexHomeDir,
+        prompt: reviewerPrompt,
+        headSha: params.headSha,
+        repoId: params.repoId,
+        reviewRunId: params.runId,
+        prNumber: params.prNumber,
+        reasoningEffort
+      });
+    }
   }
 
   const review = await readJsonWithFallback(
@@ -1009,6 +1135,14 @@ async function runReviewerChunk(params: {
     ReviewSchema,
     "reviewer"
   );
+  if (reviewMode === "agentic") {
+    await writeAgenticReviewerDiagnostics({
+      chunkId: params.chunk.id,
+      reviewMode,
+      chunkOutDir,
+      review
+    });
+  }
   return { chunk: params.chunk, review };
 }
 
@@ -1028,6 +1162,7 @@ async function runChunkedReviewer(params: {
   feedbackPolicy: FeedbackPolicy;
   prTitle?: string | null;
   prBody?: string | null;
+  baseSha?: string | null;
   headSha: string;
   repoId: number;
   runId: number;
@@ -1055,6 +1190,7 @@ async function runChunkedReviewer(params: {
         feedbackPolicy: params.feedbackPolicy,
         prTitle: params.prTitle,
         prBody: params.prBody,
+        baseSha: params.baseSha,
         headSha: params.headSha,
         repoId: params.repoId,
         runId: params.runId,
@@ -1505,7 +1641,7 @@ export async function processReviewJob(
     let draft: ReviewOutput;
     if (shouldUseChunkedReviewer) {
       console.log(
-        `[run ${run.id} pr#${prNumber}] using chunked reviewer ` +
+        `[run ${run.id} pr#${prNumber}] using chunked reviewer mode=${largePrReviewMode()} ` +
           `chunks=${chunkPlan.chunks.length} changedLines=${chunkPlan.stats.totalChangedLines}`
       );
       draft = await runChunkedReviewer({
@@ -1524,6 +1660,7 @@ export async function processReviewJob(
         feedbackPolicy,
         prTitle: refreshedPullRequestState.title,
         prBody: refreshedPullRequestState.body,
+        baseSha: refreshed.baseSha,
         headSha: refreshed.headSha,
         repoId: repo.id,
         runId: run.id,
@@ -2296,6 +2433,9 @@ export const __pipelineInternals = {
   hasBlockingVisibleFindings,
   renderStatusComment,
   resolveStatusCheckConclusion,
+  largePrReviewMode,
+  shouldUseAgenticChunkReviewer,
+  reviewHasInspectedEvidence,
   shouldRecoverRunningDuplicateRun,
   shouldSkipDuplicateReviewRun,
   upsertSummaryBlock

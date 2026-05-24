@@ -39,6 +39,13 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=build /app/dist ./dist
+RUN printf '#!/bin/sh
+exec node /app/dist/tools/gr.js "$@"
+' > /usr/local/bin/gr \
+  && printf '#!/bin/sh
+exec node /app/dist/tools/readOnlyGit.js "$@"
+' > /usr/local/bin/grepiku-readonly-git \
+  && chmod +x /usr/local/bin/gr /usr/local/bin/grepiku-readonly-git
 COPY --from=build /app/prisma ./prisma
 COPY docker/codex-runner/tools ./docker/codex-runner/tools
 COPY package.json ./

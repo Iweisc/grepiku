@@ -46,6 +46,7 @@ function sampleEnv(): Env {
     codexExecPath: "/usr/local/bin/codex-exec",
     codexStageLogOutput: false,
     codexModelReasoningEffort: "high",
+    largePrReviewMode: "direct",
     internalApiUrl: "http://web:3000/internal/retrieval",
     sandboxExecutionMode: "kubernetes",
     k8sNamespace: "ns-0kkzfz",
@@ -195,6 +196,35 @@ test("Kubernetes sandbox seeds verifier out artifacts into /work/out", () => {
       excludeGit: true
     }
   ]);
+});
+
+test("Kubernetes sandbox preserves git metadata for agentic reviewer stage", () => {
+  const uploads = __k8sSandboxInternals.buildSandboxUploadPlan({
+    task: {
+      kind: "codex-stage",
+      params: {
+        stage: "reviewer",
+        repoPath: "/app/var/repos/demo",
+        bundleDir: "/app/var/runs/9/bundle",
+        outDir: "/app/var/runs/9/out",
+        codexHomeDir: "/app/var/runs/9/codex-home",
+        prompt: "agentic review",
+        headSha: "abc123",
+        repoId: 1,
+        reviewRunId: 9,
+        prNumber: 44,
+        executionMode: "local",
+        reviewerMode: "agentic"
+      }
+    },
+    localRepoPath: "/app/var/repos/demo",
+    localBundleDir: "/app/var/runs/9/bundle",
+    localOutDir: "/app/var/runs/9/out",
+    includeGit: true
+  });
+
+  assert.equal(uploads[0]?.excludeGit, false);
+  assert.equal(uploads[1]?.excludeGit, true);
 });
 
 test("Kubernetes sandbox does not upload prior out artifacts for reviewer stage", () => {

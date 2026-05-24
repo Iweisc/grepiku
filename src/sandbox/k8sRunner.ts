@@ -575,7 +575,9 @@ function shouldSeedSandboxOutDir(task: SandboxTask): boolean {
 }
 
 function shouldPreserveGitMetadata(request: KubernetesSandboxRequest): boolean {
-  return Boolean(request.includeGit && request.task.kind === "mention-implementation-sync");
+  if (!request.includeGit) return false;
+  if (request.task.kind === "mention-implementation-sync") return true;
+  return request.task.kind === "codex-stage" && request.task.params.reviewerMode === "agentic";
 }
 
 function buildSandboxUploadPlan(request: KubernetesSandboxRequest): SandboxUploadPlanEntry[] {
@@ -758,7 +760,7 @@ export async function runCodexStageInKubernetes(params: CodexRunParams): Promise
     localBundleDir: params.bundleDir,
     localOutDir: params.outDir,
     syncRepoBack: params.stage === "mention",
-    includeGit: false
+    includeGit: params.stage === "reviewer" && params.reviewerMode === "agentic"
   });
   if (!result.metrics) {
     throw new Error("sandbox codex stage did not return metrics");

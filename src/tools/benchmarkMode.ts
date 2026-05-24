@@ -70,6 +70,20 @@ type BenchmarkRunResult = {
     finding?: BenchmarkFinding | null;
   }>;
   findings: BenchmarkFinding[];
+  agenticArtifacts?: BenchmarkAgenticArtifacts;
+};
+
+type BenchmarkAgenticArtifacts = {
+  enabled: boolean;
+  chunkDiagnostics: Array<{
+    path: string;
+    chunkId?: string;
+    grCommands?: string[];
+    shellCommands?: string[];
+    retrievalCalls?: number;
+    graphCalls?: number;
+    findingsCiteInspectedEvidence?: boolean;
+  }>;
 };
 
 type BenchmarkFinding = {
@@ -631,11 +645,44 @@ async function loadBenchmarkResult(params: {
         }
       : null,
     inlineComments,
-    findings: findings.map(normalizeFinding)
+    findings: findings.map(normalizeFinding),
+    agenticArtifacts: await collectBenchmarkAgenticArtifacts(run.id)
   };
 }
 
-export function formatBenchmarkTextOutput(result: BenchmarkRunResult): string {
+export async function collectBenchmarkAgenticArtifacts(
+  runId: number,
+  projectRoot = process.env.PROJECT_ROOT || process.cwd()
+): Promise<BenchmarkAgenticArtifacts> {
+  const resolvedProjectRoot = path.resolve(projectRoot);
+  const runRoot = path.join(resolvedProjectRoot, "var", "runs", String(runId), "out", "review_chunks");
+  const diagnostics: BenchmarkAgenticArtifacts["chunkDiagnostics"] = [];
+  async function walk(dir: string): Promise<void> {
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+      if (entry.name !== "agentic_reviewer_diagnostics.json") continue;
+      const parsed = JSON.parse(await fs.readFile(fullPath, "utf8"));
+      diagnostics.push({
+        path: path.relative(resolvedProjectRoot, fullPath),
+        chunkId: typeof parsed.chunkId === "string" ? parsed.chunkId : undefined,
+        grCommands: Array.isArray(parsed.grCommands) ? parsed.grCommands : undefined,
+        shellCommands: Array.isArray(parsed.shellCommands) ? parsed.shellCommands : undefined,
+        retrievalCalls: typeof parsed.retrievalCalls === "number" ? parsed.retrievalCalls : undefined,
+        graphCalls: typeof parsed.graphCalls === "number" ? parsed.graphCalls : undefined,
+        findingsCiteInspectedEvidence: typeof parsed.findingsCiteInspectedEvidence === "boolean" ? parsed.findingsCiteInspectedEvidence : undefined
+      });
+    }
+  }
+  await walk(runRoot);
+  return { enabled: diagnostics.length > 0, chunkDiagnostics: diagnostics.sort((a, b) => a.path.localeCompare(b.path)) };
+}
+
+function formatBenchmarkTextOutput(result: BenchmarkRunResult): string {
   const lines: string[] = [];
   lines.push("=== Benchmark Review ===");
   lines.push(`Run: ${result.run.id} (${result.run.status})`);
@@ -644,6 +691,9 @@ export function formatBenchmarkTextOutput(result: BenchmarkRunResult): string {
   if (result.statusComment?.body) {
     lines.push(result.statusComment.body);
     lines.push("");
+  }
+  if (result.agenticArtifacts?.enabled) {
+    lines.push(`Agentic chunks: ${result.agenticArtifacts.chunkDiagnostics.length}`);
   }
   if (result.findings.length === 0) {
     lines.push("No persisted findings.");
@@ -782,7 +832,8 @@ export const __benchmarkModeInternals = {
   createBenchmarkProviderAdapter,
   formatBenchmarkTextOutput,
   resolveBaseSha,
-  resolveHeadSha
+  resolveHeadSha,
+  collectBenchmarkAgenticArtifacts
 };
 
 const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : "";

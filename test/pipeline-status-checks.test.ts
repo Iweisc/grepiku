@@ -184,3 +184,66 @@ test("inline comment sync ignores spoofed marker comments from non-bot authors",
     await closeQueueClients();
   }
 });
+
+
+test("agentic chunk mode selector only enables configured large chunked reviews", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    assert.equal(
+      (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
+        mode: "agentic",
+        chunkCount: 2,
+        totalChangedLines: 16000
+      }),
+      true
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
+        mode: "direct",
+        chunkCount: 2,
+        totalChangedLines: 16000
+      }),
+      false
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
+        mode: "agentic",
+        chunkCount: 1,
+        totalChangedLines: 30000
+      }),
+      false
+    );
+  } finally {
+    await closeQueueClients();
+  }
+});
+
+test("agentic evidence diagnostic requires evidence and tracks inspected files when available", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    const review = {
+      summary: { overview: "", risk: "low", confidence: 1, key_concerns: [], what_to_test: [], file_breakdown: [] },
+      comments: [
+        {
+          comment_id: "c1",
+          comment_key: "c1",
+          path: "src/app.ts",
+          side: "RIGHT",
+          line: 1,
+          severity: "important",
+          category: "bug",
+          title: "Bug",
+          body: "Body",
+          evidence: "+broken",
+          confidence: "high"
+        }
+      ]
+    };
+    assert.equal((__pipelineInternals as any).reviewHasInspectedEvidence(review, ["src/app.ts"]), true);
+    assert.equal((__pipelineInternals as any).reviewHasInspectedEvidence(review, ["src/other.ts"]), false);
+  } finally {
+    await closeQueueClients();
+  }
+});
