@@ -108,6 +108,13 @@ test("agentic reviewer prompt is a small seed that points context discovery to g
   assert.match(prompt, /gr --help/);
   assert.match(prompt, /git diff/);
   assert.match(prompt, /Use `gr` only for Grepiku-specific retrieval/);
+  assert.match(prompt, /Required discovery order/);
+  assert.match(prompt, /gr changed-context --top-k 8/);
+  assert.match(prompt, /gr retrieve --top-k 8/);
+  assert.match(prompt, /Before calling `gr rules --path`, `gr risk --path`, or `gr tests-for`/);
+  assert.match(prompt, /uses the chunk query automatically/);
+  assert.match(prompt, /at least one `gr changed-context` or `gr retrieve` call should appear in normal completed chunk reviews/);
+  assert.match(prompt, /If the context command returns no useful context, explicitly continue/);
   assert.match(prompt, /chunk-02 \(2\/5\)/);
   assert.match(prompt, /\/bundle\/context_pack\.json/);
   assert.doesNotMatch(prompt, /context_pack:\n/);

@@ -245,6 +245,26 @@ test("agentic metrics scanner captures shell and gr usage", async () => {
   assert.equal(metrics.filesInspected.includes("src/app.ts"), true);
 });
 
+test("agentic metrics scanner counts changed-context as retrieval usage", async () => {
+  const { createAgenticUsageAccumulator, scanAgenticUsageLine, finalizeAgenticUsage } = await loadRunnerInternals();
+  const acc = createAgenticUsageAccumulator();
+  scanAgenticUsageLine(
+    JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "command_execution",
+        command: "gr changed-context --top-k 8 --json && gr risk --path src/app.ts",
+        exit_code: 0
+      }
+    }),
+    acc
+  );
+  const metrics = finalizeAgenticUsage(acc);
+
+  assert.equal(metrics.retrievalCalls, 1);
+  assert.equal(metrics.grCommands.includes("gr changed-context --top-k 8 --json"), true);
+});
+
 test("agentic metrics scanner captures codex exec_command payload events", async () => {
   const { createAgenticUsageAccumulator, scanAgenticUsageLine, finalizeAgenticUsage } = await loadRunnerInternals();
   const acc = createAgenticUsageAccumulator();

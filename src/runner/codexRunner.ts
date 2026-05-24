@@ -531,7 +531,7 @@ function recordCommandText(acc: AgenticUsageAccumulator, command: string): void 
   for (const match of grMatches) {
     const normalized = match.trim();
     acc.grCommands.add(normalized);
-    if (/\bgr\s+retrieve\b/.test(normalized)) acc.retrievalCalls += 1;
+    if (/\bgr\s+(?:retrieve|changed-context)\b/.test(normalized)) acc.retrievalCalls += 1;
     if (/\bgr\s+graph\b/.test(normalized)) acc.graphCalls += 1;
   }
   const fileMatches = trimmed.match(/(?:sed|cat|rg|git\s+(?:diff|show|grep|blame))\s+[^\n]*/g) || [];

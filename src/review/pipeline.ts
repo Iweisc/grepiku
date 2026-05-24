@@ -171,11 +171,13 @@ function largePrReviewMode(): LargePrReviewMode {
 
 function shouldUseAgenticChunkReviewer(params: {
   mode?: LargePrReviewMode;
+  sandboxExecutionMode?: "local" | "kubernetes";
   chunkCount: number;
   totalChangedLines: number;
 }): boolean {
   return (
     (params.mode ?? largePrReviewMode()) === "agentic" &&
+    (params.sandboxExecutionMode ?? env.sandboxExecutionMode) !== "kubernetes" &&
     params.chunkCount > 1 &&
     params.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES
   );
@@ -222,6 +224,15 @@ async function writeAgenticReviewerDiagnostics(params: {
     .catch(() => null);
   const agentic = stageMetrics?.agentic || null;
   const filesInspected = agentic?.filesInspected || [];
+  const grCommands = agentic?.grCommands || [];
+  const retrievalCalls = agentic?.retrievalCalls || 0;
+  const changedContextCalls = grCommands.filter((command) => /\bgr\s+changed-context\b/.test(command)).length;
+  const contextFallbackDiagnostics = [...(agentic?.fallbackDiagnostics || [])];
+  if (!params.error && (params.review?.comments.length || 0) > 0 && retrievalCalls === 0 && changedContextCalls === 0) {
+    contextFallbackDiagnostics.push(
+      "completed agentic review produced findings without gr retrieve or gr changed-context usage"
+    );
+  }
   await fs.writeFile(
     path.join(params.chunkOutDir, "agentic_reviewer_diagnostics.json"),
     JSON.stringify(
@@ -232,11 +243,12 @@ async function writeAgenticReviewerDiagnostics(params: {
         elapsedMs: stageMetrics?.durationMs ?? null,
         tokenUsage: stageMetrics?.usage ?? null,
         shellCommands: agentic?.shellCommands || [],
-        grCommands: agentic?.grCommands || [],
+        grCommands,
         filesInspected,
-        retrievalCalls: agentic?.retrievalCalls || 0,
+        retrievalCalls,
+        changedContextCalls,
         graphCalls: agentic?.graphCalls || 0,
-        contextFallbackDiagnostics: agentic?.fallbackDiagnostics || [],
+        contextFallbackDiagnostics,
         findingsCiteInspectedEvidence: params.review
           ? reviewHasInspectedEvidence(params.review, filesInspected)
           : null,
@@ -2436,6 +2448,7 @@ export const __pipelineInternals = {
   largePrReviewMode,
   shouldUseAgenticChunkReviewer,
   reviewHasInspectedEvidence,
+  writeAgenticReviewerDiagnostics,
   shouldRecoverRunningDuplicateRun,
   shouldSkipDuplicateReviewRun,
   upsertSummaryBlock

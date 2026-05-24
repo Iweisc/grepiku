@@ -281,6 +281,10 @@ test("benchmark mode collects agentic chunk diagnostics artifacts", async () => 
     assert.equal(artifacts.chunkDiagnostics.length, 1);
     assert.equal(artifacts.chunkDiagnostics[0].chunkId, "chunk-01");
     assert.deepEqual(artifacts.chunkDiagnostics[0].grCommands, ["gr retrieve auth"]);
+    assert.deepEqual(artifacts.retrievalSummary, {
+      chunksWithRetrieval: 1,
+      chunksMissingRetrieval: 0
+    });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -307,9 +311,12 @@ test("benchmark text output includes agentic artifact count when present", () =>
     findings: [],
     agenticArtifacts: {
       enabled: true,
+      retrievalSummary: { chunksWithRetrieval: 0, chunksMissingRetrieval: 1 },
       chunkDiagnostics: [{ path: "var/runs/1/out/review_chunks/chunk-01/agentic_reviewer_diagnostics.json" }]
     }
   });
 
   assert.match(output, /Agentic chunks: 1/);
+  assert.match(output, /Agentic retrieval: 0\/1 chunks used gr retrieve\/changed-context/);
+  assert.match(output, /Agentic retrieval warning: 1 chunks had zero gr retrieve\/changed-context calls/);
 });

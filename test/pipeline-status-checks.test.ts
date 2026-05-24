@@ -214,6 +214,15 @@ test("agentic chunk mode selector only enables configured large chunked reviews"
       }),
       false
     );
+    assert.equal(
+      (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
+        mode: "agentic",
+        sandboxExecutionMode: "kubernetes",
+        chunkCount: 2,
+        totalChangedLines: 30000
+      }),
+      false
+    );
   } finally {
     await closeQueueClients();
   }
@@ -244,6 +253,55 @@ test("agentic evidence diagnostic requires evidence and tracks inspected files w
     assert.equal((__pipelineInternals as any).reviewHasInspectedEvidence(review, ["src/app.ts"]), true);
     assert.equal((__pipelineInternals as any).reviewHasInspectedEvidence(review, ["src/other.ts"]), false);
   } finally {
+    await closeQueueClients();
+  }
+});
+
+
+test("agentic diagnostics flags findings without retrieval-like context usage", async () => {
+  ensureReviewRenderTestEnv();
+  const root = await import("node:fs/promises");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const chunkOutDir = await root.mkdtemp(path.join(os.tmpdir(), "grepiku-agentic-diag-"));
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    const review = {
+      summary: { overview: "", risk: "low", confidence: 1, key_concerns: [], what_to_test: [], file_breakdown: [] },
+      comments: [
+        {
+          comment_id: "c1",
+          comment_key: "c1",
+          path: "src/app.ts",
+          side: "RIGHT",
+          line: 1,
+          severity: "important",
+          category: "bug",
+          title: "Bug",
+          body: "Body",
+          evidence: "+broken",
+          confidence: "high"
+        }
+      ]
+    };
+    await root.writeFile(
+      path.join(chunkOutDir, "stage_metrics_latest_reviewer.json"),
+      JSON.stringify({ durationMs: 12, agentic: { grCommands: ["gr risk --path src/app.ts"], retrievalCalls: 0 } }),
+      "utf8"
+    );
+    await (__pipelineInternals as any).writeAgenticReviewerDiagnostics({
+      chunkId: "chunk-01",
+      reviewMode: "agentic",
+      chunkOutDir,
+      review
+    });
+    const diagnostics = JSON.parse(
+      await root.readFile(path.join(chunkOutDir, "agentic_reviewer_diagnostics.json"), "utf8")
+    );
+    assert.equal(diagnostics.changedContextCalls, 0);
+    assert.match(diagnostics.contextFallbackDiagnostics.join("\n"), /without gr retrieve or gr changed-context/);
+  } finally {
+    await root.rm(chunkOutDir, { recursive: true, force: true });
     await closeQueueClients();
   }
 });

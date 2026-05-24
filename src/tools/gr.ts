@@ -31,13 +31,19 @@ type ParsedArgs = {
 const HELP_TEXT = `gr - Grepiku review context CLI
 
 Usage:
-  gr retrieve <query> [--top-k N] [--json]
+  gr changed-context [--top-k N] [--json]
+  gr retrieve [query] [--top-k N] [--json]
   gr graph impact [--json]
   gr graph neighbors <path-or-symbol> [--depth N] [--json]
   gr symbol-context <path> <symbol> [--json]
   gr rules --path <path> [--json]
   gr risk --path <path> [--json]
   gr tests-for <path> [--json]
+
+Recommended review flow:
+  1. Start with gr changed-context --top-k 8, or gr retrieve --top-k 8 for semantic context.
+  2. Inspect the diff and relevant files with shell tools.
+  3. Use gr rules/risk/tests-for for specific files after the chunk-level context pass.
 
 Use normal shell tools for repo inspection: git diff, git grep, rg, sed, and file reads.
 gr only returns Grepiku-specific cached retrieval, graph, rules, risk, symbol, and test hints.`;
@@ -78,6 +84,36 @@ function scoreContextItem(item: JsonRecord, terms: string[]): number {
     if (haystack.includes(term)) score += 1;
   }
   return score;
+}
+
+function compactContextArray(value: unknown, limit: number): unknown[] {
+  return asArray(value).slice(0, limit);
+}
+
+function compactRetrievedItems(value: unknown[], textChars: number): JsonRecord[] {
+  return value.filter(isRecord).map((item) => ({
+    kind: item.kind,
+    path: item.path,
+    symbol: item.symbol,
+    score: item.score,
+    isPattern: item.isPattern === true || undefined,
+    text: compactString(item.text, textChars)
+  }));
+}
+
+function defaultRetrieveQuery(context: GrContext): string {
+  const query = compactString(context.contextPack.query, 2400);
+  if (query) return query;
+  const reviewFocus = asArray(context.contextPack.reviewFocus)
+    .map((item) => (typeof item === "string" ? item : ""))
+    .filter(Boolean)
+    .slice(0, 12);
+  const changedPaths = asArray(context.contextPack.changedFileStats)
+    .filter(isRecord)
+    .map((item) => (typeof item.path === "string" ? item.path : ""))
+    .filter(Boolean)
+    .slice(0, 40);
+  return [...reviewFocus, ...changedPaths].join("\n");
 }
 
 function compactString(value: unknown, maxChars = 1200): string | undefined {
@@ -148,12 +184,26 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function retrieve(context: GrContext, query: string, topK: number): unknown[] {
-  const terms = queryTerms(query);
+  const terms = queryTerms(query || defaultRetrieveQuery(context));
   return asArray(context.contextPack.retrieved)
     .filter(isRecord)
     .map((item) => ({ ...item, score: scoreContextItem(item, terms) }))
     .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
     .slice(0, topK);
+}
+
+function changedContext(context: GrContext, topK: number): JsonRecord {
+  return {
+    query: compactString(context.contextPack.query, 1600) || defaultRetrieveQuery(context),
+    reviewFocus: compactContextArray(context.contextPack.reviewFocus, 12),
+    changedFileStats: compactContextArray(context.contextPack.changedFileStats, 80),
+    hotspots: compactContextArray(context.contextPack.hotspots, 8),
+    relatedFiles: compactContextArray(context.contextPack.relatedFiles, 24),
+    graphLinks: compactContextArray(context.contextPack.graphLinks, 48),
+    graphPaths: compactContextArray(context.contextPack.graphPaths, 12),
+    graphDebug: context.contextPack.graphDebug || null,
+    retrieved: compactRetrievedItems(retrieve(context, defaultRetrieveQuery(context), topK), 900)
+  };
 }
 
 function graphImpact(context: GrContext): JsonRecord {
@@ -325,6 +375,9 @@ export async function runGr(argv: string[], loadContext = loadGrContext): Promis
   if (rootCommand === "retrieve") {
     return { status: diagnostics.length ? "fallback" : "ok", command: "retrieve", data: retrieve(context, [subCommand, ...rest].filter(Boolean).join(" "), parsed.topK), diagnostics };
   }
+  if (rootCommand === "changed-context") {
+    return { status: diagnostics.length ? "fallback" : "ok", command: "changed-context", data: changedContext(context, parsed.topK), diagnostics };
+  }
   if (rootCommand === "graph" && subCommand === "impact") {
     return { status: diagnostics.length ? "fallback" : "ok", command: "graph impact", data: graphImpact(context), diagnostics };
   }
@@ -362,6 +415,8 @@ export const __grInternals = {
   queryTerms,
   scoreContextItem,
   retrieve,
+  defaultRetrieveQuery,
+  changedContext,
   graphImpact,
   graphNeighbors,
   riskForPath,

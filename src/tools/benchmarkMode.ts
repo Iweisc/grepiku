@@ -75,6 +75,10 @@ type BenchmarkRunResult = {
 
 type BenchmarkAgenticArtifacts = {
   enabled: boolean;
+  retrievalSummary: {
+    chunksWithRetrieval: number;
+    chunksMissingRetrieval: number;
+  };
   chunkDiagnostics: Array<{
     path: string;
     chunkId?: string;
@@ -679,7 +683,16 @@ export async function collectBenchmarkAgenticArtifacts(
     }
   }
   await walk(runRoot);
-  return { enabled: diagnostics.length > 0, chunkDiagnostics: diagnostics.sort((a, b) => a.path.localeCompare(b.path)) };
+  const sortedDiagnostics = diagnostics.sort((a, b) => a.path.localeCompare(b.path));
+  const chunksWithRetrieval = sortedDiagnostics.filter((diag) => (diag.retrievalCalls || 0) > 0).length;
+  return {
+    enabled: sortedDiagnostics.length > 0,
+    retrievalSummary: {
+      chunksWithRetrieval,
+      chunksMissingRetrieval: sortedDiagnostics.length - chunksWithRetrieval
+    },
+    chunkDiagnostics: sortedDiagnostics
+  };
 }
 
 function formatBenchmarkTextOutput(result: BenchmarkRunResult): string {
@@ -693,7 +706,19 @@ function formatBenchmarkTextOutput(result: BenchmarkRunResult): string {
     lines.push("");
   }
   if (result.agenticArtifacts?.enabled) {
+    const retrievalSummary = result.agenticArtifacts.retrievalSummary;
     lines.push(`Agentic chunks: ${result.agenticArtifacts.chunkDiagnostics.length}`);
+    if (retrievalSummary) {
+      const totalChunks = retrievalSummary.chunksWithRetrieval + retrievalSummary.chunksMissingRetrieval;
+      lines.push(
+        `Agentic retrieval: ${retrievalSummary.chunksWithRetrieval}/${totalChunks} chunks used gr retrieve/changed-context`
+      );
+      if (retrievalSummary.chunksMissingRetrieval > 0) {
+        lines.push(
+          `Agentic retrieval warning: ${retrievalSummary.chunksMissingRetrieval} chunks had zero gr retrieve/changed-context calls`
+        );
+      }
+    }
   }
   if (result.findings.length === 0) {
     lines.push("No persisted findings.");
