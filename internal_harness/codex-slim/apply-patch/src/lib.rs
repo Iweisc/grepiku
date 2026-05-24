@@ -297,7 +297,10 @@ fn ensure_no_symlink_components(path: &Path, allow_final_symlink: bool) -> anyho
                 if allow_final_symlink && index == last_index {
                     continue;
                 }
-                anyhow::bail!("Refusing to apply patch through symlink path {}", current.display());
+                anyhow::bail!(
+                    "Refusing to apply patch through symlink path {}",
+                    current.display()
+                );
             }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

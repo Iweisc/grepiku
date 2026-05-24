@@ -190,7 +190,6 @@ use crate::protocol::ModelRerouteEvent;
 use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
-use crate::protocol::PatchApplyStatus;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReasoningContentDeltaEvent;
@@ -1544,22 +1543,6 @@ impl Session {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         format!("auto-compact-{id}")
     }
-
-    pub(crate) async fn route_realtime_text_input(self: &Arc<Self>, text: String) {
-        handlers::user_input_or_turn(
-            self,
-            self.next_internal_sub_id(),
-            Op::UserInput {
-                items: vec![UserInput::Text {
-                    text,
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-            },
-        )
-        .await;
-    }
-
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
@@ -2168,12 +2151,6 @@ impl Session {
             .original_config_do_not_use
             .clone()
     }
-
-    pub(crate) async fn provider(&self) -> ModelProviderInfo {
-        let state = self.state.lock().await;
-        state.session_configuration.provider.clone()
-    }
-
     pub(crate) async fn reload_user_config_layer(&self) {
         let config_toml_path = {
             let state = self.state.lock().await;
@@ -2255,9 +2232,6 @@ impl Session {
             msg,
         };
         self.send_event_raw(event).await;
-        self.maybe_mirror_event_text_to_realtime(&legacy_source)
-            .await;
-
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
             let legacy_event = Event {
@@ -2265,18 +2239,6 @@ impl Session {
                 msg: legacy,
             };
             self.send_event_raw(legacy_event).await;
-        }
-    }
-
-    async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
-        let Some(text) = realtime_text_for_event(msg) else {
-            return;
-        };
-        if self.conversation.running_state().await.is_none() {
-            return;
-        }
-        if let Err(err) = self.conversation.text_in(text).await {
-            debug!("failed to mirror event text to realtime conversation: {err}");
         }
     }
 
@@ -5698,56 +5660,6 @@ fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String 
             codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
         })
         .collect()
-}
-
-fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
-    match msg {
-        EventMsg::AgentMessage(event) => Some(event.message.clone()),
-        EventMsg::ItemCompleted(event) => match &event.item {
-            TurnItem::AgentMessage(item) => Some(agent_message_text(item)),
-            _ => None,
-        },
-        EventMsg::ExecCommandBegin(event) => {
-            let command = event.command.join(" ");
-            Some(format!(
-                "Exec command started: {command}\nWorking directory: {}",
-                event.cwd.display()
-            ))
-        }
-        EventMsg::PatchApplyBegin(event) => {
-            let mut files: Vec<String> = event
-                .changes
-                .keys()
-                .map(|path| path.display().to_string())
-                .collect();
-            files.sort();
-            let file_list = if files.is_empty() {
-                "none".to_string()
-            } else {
-                files.join(", ")
-            };
-            Some(format!(
-                "apply_patch started ({count} file change(s))\nFiles: {file_list}",
-                count = files.len()
-            ))
-        }
-        EventMsg::PatchApplyEnd(event) => {
-            let status = match event.status {
-                PatchApplyStatus::Completed => "completed",
-                PatchApplyStatus::Failed => "failed",
-                PatchApplyStatus::Declined => "declined",
-            };
-            let mut text = format!("apply_patch {status}");
-            if !event.stdout.is_empty() {
-                text.push_str(&format!("\nstdout:\n{}", event.stdout));
-            }
-            if !event.stderr.is_empty() {
-                text.push_str(&format!("\nstderr:\n{}", event.stderr));
-            }
-            Some(text)
-        }
-        _ => None,
-    }
 }
 
 /// Split the stream into normal assistant text vs. proposed plan content.

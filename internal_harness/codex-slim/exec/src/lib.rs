@@ -5,10 +5,13 @@
 #![deny(clippy::print_stdout)]
 
 mod cli;
+mod config_summary;
+mod elapsed;
 mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
+mod sandbox_summary;
 
 pub use cli::Cli;
 pub use cli::Command;
