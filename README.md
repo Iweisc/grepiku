@@ -348,8 +348,12 @@ The command exits non-zero in `--ci` mode when recall, precision, or p95 SLO thr
 npm run start:mcp-ide
 ```
 
-### Local demo review runner
+### Local benchmark review runner
+
+Run the production review pipeline against a local repository without posting to a real PR:
 
 ```bash
-npm run start:demo -- --repo-path /absolute/path/to/repo
+npm run start:benchmark -- --repo-path /absolute/path/to/repo --format text
 ```
+
+By default benchmark mode indexes the trusted base checkout when no `--repo-id` is provided, persists a local benchmark PR/run in the database, then invokes the normal review pipeline with a local no-op provider client. Use `--repo-id <id> --index-mode never` to reuse an existing repository index; pass `--no-force --trigger synchronize --pr-number <n>` when you specifically want to exercise incremental-review behavior.

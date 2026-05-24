@@ -14,7 +14,6 @@ import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { loadEnv } from "../config/env.js";
 import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
 import { chunkTextForEmbedding } from "./chunking.js";
-import { enqueueGraphJob } from "../queue/enqueue.js";
 import {
   normalizePatternRepositoryUrl,
   patternRepositoryDirName,
@@ -523,6 +522,15 @@ async function indexResolvedRepoPath(params: {
   });
 }
 
+export async function indexLocalRepoPathForBenchmark(params: { repoId: number; repoPath: string; force?: boolean }) {
+  initParsers();
+  await indexResolvedRepoPath({
+    repoId: params.repoId,
+    repoPath: params.repoPath,
+    force: Boolean(params.force)
+  });
+}
+
 export async function processIndexJob(job: IndexJob) {
   initParsers();
   const repo = await prisma.repo.findFirst({ where: { id: job.repoId }, include: { provider: true, installations: { include: { installation: true } } } });
@@ -653,6 +661,7 @@ export async function processIndexJob(job: IndexJob) {
         completedAt: new Date()
       }
     });
+    const { enqueueGraphJob } = await import("../queue/enqueue.js");
     await enqueueGraphJob({ repoId: repo.id });
   } catch (err) {
     await prisma.indexRun.update({

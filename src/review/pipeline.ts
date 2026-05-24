@@ -41,8 +41,7 @@ import {
 import { generateMermaidDiagram } from "./diagram.js";
 import { ReviewOutput, VerdictsOutput } from "./schemas.js";
 import { getProviderAdapter } from "../providers/registry.js";
-import { ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
-import { enqueueAnalyticsJob, enqueueIndexJob } from "../queue/enqueue.js";
+import { ProviderAdapter, ProviderPullRequest, ProviderRepo, ProviderStatusCheck, ProviderReviewComment } from "../providers/types.js";
 import { buildReviewJobId } from "../queue/jobId.js";
 import { resolveRules } from "./triggers.js";
 import { buildContextPack, type ContextPack } from "./context.js";
@@ -176,6 +175,26 @@ export type ReviewJobData = {
   force?: boolean;
   rulesOverride?: any;
 };
+
+type ReviewQueuePublisher = (data: any) => Promise<void>;
+
+export type ReviewJobOptions = {
+  jobId?: string | null;
+  adapter?: ProviderAdapter;
+  resolveBotLogin?: () => Promise<string>;
+  enqueueIndexJob?: ReviewQueuePublisher;
+  enqueueAnalyticsJob?: ReviewQueuePublisher;
+};
+
+async function defaultEnqueueIndexJob(data: any): Promise<void> {
+  const { enqueueIndexJob } = await import("../queue/enqueue.js");
+  await enqueueIndexJob(data);
+}
+
+async function defaultEnqueueAnalyticsJob(data: any): Promise<void> {
+  const { enqueueAnalyticsJob } = await import("../queue/enqueue.js");
+  await enqueueAnalyticsJob(data);
+}
 
  
 
@@ -1050,7 +1069,7 @@ async function runChunkedReviewer(params: {
 
 export async function processReviewJob(
   data: ReviewJobData,
-  options: { jobId?: string | null } = {}
+  options: ReviewJobOptions = {}
 ) {
   const { provider, installationId, repoId, pullRequestId, prNumber, headSha, trigger, rulesOverride } = data;
   const repo = await prisma.repo.findFirst({ where: { id: repoId } });
@@ -1061,7 +1080,10 @@ export async function processReviewJob(
     ? await prisma.installation.findFirst({ where: { externalId: installationId } })
     : null;
 
-  const adapter = getProviderAdapter(provider);
+  const adapter = options.adapter ?? getProviderAdapter(provider);
+  const resolveBotLogin = options.resolveBotLogin ?? resolveGithubBotLogin;
+  const enqueueIndex = options.enqueueIndexJob ?? defaultEnqueueIndexJob;
+  const enqueueAnalytics = options.enqueueAnalyticsJob ?? defaultEnqueueAnalyticsJob;
   const providerRepo: ProviderRepo = {
     externalId: repo.externalId,
     owner: repo.owner,
@@ -1091,7 +1113,7 @@ export async function processReviewJob(
     console.log(`[pr#${prNumber}] PR is closed; skipping review`);
     return;
   }
-  const skipSelfReviewBotLogin = provider === "github" ? await resolveGithubBotLogin().catch(() => "") : "";
+  const skipSelfReviewBotLogin = provider === "github" ? await resolveBotLogin().catch(() => "") : "";
   if (
     provider === "github" &&
     shouldSkipReviewForSelfAuthoredPullRequest({
@@ -1296,7 +1318,7 @@ export async function processReviewJob(
         update: { scope: patternRepo.scope || null },
         create: { repoId: repo.id, patternRepoId: pattern.id, scope: patternRepo.scope || null }
       });
-      await enqueueIndexJob({
+      await enqueueIndex({
         provider,
         installationId: installationId || null,
         repoId: repo.id,
@@ -2060,7 +2082,7 @@ export async function processReviewJob(
 
       let updatedInline = 0;
       const inlineSyncBotLogin =
-        provider === "github" ? await resolveGithubBotLogin().catch(() => "") : "";
+        provider === "github" ? await resolveBotLogin().catch(() => "") : "";
       if (!inlineSyncBotLogin) {
         console.warn(
           `[run ${run.id} pr#${prNumber}] inline comment sync skipped: bot identity unavailable`
@@ -2234,14 +2256,14 @@ export async function processReviewJob(
       headSha: refreshed.headSha
     });
     if (trustedRepoIndexSha) {
-      await enqueueIndexJob({
+      await enqueueIndex({
         provider,
         installationId: installationId || null,
         repoId: repo.id,
         headSha: trustedRepoIndexSha
       });
     }
-    await enqueueAnalyticsJob({ reviewRunId: run.id });
+    await enqueueAnalytics({ reviewRunId: run.id });
   } catch (err) {
     await prisma.reviewRun.update({
       where: { id: run.id },
