@@ -14,7 +14,7 @@ import { ProviderPullRequest, ProviderRepo } from "../providers/types.js";
 import { loadEnv } from "../config/env.js";
 import { gitCheckoutSafetyEnv } from "../github/gitAuth.js";
 import { chunkTextForEmbedding } from "./chunking.js";
-import { enqueueGraphJob } from "../queue/enqueue.js";
+import { embedTexts } from "./embeddings.js";
 import {
   normalizePatternRepositoryUrl,
   patternRepositoryDirName,
@@ -366,6 +366,13 @@ async function indexFile(params: {
     chunks.length > 0
       ? chunks.map((chunk) => `${params.relativePath}\nL${chunk.startLine}-${chunk.endLine}\n${chunk.text}`)
       : [];
+  const symbolTexts = symbolPayloads.map((symbol) => `${symbol.name} ${symbol.signature || ""}`);
+  const fileText = `${params.relativePath}\n${params.content.slice(0, 5000)}`;
+  const embeddingInputs = [...symbolTexts, ...chunkTexts, fileText];
+  const embeddingVectors = await embedTexts(embeddingInputs, { task: "document" });
+  const symbolVectors = embeddingVectors.slice(0, symbolTexts.length);
+  const chunkVectors = embeddingVectors.slice(symbolTexts.length, symbolTexts.length + chunkTexts.length);
+  const fileVector = embeddingVectors[embeddingVectors.length - 1] || [];
 
   return prisma.$transaction(async (tx) => {
     const current = await tx.fileIndex.findUnique({ where: fileKey });
@@ -399,7 +406,7 @@ async function indexFile(params: {
     await tx.embedding.deleteMany({ where: { fileId: fileRecord.id } });
     await tx.symbol.deleteMany({ where: { fileId: fileRecord.id } });
 
-    for (const symbol of symbolPayloads) {
+    for (const [idx, symbol] of symbolPayloads.entries()) {
       const symbolRecord = await tx.symbol.create({
         data: {
           repoId: params.repoId,
@@ -419,8 +426,8 @@ async function indexFile(params: {
           fileId: fileRecord.id,
           symbolId: symbolRecord.id,
           kind: "symbol",
-          vector: [],
-          text: `${symbol.name} ${symbol.signature || ""}`
+          vector: symbolVectors[idx] || [],
+          text: symbolTexts[idx] || ""
         }
       });
     }
@@ -445,7 +452,7 @@ async function indexFile(params: {
           repoId: params.repoId,
           fileId: fileRecord.id,
           kind: "chunk",
-          vector: [],
+          vector: chunkVectors[idx] || [],
           text: text.slice(0, 6000)
         }
       });
@@ -456,8 +463,8 @@ async function indexFile(params: {
         repoId: params.repoId,
         fileId: fileRecord.id,
         kind: "file",
-        vector: [],
-        text: `${params.relativePath}\n${params.content.slice(0, 5000)}`
+        vector: fileVector,
+        text: fileText
       }
     });
 
@@ -520,6 +527,15 @@ async function indexResolvedRepoPath(params: {
     isPattern: Boolean(params.patternRepo),
     keepFileIds: Array.from(indexedFileIds),
     patternRepo: params.patternRepo
+  });
+}
+
+export async function indexLocalRepoPathForBenchmark(params: { repoId: number; repoPath: string; force?: boolean }) {
+  initParsers();
+  await indexResolvedRepoPath({
+    repoId: params.repoId,
+    repoPath: params.repoPath,
+    force: Boolean(params.force)
   });
 }
 
@@ -653,6 +669,7 @@ export async function processIndexJob(job: IndexJob) {
         completedAt: new Date()
       }
     });
+    const { enqueueGraphJob } = await import("../queue/enqueue.js");
     await enqueueGraphJob({ repoId: repo.id });
   } catch (err) {
     await prisma.indexRun.update({

@@ -31,6 +31,26 @@ test("graphifyGraphPath resolves outside the repo checkout", async () => {
   assert.match(outDir, /var\/graphify\//);
 });
 
+test("copies repo-local Graphify output into Grepiku cache when Graphify ignores GRAPHIFY_OUT", async () => {
+  const { __graphifyContextInternals } = await loadGraphifyContext();
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-graphify-cache-copy-"));
+  const repoPath = path.join(root, "repo");
+  const graphPath = __graphifyContextInternals.graphifyGraphPath(repoPath);
+  const repoLocalGraphPath = __graphifyContextInternals.graphifyRepoLocalGraphPath(repoPath);
+
+  await fs.mkdir(path.dirname(repoLocalGraphPath), { recursive: true });
+  await fs.writeFile(repoLocalGraphPath, JSON.stringify({ nodes: [{ id: "a" }], links: [] }), "utf8");
+
+  try {
+    const copied = await __graphifyContextInternals.copyRepoLocalGraphToCacheIfPresent(repoPath, graphPath);
+    assert.equal(copied, true);
+    assert.deepEqual(JSON.parse(await fs.readFile(graphPath, "utf8")), { nodes: [{ id: "a" }], links: [] });
+  } finally {
+    await fs.rm(path.dirname(graphPath), { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("buildGraphifyImpact converts review-context output into Grepiku graph impact shape", async () => {
   const { buildGraphifyImpact, __graphifyContextInternals } = await loadGraphifyContext();
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-graphify-impact-"));

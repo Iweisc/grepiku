@@ -4,6 +4,7 @@ import path from "path";
 import { execa } from "execa";
 import { prisma } from "../db/client.js";
 import { normalizePath } from "../review/diff.js";
+import { cosineSimilarity, embedQueryWithCache } from "./embeddings.js";
 import { shouldSkipSensitivePath } from "./indexerPathPolicy.js";
 
 export type RetrievalResult = {
@@ -16,6 +17,8 @@ export type RetrievalResult = {
   signals?: {
     semantic: number;
     lexical: number;
+    vector: number;
+    titleLexical: number;
     pathBoost: number;
     kindBoost: number;
     patternBoost: number;
@@ -73,6 +76,8 @@ type ScoredRetrievalItem = {
   isPattern?: boolean;
   semantic: number;
   lexical: number;
+  vectorScore: number;
+  titleLexical: number;
   pathBoost: number;
   patternBoost: number;
   kindBoost: number;
@@ -139,13 +144,27 @@ export async function retrieveContext(params: {
   const queryPathHints = extractPathHints(params.query);
   const candidateLimit = computeRetrievalCandidateLimit(topK);
   const candidateTrimThreshold = candidateLimit * RETRIEVAL_CANDIDATE_TRIM_MULTIPLIER;
+  let queryVector: number[] | null | undefined;
+  const resolveQueryVector = async () => {
+    if (queryVector !== undefined) return queryVector;
+    try {
+      queryVector = await embedQueryWithCache({ repoId: params.repoId, query: params.query });
+    } catch (error) {
+      console.warn("[retrieval] query embedding failed; falling back to lexical scoring", {
+        repoId: params.repoId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      queryVector = null;
+    }
+    return queryVector;
+  };
 
   const scored: ScoredRetrievalItem[] = [];
   const sourceTextByEmbeddingId = new Map<number, string>();
 
   await forEachRepoEmbeddingBatch({
     repoId: params.repoId,
-    includeVector: false,
+    includeVector: true,
     onBatch: async (batch) => {
       const { fileMap, symbolMap } = await loadEmbeddingBatchMetadata(params.repoId, batch);
       for (const embedding of batch) {
@@ -156,10 +175,18 @@ export async function retrieveContext(params: {
         }
         const symbol = embedding.symbolId ? symbolMap.get(embedding.symbolId) : undefined;
         const sourceText = embedding.text || "";
-        const semantic = lexicalSimilarity(
+        const titleLexical = lexicalSimilarity(
           queryTokens,
           tokenize(buildNodeTitle({ path, symbol, text: sourceText }))
         );
+        let vectorScore = 0;
+        if (embedding.vector && embedding.vector.length > 0) {
+          const vector = await resolveQueryVector();
+          if (vector && vector.length > 0) {
+            vectorScore = Math.max(0, cosineSimilarity(vector, embedding.vector));
+          }
+        }
+        const semantic = vectorScore > 0 ? vectorScore : titleLexical;
         const lexical = lexicalSimilarity(
           queryTokens,
           tokenize(buildLexicalInput({ path, symbol, text: sourceText }))
@@ -193,6 +220,8 @@ export async function retrieveContext(params: {
           isPattern: fileMeta?.isPattern,
           semantic,
           lexical,
+          vectorScore,
+          titleLexical,
           pathBoost,
           patternBoost,
           kindBoost,
@@ -247,10 +276,10 @@ export async function retrieveContext(params: {
   const anchorByPath = new Map<string, number>();
   for (const item of scored) {
     const scriptScore = pageIndexScores.get(item.embedding.id);
-    const sourceText = sourceTextByEmbeddingId.get(item.embedding.id) || "";
-    const semanticFallback = item.semantic;
+    const titleFallback = pageIndexAvailable ? (scriptScore?.semantic ?? item.titleLexical) : item.titleLexical;
     const lexicalFallback = item.lexical;
-    item.semantic = pageIndexAvailable ? (scriptScore?.semantic ?? semanticFallback) : semanticFallback;
+    item.titleLexical = titleFallback;
+    item.semantic = item.vectorScore > 0 ? item.vectorScore : titleFallback;
     item.lexical = pageIndexAvailable ? (scriptScore?.lexical ?? lexicalFallback) : lexicalFallback;
     item.baseScore =
       item.semantic * weights.semanticWeight +
@@ -319,6 +348,8 @@ export async function retrieveContext(params: {
     signals: {
       semantic: item.semantic,
       lexical: item.lexical,
+      vector: item.vectorScore,
+      titleLexical: item.titleLexical,
       pathBoost: item.pathBoost,
       kindBoost: item.kindBoost,
       patternBoost: item.patternBoost,

@@ -22,11 +22,11 @@
     "start:review-loop": "node dist/tools/reviewLoop.js",
     "start:traversal-quality": "node dist/tools/traversalQuality.js",
     "migrate:pageindex": "node --import tsx src/tools/migratePageIndex.ts",
-    "start:demo": "node --import tsx src/tools/demoReview.ts",
     "check:traversal-quality": "tsx src/tools/traversalQuality.ts --ci",
     "start:mcp-ide": "node --import tsx src/mcp/ide-server.ts",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate deploy"
+    "prisma:migrate": "prisma migrate deploy",
+    "start:benchmark": "node --import tsx src/tools/benchmarkMode.ts"
   },
   "dependencies": {
     "@kubernetes/client-node": "^1.4.0",

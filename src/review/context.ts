@@ -133,6 +133,11 @@ const DEFAULT_TRAVERSAL_OPTIONS: GraphTraversalOptions = {
 };
 const ADJACENCY_PREFETCH_BATCH = 16;
 
+function isGraphifyDisabled(): boolean {
+  const value = process.env.GREPIKU_DISABLE_GRAPHIFY || process.env.GRAPHIFY_DISABLED || "";
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
 function edgeWeightFromData(data: unknown): number {
   if (!data || typeof data !== "object" || Array.isArray(data)) return 1;
   const value = (data as Record<string, unknown>).weight;
@@ -867,33 +872,34 @@ export async function buildContextPack(params: {
   });
 
   const graphStart = Date.now();
-  const graphImpact =
-    params.repoPath && params.repoPath.trim().length > 0
-      ? await buildGraphifyImpact({
-          repoPath: params.repoPath,
-          headSha: params.headSha,
-          changedFiles: changedPaths,
-          graph: params.graph
-        }).catch((error: unknown) => {
-          console.warn("[context] graphify impact failed; falling back to internal graph", {
-            repoId: params.repoId,
-            error: error instanceof Error ? error.message : String(error)
-          });
-          return collectGraphImpact({
-            repoId: params.repoId,
-            changedPaths,
-            diffPatch: params.diffPatch,
-            traversal: params.graph?.traversal,
-            excludeDirs: params.graph?.exclude_dirs
-          });
-        })
-      : await collectGraphImpact({
+  const graphifyRepoPath = params.repoPath && params.repoPath.trim().length > 0 ? params.repoPath : null;
+  const shouldUseGraphify = graphifyRepoPath !== null && !isGraphifyDisabled();
+  const graphImpact = shouldUseGraphify
+    ? await buildGraphifyImpact({
+        repoPath: graphifyRepoPath,
+        headSha: params.headSha,
+        changedFiles: changedPaths,
+        graph: params.graph
+      }).catch((error: unknown) => {
+        console.warn("[context] graphify impact failed; falling back to internal graph", {
+          repoId: params.repoId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return collectGraphImpact({
           repoId: params.repoId,
           changedPaths,
           diffPatch: params.diffPatch,
           traversal: params.graph?.traversal,
           excludeDirs: params.graph?.exclude_dirs
         });
+      })
+    : await collectGraphImpact({
+        repoId: params.repoId,
+        changedPaths,
+        diffPatch: params.diffPatch,
+        traversal: params.graph?.traversal,
+        excludeDirs: params.graph?.exclude_dirs
+      });
   graphImpact.debug.traversalMs = Date.now() - graphStart;
 
   const changedPathSet = new Set(changedPaths);
@@ -1156,6 +1162,7 @@ function buildFocusHints(params: {
 
 export const __contextInternals = {
   parseChangedLinesByPath,
+  isGraphifyDisabled,
   localEdgeFanout,
   globalEdgeBudget,
   buildProvenanceTrace,

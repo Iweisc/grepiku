@@ -332,6 +332,99 @@ test("retrieveContext avoids preloading full repo file and symbol metadata table
   }
 });
 
+test("retrieveContext uses stored vectors when ranking candidates", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalFileFindMany = prisma.fileIndex.findMany;
+  const originalSymbolFindMany = prisma.symbol.findMany;
+  const originalEmbeddingFindMany = prisma.embedding.findMany;
+  const originalEmbeddingFindFirst = prisma.embedding.findFirst;
+  const originalEmbeddingCreate = prisma.embedding.create;
+
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        data: [{ index: 0, embedding: [1, 0] }],
+        embeddings: [{ values: [1, 0] }]
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    )) as typeof fetch;
+
+  prisma.fileIndex.findMany = (async (args: any) => {
+    const ids = args?.where?.id?.in;
+    assert.deepEqual(ids, [20, 10]);
+    return [
+      { id: 10, path: "src/low.ts", isPattern: false },
+      { id: 20, path: "src/high.ts", isPattern: false }
+    ];
+  }) as typeof prisma.fileIndex.findMany;
+
+  prisma.symbol.findMany = (async () => []) as typeof prisma.symbol.findMany;
+  prisma.embedding.findFirst = (async () => null) as typeof prisma.embedding.findFirst;
+  prisma.embedding.create = (async (args: any) => ({
+    id: 99,
+    fileId: null,
+    symbolId: null,
+    kind: "query",
+    vector: args.data.vector,
+    text: args.data.text,
+    repoId: args.data.repoId,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  })) as typeof prisma.embedding.create;
+
+  prisma.embedding.findMany = (async (args: any) => {
+    if (args?.where?.repoId === 92) {
+      if (args.cursor) return [];
+      return [
+        {
+          id: 2,
+          fileId: 20,
+          symbolId: null,
+          kind: "file",
+          vector: [1, 0],
+          text: "billing auth code"
+        },
+        {
+          id: 1,
+          fileId: 10,
+          symbolId: null,
+          kind: "file",
+          vector: [0, 1],
+          text: "billing auth code"
+        }
+      ];
+    }
+
+    const selectedIds = args?.where?.id?.in;
+    if (Array.isArray(selectedIds)) {
+      return selectedIds.map((id: number) => ({
+        id,
+        text: id === 2 ? "billing auth code high" : "billing auth code low"
+      }));
+    }
+
+    return [];
+  }) as typeof prisma.embedding.findMany;
+
+  try {
+    const results = await retrieveContext({
+      repoId: 92,
+      query: "unrelated query text",
+      topK: 4
+    });
+
+    assert.equal(results[0]?.path, "src/high.ts");
+    assert.equal(results[0]?.signals?.vector, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    prisma.fileIndex.findMany = originalFileFindMany;
+    prisma.symbol.findMany = originalSymbolFindMany;
+    prisma.embedding.findMany = originalEmbeddingFindMany;
+    prisma.embedding.findFirst = originalEmbeddingFindFirst;
+    prisma.embedding.create = originalEmbeddingCreate;
+  }
+});
+
 test("retrieveContext skips sensitive repo paths even if legacy embeddings still exist", async () => {
   const originalFileFindMany = prisma.fileIndex.findMany;
   const originalSymbolFindMany = prisma.symbol.findMany;

@@ -5,20 +5,56 @@ import { ZodSchema } from "zod";
 const MAX_STAGE_OUTPUT_JSON_BYTES = 1_000_000;
 const OUTPUT_FILE_LIMIT_ERROR_PREFIX = "output file exceeded byte limit";
 
+function normalizeRiskLabel(value: unknown): unknown {
+  if (value === "blocking") return "high";
+  if (value === "important") return "medium";
+  if (value === "nit") return "low";
+  return value;
+}
+
+function normalizeSummaryRiskValues(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const source = value as Record<string, unknown>;
+  const summary = source.summary;
+  const finalReview = source.final_review;
+  const next: Record<string, unknown> = { ...source };
+
+  if (summary && typeof summary === "object" && !Array.isArray(summary)) {
+    const summaryRecord = summary as Record<string, unknown>;
+    const nextSummary: Record<string, unknown> = { ...summaryRecord };
+    nextSummary.risk = normalizeRiskLabel(nextSummary.risk);
+    if (Array.isArray(nextSummary.file_breakdown)) {
+      nextSummary.file_breakdown = nextSummary.file_breakdown.map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        const record = item as Record<string, unknown>;
+        return { ...record, risk: normalizeRiskLabel(record.risk) };
+      });
+    }
+    next.summary = nextSummary;
+  }
+
+  if (finalReview && typeof finalReview === "object" && !Array.isArray(finalReview)) {
+    next.final_review = normalizeSummaryRiskValues(finalReview);
+  }
+
+  return next;
+}
+
 function trySchema<T>(
   value: unknown,
   schema: ZodSchema<T>
 ): { data: T | null; error: unknown } {
-  const direct = schema.safeParse(value);
+  const normalizedValue = normalizeSummaryRiskValues(value);
+  const direct = schema.safeParse(normalizedValue);
   if (direct.success) {
     return { data: direct.data, error: null };
   }
 
   const queue: unknown[] = [];
-  if (Array.isArray(value)) {
-    queue.push(...value);
-  } else if (value && typeof value === "object") {
-    queue.push(...Object.values(value as Record<string, unknown>));
+  if (Array.isArray(normalizedValue)) {
+    queue.push(...normalizedValue);
+  } else if (normalizedValue && typeof normalizedValue === "object") {
+    queue.push(...Object.values(normalizedValue as Record<string, unknown>));
   }
 
   for (let index = 0; index < queue.length; index += 1) {

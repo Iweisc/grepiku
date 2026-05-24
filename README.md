@@ -147,6 +147,9 @@ Additional variables:
 - `CODEX_EXEC_PATH` points to `codex-exec` locally
 - Docker worker uses `/usr/local/bin/codex-exec`
 - `INTERNAL_API_KEY` also protects dashboard access through Basic or Bearer auth
+- `EMBEDDINGS_PROVIDER=gemini` uses Gemini embeddings for indexed files, symbols, chunks, and retrieval queries
+- `GEMINI_API_KEY` is required when Gemini embeddings are enabled
+- `GEMINI_EMBEDDINGS_MODEL` defaults to `gemini-embedding-2`
 
 ### 3) Start services
 
@@ -224,7 +227,7 @@ Notes:
 
 - `graph.exclude_dirs` excludes repo-relative directory prefixes from graph generation and traversal seeding.
 - `graph.traversal` controls how aggressively Grepiku expands review context.
-- `retrieval` uses a vectorless PageIndex tree search over file, symbol, and chunk nodes.
+- `retrieval` uses hybrid scoring over Gemini/OpenAI embedding similarity, lexical signals, optional PageIndex scoring, path boosts, graph context, and pattern matches.
 - `output.syncSummaryWithStatus` keeps the PR body summary synchronized with review status runs.
 - `output.allowIncrementalPrBodyUpdates` enables PR body summary updates on incremental runs.
 - Scoped per-path overrides are supported via `.grepiku/config.json` for `strictness`, `commentTypes`, `ignore`, `limits`, and `rules`.
@@ -348,8 +351,12 @@ The command exits non-zero in `--ci` mode when recall, precision, or p95 SLO thr
 npm run start:mcp-ide
 ```
 
-### Local demo review runner
+### Local benchmark review runner
+
+Run the production review pipeline against a local repository without posting to a real PR:
 
 ```bash
-npm run start:demo -- --repo-path /absolute/path/to/repo
+npm run start:benchmark -- --repo-path /absolute/path/to/repo --format text
 ```
+
+By default benchmark mode indexes the trusted base checkout when no `--repo-id` is provided, persists a local benchmark PR/run in the database, then invokes the normal review pipeline with a local no-op provider client. Use `--repo-id <id> --index-mode never` to reuse an existing repository index; pass `--no-force --trigger synchronize --pr-number <n>` when you specifically want to exercise incremental-review behavior.

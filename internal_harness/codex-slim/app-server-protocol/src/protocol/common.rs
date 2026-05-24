@@ -1,10 +1,6 @@
-use std::path::Path;
-
 use crate::JSONRPCNotification;
 use crate::JSONRPCRequest;
 use crate::RequestId;
-use crate::export::GeneratedSchema;
-use crate::export::write_json_schema;
 use crate::protocol::v1;
 use crate::protocol::v2;
 use schemars::JsonSchema;
@@ -56,31 +52,9 @@ macro_rules! experimental_reason_expr {
     };
 }
 
-macro_rules! experimental_method_entry {
-    (#[experimental($reason:expr)] => $wire:literal) => {
-        $wire
-    };
-    (#[experimental($reason:expr)]) => {
-        $reason
-    };
-    ($($tt:tt)*) => {
-        ""
-    };
-}
-
-macro_rules! experimental_type_entry {
-    (#[experimental($reason:expr)] $ty:ty) => {
-        stringify!($ty)
-    };
-    ($ty:ty) => {
-        ""
-    };
-}
-
 /// Generates an `enum ClientRequest` where each variant is a request that the
 /// client can send to the server. Each variant has associated `params` and
-/// `response` types. Also generates a `export_client_responses()` function to
-/// export all response types to TypeScript.
+/// `response` types.
 macro_rules! client_request_definitions {
     (
         $(
@@ -125,52 +99,7 @@ macro_rules! client_request_definitions {
             }
         }
 
-        pub(crate) const EXPERIMENTAL_CLIENT_METHODS: &[&str] = &[
-            $(
-                experimental_method_entry!($(#[experimental($reason)])? $(=> $wire)?),
-            )*
-        ];
-        pub(crate) const EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES: &[&str] = &[
-            $(
-                experimental_type_entry!($(#[experimental($reason)])? $params),
-            )*
-        ];
-        pub(crate) const EXPERIMENTAL_CLIENT_METHOD_RESPONSE_TYPES: &[&str] = &[
-            $(
-                experimental_type_entry!($(#[experimental($reason)])? $response),
-            )*
-        ];
 
-        pub fn export_client_responses(
-            out_dir: &::std::path::Path,
-        ) -> ::std::result::Result<(), ::ts_rs::ExportError> {
-            $(
-                <$response as ::ts_rs::TS>::export_all_to(out_dir)?;
-            )*
-            Ok(())
-        }
-
-        #[allow(clippy::vec_init_then_push)]
-        pub fn export_client_response_schemas(
-            out_dir: &::std::path::Path,
-        ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
-            let mut schemas = Vec::new();
-            $(
-                schemas.push(write_json_schema::<$response>(out_dir, stringify!($response))?);
-            )*
-            Ok(schemas)
-        }
-
-        #[allow(clippy::vec_init_then_push)]
-        pub fn export_client_param_schemas(
-            out_dir: &::std::path::Path,
-        ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
-            let mut schemas = Vec::new();
-            $(
-                schemas.push(write_json_schema::<$params>(out_dir, stringify!($params))?);
-            )*
-            Ok(schemas)
-        }
     };
 }
 
@@ -488,7 +417,7 @@ client_request_definitions! {
 /// Generates an `enum ServerRequest` where each variant is a request that the
 /// server can send to the client along with the corresponding params and
 /// response types. It also generates helper types used by the app/server
-/// infrastructure (payload enum, request constructor, and export helpers).
+/// infrastructure (payload enum and request constructor).
 macro_rules! server_request_definitions {
     (
         $(
@@ -527,47 +456,10 @@ macro_rules! server_request_definitions {
             }
         }
 
-        pub fn export_server_responses(
-            out_dir: &::std::path::Path,
-        ) -> ::std::result::Result<(), ::ts_rs::ExportError> {
-            $(
-                <$response as ::ts_rs::TS>::export_all_to(out_dir)?;
-            )*
-            Ok(())
-        }
-
-        #[allow(clippy::vec_init_then_push)]
-        pub fn export_server_response_schemas(
-            out_dir: &Path,
-        ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
-            let mut schemas = Vec::new();
-            $(
-                schemas.push(crate::export::write_json_schema::<$response>(
-                    out_dir,
-                    concat!(stringify!($variant), "Response"),
-                )?);
-            )*
-            Ok(schemas)
-        }
-
-        #[allow(clippy::vec_init_then_push)]
-        pub fn export_server_param_schemas(
-            out_dir: &Path,
-        ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
-            let mut schemas = Vec::new();
-            $(
-                schemas.push(crate::export::write_json_schema::<$params>(
-                    out_dir,
-                    concat!(stringify!($variant), "Params"),
-                )?);
-            )*
-            Ok(schemas)
-        }
     };
 }
 
-/// Generates `ServerNotification` enum and helpers, including a JSON Schema
-/// exporter for each notification.
+/// Generates `ServerNotification` enum and helpers.
 macro_rules! server_notification_definitions {
     (
         $(
@@ -603,14 +495,6 @@ macro_rules! server_notification_definitions {
             }
         }
 
-        #[allow(clippy::vec_init_then_push)]
-        pub fn export_server_notification_schemas(
-            out_dir: &::std::path::Path,
-        ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
-            let mut schemas = Vec::new();
-            $(schemas.push(crate::export::write_json_schema::<$payload>(out_dir, stringify!($payload))?);)*
-            Ok(schemas)
-        }
     };
 }
 /// Notifications sent from the client to the server.
@@ -631,13 +515,6 @@ macro_rules! client_notification_definitions {
             )*
         }
 
-        pub fn export_client_notification_schemas(
-            _out_dir: &::std::path::Path,
-        ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
-            let schemas = Vec::new();
-            $( $(schemas.push(crate::export::write_json_schema::<$payload>(_out_dir, stringify!($payload))?);)? )*
-            Ok(schemas)
-        }
     };
 }
 
