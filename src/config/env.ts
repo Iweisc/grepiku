@@ -13,10 +13,17 @@ const EnvSchema = z.object({
   OPENAI_COMPAT_BASE_URL: z.string().min(1),
   OPENAI_COMPAT_API_KEY: z.string().min(1),
   OPENAI_COMPAT_MODEL: z.string().default("gpt-5.3-codex"),
+  EMBEDDINGS_PROVIDER: z.enum(["openai", "gemini"]).default("openai"),
   OPENAI_EMBEDDINGS_MODEL: z.string().default("text-embedding-3-small"),
   OPENAI_EMBEDDINGS_DIMENSIONS: z.string().default(""),
   OPENAI_EMBEDDINGS_MAX_CHARS: z.string().default("12000"),
   OPENAI_EMBEDDINGS_BATCH_SIZE: z.string().default("16"),
+  GEMINI_API_KEY: z.string().default(""),
+  GEMINI_EMBEDDINGS_BASE_URL: z.string().default("https://generativelanguage.googleapis.com/v1beta"),
+  GEMINI_EMBEDDINGS_MODEL: z.string().default("gemini-embedding-2"),
+  GEMINI_EMBEDDINGS_DIMENSIONS: z.string().default(""),
+  GEMINI_EMBEDDINGS_DOCUMENT_TASK_TYPE: z.string().default("RETRIEVAL_DOCUMENT"),
+  GEMINI_EMBEDDINGS_QUERY_TASK_TYPE: z.string().default("RETRIEVAL_QUERY"),
   OPENAI_TIMEOUT_MS: z.string().default("120000"),
   OPENAI_MAX_RETRIES: z.string().default("3"),
   CODEX_STAGE_TIMEOUT_MS: z.string().default("900000"),
@@ -53,10 +60,17 @@ export type Env = {
   openaiBaseUrl: string;
   openaiApiKey: string;
   openaiModel: string;
+  embeddingsProvider: "openai" | "gemini";
   openaiEmbeddingsModel: string;
   openaiEmbeddingsDimensions: number | null;
   openaiEmbeddingsMaxChars: number;
   openaiEmbeddingsBatchSize: number;
+  geminiApiKey: string;
+  geminiEmbeddingsBaseUrl: string;
+  geminiEmbeddingsModel: string;
+  geminiEmbeddingsDimensions: number | null;
+  geminiEmbeddingsDocumentTaskType: string;
+  geminiEmbeddingsQueryTaskType: string;
   openaiTimeoutMs: number;
   openaiMaxRetries: number;
   codexStageTimeoutMs: number;
@@ -124,12 +138,21 @@ export function loadEnv(): Env {
     openaiBaseUrl: parsed.OPENAI_COMPAT_BASE_URL,
     openaiApiKey: parsed.OPENAI_COMPAT_API_KEY,
     openaiModel: parsed.OPENAI_COMPAT_MODEL,
+    embeddingsProvider: parsed.EMBEDDINGS_PROVIDER,
     openaiEmbeddingsModel: parsed.OPENAI_EMBEDDINGS_MODEL,
     openaiEmbeddingsDimensions: parsed.OPENAI_EMBEDDINGS_DIMENSIONS
       ? Number(parsed.OPENAI_EMBEDDINGS_DIMENSIONS)
       : null,
     openaiEmbeddingsMaxChars: embeddingsMaxChars,
     openaiEmbeddingsBatchSize: embeddingsBatchSize,
+    geminiApiKey: parsed.GEMINI_API_KEY.trim(),
+    geminiEmbeddingsBaseUrl: parsed.GEMINI_EMBEDDINGS_BASE_URL.trim(),
+    geminiEmbeddingsModel: parsed.GEMINI_EMBEDDINGS_MODEL.trim(),
+    geminiEmbeddingsDimensions: parsed.GEMINI_EMBEDDINGS_DIMENSIONS
+      ? Number(parsed.GEMINI_EMBEDDINGS_DIMENSIONS)
+      : null,
+    geminiEmbeddingsDocumentTaskType: parsed.GEMINI_EMBEDDINGS_DOCUMENT_TASK_TYPE.trim(),
+    geminiEmbeddingsQueryTaskType: parsed.GEMINI_EMBEDDINGS_QUERY_TASK_TYPE.trim(),
     openaiTimeoutMs: Number(parsed.OPENAI_TIMEOUT_MS),
     openaiMaxRetries: Number(parsed.OPENAI_MAX_RETRIES),
     codexStageTimeoutMs,

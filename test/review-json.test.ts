@@ -70,6 +70,30 @@ test("parseAndValidateJson extracts the matching object from multi-object text",
   assert.deepEqual(parsed, sampleVerdicts);
 });
 
+test("parseAndValidateJson normalizes severity words in summary risk fields", () => {
+  const raw = JSON.stringify({
+    summary: {
+      overview: "The PR has issues to review.",
+      risk: "blocking",
+      key_concerns: ["Review the risky file."],
+      what_to_test: ["Exercise the changed flow."],
+      file_breakdown: [
+        {
+          path: "src/review/pipeline.ts",
+          summary: "Needs attention.",
+          risk: "important"
+        }
+      ]
+    },
+    comments: []
+  });
+
+  const parsed = parseAndValidateJson(raw, ReviewSchema);
+
+  assert.equal(parsed.summary.risk, "high");
+  assert.equal(parsed.summary.file_breakdown?.[0]?.risk, "medium");
+});
+
 test("readAndValidateJsonWithFallback uses last message when the primary file is invalid", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-review-json-"));
   const filePath = path.join(root, "final_review.json");

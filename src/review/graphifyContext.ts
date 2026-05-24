@@ -52,6 +52,7 @@ export type GraphifyImpact = {
 };
 
 const GRAPHIFY_CACHE_DIR = "graphify";
+const GRAPHIFY_REPO_OUT_DIR = "graphify-out";
 const GRAPHIFY_COMMIT_STAMP = ".grepiku-graphify-head";
 const inflightGraphBuilds = new Map<string, Promise<string>>();
 
@@ -71,6 +72,23 @@ function graphifyOutDir(repoPath: string): string {
 
 function graphifyGraphPath(repoPath: string): string {
   return path.join(graphifyOutDir(repoPath), "graph.json");
+}
+
+function graphifyRepoLocalGraphPath(repoPath: string): string {
+  return path.join(repoPath, GRAPHIFY_REPO_OUT_DIR, "graph.json");
+}
+
+async function copyRepoLocalGraphToCacheIfPresent(repoPath: string, graphPath: string): Promise<boolean> {
+  const repoLocalGraphPath = graphifyRepoLocalGraphPath(repoPath);
+  try {
+    await fs.access(repoLocalGraphPath);
+  } catch {
+    return false;
+  }
+
+  await fs.mkdir(path.dirname(graphPath), { recursive: true });
+  await fs.copyFile(repoLocalGraphPath, graphPath);
+  return true;
 }
 
 function graphifyCommitStampPath(repoPath: string): string {
@@ -117,6 +135,7 @@ async function ensureGraphifyGraph(params: { repoPath: string; headSha?: string 
   if (cached) return cached;
 
   const work = (async () => {
+    await copyRepoLocalGraphToCacheIfPresent(repoPath, graphPath);
     const existingCommit = await readGraphCommit(graphPath);
     if (existingCommit && (!headSha || existingCommit === headSha)) {
       return graphPath;
@@ -132,6 +151,7 @@ async function ensureGraphifyGraph(params: { repoPath: string; headSha?: string 
       }
     });
 
+    await copyRepoLocalGraphToCacheIfPresent(repoPath, graphPath);
     const updatedCommit = (await resolveCurrentHeadSha(repoPath)) || headSha;
     if (updatedCommit) {
       await fs.mkdir(path.dirname(graphPath), { recursive: true });
@@ -295,6 +315,8 @@ export async function buildGraphifyImpact(params: {
 export const __graphifyContextInternals = {
   graphifyOutDir,
   graphifyGraphPath,
+  graphifyRepoLocalGraphPath,
+  copyRepoLocalGraphToCacheIfPresent,
   graphifyCommitStampPath,
   graphifyPythonBin,
   readGraphCommit,
