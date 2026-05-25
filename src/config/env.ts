@@ -27,10 +27,12 @@ const EnvSchema = z.object({
   OPENAI_TIMEOUT_MS: z.string().default("120000"),
   OPENAI_MAX_RETRIES: z.string().default("3"),
   CODEX_STAGE_TIMEOUT_MS: z.string().default("900000"),
+  CODEX_AGENTIC_IDLE_TIMEOUT_MS: z.string().default("300000"),
   PROJECT_ROOT: z.string().min(1),
   CODEX_EXEC_PATH: z.string().default(""),
   CODEX_STAGE_LOG_OUTPUT: z.string().default("false"),
   CODEX_MODEL_REASONING_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
+  LARGE_PR_REVIEW_MODE: z.enum(["direct", "agentic"]).default("direct"),
   INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
   SANDBOX_EXECUTION_MODE: z.enum(["local", "kubernetes"]).default("local"),
   K8S_NAMESPACE: z.string().default(""),
@@ -74,10 +76,12 @@ export type Env = {
   openaiTimeoutMs: number;
   openaiMaxRetries: number;
   codexStageTimeoutMs: number;
+  codexAgenticIdleTimeoutMs: number;
   projectRoot: string;
   codexExecPath: string;
   codexStageLogOutput: boolean;
   codexModelReasoningEffort: "low" | "medium" | "high" | "xhigh";
+  largePrReviewMode: "direct" | "agentic";
   internalApiUrl: string;
   sandboxExecutionMode: "local" | "kubernetes";
   k8sNamespace: string;
@@ -125,6 +129,10 @@ export function loadEnv(): Env {
     Number.isFinite(codexStageTimeoutRaw) && codexStageTimeoutRaw > 0
       ? Math.floor(codexStageTimeoutRaw)
       : 900000;
+  const codexAgenticIdleTimeoutMs = parsePositiveInteger(
+    parsed.CODEX_AGENTIC_IDLE_TIMEOUT_MS,
+    300000
+  );
   const codexExecPath = parsed.CODEX_EXEC_PATH.trim();
   cached = {
     port: Number(parsed.PORT),
@@ -156,6 +164,7 @@ export function loadEnv(): Env {
     openaiTimeoutMs: Number(parsed.OPENAI_TIMEOUT_MS),
     openaiMaxRetries: Number(parsed.OPENAI_MAX_RETRIES),
     codexStageTimeoutMs,
+    codexAgenticIdleTimeoutMs,
     projectRoot: parsed.PROJECT_ROOT,
     codexExecPath:
       codexExecPath.length > 0
@@ -163,6 +172,7 @@ export function loadEnv(): Env {
         : path.join(parsed.PROJECT_ROOT, "internal_harness", "codex-slim", "target", "release", "codex-exec"),
     codexStageLogOutput: parseBooleanFlag(parsed.CODEX_STAGE_LOG_OUTPUT),
     codexModelReasoningEffort: parsed.CODEX_MODEL_REASONING_EFFORT,
+    largePrReviewMode: parsed.LARGE_PR_REVIEW_MODE,
     internalApiUrl: parsed.INTERNAL_API_URL.trim(),
     sandboxExecutionMode: parsed.SANDBOX_EXECUTION_MODE,
     k8sNamespace: parsed.K8S_NAMESPACE.trim(),

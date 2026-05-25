@@ -26,12 +26,22 @@ export type CodexRunParams = {
   captureLastMessage?: boolean;
   reasoningEffort?: CodexReasoningEffort;
   executionMode?: "local" | "kubernetes-sandbox";
+  reviewerMode?: "mcp" | "agentic";
 };
 
 export type CodexTokenUsage = {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
+};
+
+export type CodexAgenticReviewerMetrics = {
+  shellCommands: string[];
+  grCommands: string[];
+  filesInspected: string[];
+  retrievalCalls: number;
+  graphCalls: number;
+  fallbackDiagnostics: string[];
 };
 
 export type CodexStageMetrics = {
@@ -42,11 +52,14 @@ export type CodexStageMetrics = {
   promptBytes: number;
   estimatedPromptTokens: number;
   usage: CodexTokenUsage | null;
+  agentic?: CodexAgenticReviewerMetrics;
 };
 
 const env = loadEnv();
 let resolvedCodexExecPath: string | null = null;
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const AGENTIC_TOOL_BIN_DIR = "agentic-bin";
+
 const STAGE_ENV_ALLOWLIST = [
   "PATH",
   "LANG",
@@ -74,8 +87,15 @@ function applyIsolatedHomeEnv(output: NodeJS.ProcessEnv, homeDir: string): NodeJ
   return output;
 }
 
-function systemPrompt(stage: CodexStage, roots: string[]): string {
+function isAgenticReviewer(params: Pick<CodexRunParams, "stage" | "reviewerMode">): boolean {
+  return params.stage === "reviewer" && params.reviewerMode === "agentic";
+}
+
+function systemPrompt(stage: CodexStage, roots: string[], options: { agenticReviewer?: boolean } = {}): string {
   const toolNote = (() => {
+    if (options.agenticReviewer) {
+      return "Available tool names include shell_command. Use standard read-only shell inspection, and use gr only for Grepiku-specific context.";
+    }
     if (stage === "verifier") return "Available tool names: read_file, search, lint, build, test.";
     if (stage === "mention") return "Available tool names: read_file, search, retrieve_context, apply_patch.";
     return "Available tool names: read_file, search, retrieve_context.";
@@ -167,11 +187,12 @@ function baseConfig(params?: {
   shellTool?: boolean;
   applyPatchFreeform?: boolean;
   reasoningEffort?: CodexReasoningEffort;
+  writableRoots?: string[];
 }): string {
   const shellTool = params?.shellTool === true;
   const applyPatchFreeform = params?.applyPatchFreeform === true;
   const reasoningEffort = params?.reasoningEffort ?? env.codexModelReasoningEffort;
-  return [
+  const lines = [
     `approval_policy = "never"`,
     `sandbox_mode = "workspace-write"`,
     `web_search = "disabled"`,
@@ -187,7 +208,18 @@ function baseConfig(params?: {
     "[tools]",
     "view_image = false",
     ""
-  ].join("\n");
+  ];
+  if (params?.writableRoots?.length) {
+    lines.push(
+      "[sandbox_workspace_write]",
+      `writable_roots = [${params.writableRoots.map(tomlString).join(", ")}]`,
+      "network_access = false",
+      "exclude_tmpdir_env_var = true",
+      "exclude_slash_tmp = true",
+      ""
+    );
+  }
+  return lines.join("\n");
 }
 
 function configForStage(stage: CodexStage, params: CodexRunParams): string {
@@ -198,9 +230,17 @@ function configForStage(stage: CodexStage, params: CodexRunParams): string {
     WORK_OUT_ROOT: params.outDir
   };
   if (stage === "reviewer") {
+    if (isAgenticReviewer(params)) {
+      return baseConfig({
+        shellTool: true,
+        reasoningEffort: params.reasoningEffort,
+        writableRoots: [params.outDir]
+      });
+    }
     const base = baseConfig({ reasoningEffort: params.reasoningEffort });
     return (
-      `${base}\n` +
+      `${base}
+` +
       mcpServerBlock("readonly", "readonly_mcp.js", readonlyEnv) +
       mcpServerBlock(
         "retrieval",
@@ -299,7 +339,7 @@ function baseStageEnv(): NodeJS.ProcessEnv {
 }
 
 function buildStageEnv(params: CodexRunParams, stageHomeDir: string): NodeJS.ProcessEnv {
-  return applyIsolatedHomeEnv({
+  const output = applyIsolatedHomeEnv({
     ...baseStageEnv(),
     OPENAI_BASE_URL: env.openaiBaseUrl,
     OPENAI_TIMEOUT_MS: String(env.openaiTimeoutMs),
@@ -308,6 +348,20 @@ function buildStageEnv(params: CodexRunParams, stageHomeDir: string): NodeJS.Pro
     CODEX_DISABLE_PROJECT_DOC: "1",
     CODEX_QUIET_MODE: "1"
   }, stageHomeDir);
+  if (isAgenticReviewer(params)) {
+    const toolBinDir = path.join(stageHomeDir, AGENTIC_TOOL_BIN_DIR);
+    output.PATH = [toolBinDir, output.PATH].filter(Boolean).join(path.delimiter);
+    output.GREPIKU_GIT_WRAPPER_DIR = toolBinDir;
+    output.GIT_PAGER = "cat";
+    output.PAGER = "cat";
+    output.GIT_TERMINAL_PROMPT = "0";
+    output.GIT_OPTIONAL_LOCKS = "0";
+    output.WORK_REPO_ROOT = params.repoPath || "";
+    output.WORK_BUNDLE_ROOT = params.bundleDir;
+    output.WORK_OUT_ROOT = params.outDir;
+    output.GREPIKU_CONTEXT_PACK_PATH = path.join(params.bundleDir, "context_pack.json");
+  }
+  return output;
 }
 
 function buildStageLaunch(params: CodexRunParams): {
@@ -345,7 +399,7 @@ function buildStageLaunch(params: CodexRunParams): {
   const roots = [params.repoPath, params.bundleDir, params.outDir].filter(
     (value): value is string => Boolean(value)
   );
-  const fullPrompt = `${systemPrompt(params.stage, roots)}\n\n${params.prompt}`;
+  const fullPrompt = `${systemPrompt(params.stage, roots, { agenticReviewer: isAgenticReviewer(params) })}\n\n${params.prompt}`;
 
   return {
     codexArgs,
@@ -389,6 +443,7 @@ function forwardStageStream(params: {
   stream: NodeJS.ReadableStream | null | undefined;
   stageTag: string;
   channel: "stdout" | "stderr";
+  onActivity?: () => void;
 }): Promise<void> {
   if (!params.stream) return Promise.resolve();
   const log = params.channel === "stderr" ? console.error : console.log;
@@ -398,6 +453,7 @@ function forwardStageStream(params: {
   });
   rl.on("line", (line) => {
     if (line.length === 0) return;
+    params.onActivity?.();
     log(`${params.stageTag} ${params.channel}: ${line}`);
   });
   return new Promise((resolve, reject) => {
@@ -411,6 +467,8 @@ function scanCodexJsonStream(params: {
   stageTag: string;
   logLines: boolean;
   onUsage: (usage: CodexTokenUsage) => void;
+  onJsonLine?: (line: string) => void;
+  onActivity?: () => void;
 }): Promise<void> {
   if (!params.stream) return Promise.resolve();
   const rl = createInterface({
@@ -419,6 +477,8 @@ function scanCodexJsonStream(params: {
   });
   rl.on("line", (line) => {
     if (line.length === 0) return;
+    params.onActivity?.();
+    params.onJsonLine?.(line);
     const usage = parseCodexUsageLine(line);
     if (usage) {
       params.onUsage(usage);
@@ -431,6 +491,223 @@ function scanCodexJsonStream(params: {
     rl.once("close", () => resolve());
     rl.once("error", reject);
   });
+}
+
+
+type AgenticUsageAccumulator = {
+  shellCommands: Set<string>;
+  grCommands: Set<string>;
+  filesInspected: Set<string>;
+  retrievalCalls: number;
+  graphCalls: number;
+  fallbackDiagnostics: Set<string>;
+};
+
+function createAgenticUsageAccumulator(): AgenticUsageAccumulator {
+  return {
+    shellCommands: new Set(),
+    grCommands: new Set(),
+    filesInspected: new Set(),
+    retrievalCalls: 0,
+    graphCalls: 0,
+    fallbackDiagnostics: new Set()
+  };
+}
+
+function parseFunctionArguments(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function recordCommandText(acc: AgenticUsageAccumulator, command: string): void {
+  const trimmed = command.trim();
+  if (!trimmed) return;
+  acc.shellCommands.add(trimmed);
+  const grMatches = trimmed.match(/(?:^|[;&|()\s])gr\s+([^;&|\n]*)/g) || [];
+  for (const match of grMatches) {
+    const normalized = match.trim();
+    acc.grCommands.add(normalized);
+    if (/\bgr\s+(?:retrieve|changed-context)\b/.test(normalized)) acc.retrievalCalls += 1;
+    if (/\bgr\s+graph\b/.test(normalized)) acc.graphCalls += 1;
+  }
+  const fileMatches = trimmed.match(/(?:sed|cat|rg|git\s+(?:diff|show|grep|blame))\s+[^\n]*/g) || [];
+  for (const match of fileMatches) {
+    for (const token of match.split(/\s+/)) {
+      if (/^[\w./-]+\.(ts|tsx|js|jsx|go|py|rs|java|kt|rb|json|ya?ml|md)$/.test(token)) {
+        acc.filesInspected.add(token.replace(/^['"]|['"]$/g, ""));
+      }
+    }
+  }
+}
+
+function scanAgenticUsageValue(value: unknown, acc: AgenticUsageAccumulator): void {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) scanAgenticUsageValue(item, acc);
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  const name =
+    typeof record.name === "string"
+      ? record.name
+      : typeof record.tool_name === "string"
+        ? record.tool_name
+        : typeof record.type === "string" &&
+            ["shell_command", "exec_command", "command_execution", "shell", "local_shell"].includes(record.type)
+          ? record.type
+          : "";
+  const args = parseFunctionArguments(record.arguments ?? record.input ?? record.params ?? record.payload);
+  if (
+    name === "shell_command" ||
+    name === "exec_command" ||
+    name === "command_execution" ||
+    name === "shell" ||
+    name === "local_shell"
+  ) {
+    if (typeof args === "string") {
+      recordCommandText(acc, args);
+    } else if (args && typeof args === "object") {
+      const argRecord = args as Record<string, unknown>;
+      const command = argRecord.command ?? argRecord.cmd;
+      if (typeof command === "string") recordCommandText(acc, command);
+      if (Array.isArray(command)) recordCommandText(acc, command.join(" "));
+    } else {
+      const command = record.command ?? record.cmd;
+      if (typeof command === "string") recordCommandText(acc, command);
+      if (Array.isArray(command)) recordCommandText(acc, command.join(" "));
+    }
+  }
+  if (typeof record.text === "string" && /context_pack fallback|grDiagnostics|fallback/i.test(record.text)) {
+    acc.fallbackDiagnostics.add(record.text.slice(0, 500));
+  }
+  for (const child of Object.values(record)) scanAgenticUsageValue(child, acc);
+}
+
+function scanAgenticUsageLine(line: string, acc: AgenticUsageAccumulator): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return;
+  }
+  scanAgenticUsageValue(parsed, acc);
+}
+
+class CodexStageIdleTimeoutError extends Error {
+  constructor(params: {
+    stage: CodexStage;
+    reviewRunId: number;
+    prNumber: number;
+    idleTimeoutMs: number;
+    elapsedMs: number;
+    idleMs: number;
+    outDir: string;
+  }) {
+    super(
+      `Codex ${params.stage} stage for run ${params.reviewRunId} pr#${params.prNumber} idle timed out ` +
+        `after ${params.idleMs}ms without output (elapsed ${params.elapsedMs}ms, timeout ${params.idleTimeoutMs}ms, outDir ${params.outDir})`
+    );
+    this.name = "CodexStageIdleTimeoutError";
+  }
+}
+
+function shouldUseAgenticIdleWatchdog(params: CodexRunParams): boolean {
+  return isAgenticReviewer(params) && env.codexAgenticIdleTimeoutMs > 0;
+}
+
+function waitForStageOrIdleTimeout(params: {
+  runParams: CodexRunParams;
+  subprocess: ReturnType<typeof execa>;
+  startedAt: number;
+  getLastActivityAt: () => number;
+}): Promise<unknown> {
+  if (!shouldUseAgenticIdleWatchdog(params.runParams)) return params.subprocess;
+  const idleTimeoutMs = env.codexAgenticIdleTimeoutMs;
+  const interval = Math.min(Math.max(1000, Math.floor(idleTimeoutMs / 4)), 30000);
+  let timer: NodeJS.Timeout | null = null;
+  const idlePromise = new Promise<never>((_, reject) => {
+    timer = setInterval(() => {
+      if (params.subprocess.exitCode !== null || params.subprocess.killed) return;
+      const now = Date.now();
+      const idleMs = now - params.getLastActivityAt();
+      if (idleMs < idleTimeoutMs) return;
+      const error = new CodexStageIdleTimeoutError({
+        stage: params.runParams.stage,
+        reviewRunId: params.runParams.reviewRunId,
+        prNumber: params.runParams.prNumber,
+        idleTimeoutMs,
+        elapsedMs: now - params.startedAt,
+        idleMs,
+        outDir: params.runParams.outDir
+      });
+      params.subprocess.kill("SIGTERM");
+      reject(error);
+    }, interval);
+    timer.unref();
+  });
+  return Promise.race([params.subprocess, idlePromise]).finally(() => {
+    if (timer) clearInterval(timer);
+  });
+}
+
+function finalizeAgenticUsage(acc: AgenticUsageAccumulator): CodexAgenticReviewerMetrics {
+  return {
+    shellCommands: Array.from(acc.shellCommands),
+    grCommands: Array.from(acc.grCommands),
+    filesInspected: Array.from(acc.filesInspected),
+    retrievalCalls: acc.retrievalCalls,
+    graphCalls: acc.graphCalls,
+    fallbackDiagnostics: Array.from(acc.fallbackDiagnostics)
+  };
+}
+
+type ToolEntrypoint = {
+  command: string;
+  env: Record<string, string>;
+};
+
+async function resolveToolEntrypoint(params: { distPath: string; sourcePath: string }): Promise<ToolEntrypoint> {
+  try {
+    await fs.access(params.distPath);
+    return { command: `node ${JSON.stringify(params.distPath)}`, env: {} };
+  } catch {
+    const tsxPath = path.join(runtimeRoot, "node_modules", ".bin", "tsx");
+    await fs.access(tsxPath);
+    return { command: `${JSON.stringify(tsxPath)} ${JSON.stringify(params.sourcePath)}`, env: { TMPDIR: "/tmp" } };
+  }
+}
+
+function renderAgenticToolWrapper(entrypoint: ToolEntrypoint): string {
+  const exports = Object.entries(entrypoint.env)
+    .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
+    .join("\n");
+  return `#!/bin/sh\n${exports ? `${exports}\n` : ""}exec ${entrypoint.command} "$@"\n`;
+}
+
+async function writeAgenticToolWrappers(stageHomeDir: string): Promise<void> {
+  const binDir = path.join(stageHomeDir, AGENTIC_TOOL_BIN_DIR);
+  await fs.mkdir(binDir, { recursive: true });
+  const grEntrypoint = await resolveToolEntrypoint({
+    distPath: path.join(runtimeRoot, "dist", "tools", "gr.js"),
+    sourcePath: path.join(runtimeRoot, "src", "tools", "gr.ts")
+  });
+  const gitEntrypoint = await resolveToolEntrypoint({
+    distPath: path.join(runtimeRoot, "dist", "tools", "readOnlyGit.js"),
+    sourcePath: path.join(runtimeRoot, "src", "tools", "readOnlyGit.ts")
+  });
+  const wrappers = [
+    ["gr", renderAgenticToolWrapper(grEntrypoint)],
+    ["git", renderAgenticToolWrapper(gitEntrypoint)]
+  ] as const;
+  for (const [name, body] of wrappers) {
+    const filePath = path.join(binDir, name);
+    await fs.writeFile(filePath, body, { encoding: "utf8", mode: 0o755 });
+    await fs.chmod(filePath, 0o755);
+  }
 }
 
 async function writeStageMetrics(params: {
@@ -466,6 +743,9 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
   const stageHomeDir = path.join(params.codexHomeDir, params.stage);
   await fs.mkdir(stageHomeDir, { recursive: true });
   await fs.mkdir(path.join(stageHomeDir, ".tmp"), { recursive: true });
+  if (isAgenticReviewer(params)) {
+    await writeAgenticToolWrappers(stageHomeDir);
+  }
   await writeAuthFile(stageHomeDir);
   const configToml = configForStage(params.stage, params);
   const configPath = path.join(stageHomeDir, "config.toml");
@@ -473,7 +753,12 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
   const stageEnv = buildStageEnv(params, stageHomeDir);
   const { codexArgs, fullPrompt, stageCwd } = buildStageLaunch(params);
   const startedAt = Date.now();
+  let lastActivityAt = startedAt;
+  const markActivity = () => {
+    lastActivityAt = Date.now();
+  };
   const tokenUsageRef: { current: CodexTokenUsage | null } = { current: null };
+  const agenticUsage = isAgenticReviewer(params) ? createAgenticUsageAccumulator() : null;
   let forwarders: Promise<void>[] = [];
   console.log(`${stageTag} starting`);
   try {
@@ -496,10 +781,17 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
           logLines: false,
           onUsage: (usage) => {
             tokenUsageRef.current = usage;
-          }
+          },
+          onJsonLine: agenticUsage ? (line) => scanAgenticUsageLine(line, agenticUsage) : undefined,
+          onActivity: markActivity
         })
       ];
-      await subprocess;
+      await waitForStageOrIdleTimeout({
+        runParams: params,
+        subprocess,
+        startedAt,
+        getLastActivityAt: () => lastActivityAt
+      });
       await Promise.allSettled(forwarders);
       const durationMs = Date.now() - startedAt;
       const metrics = {
@@ -509,7 +801,8 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
         promptChars: fullPrompt.length,
         promptBytes: Buffer.byteLength(fullPrompt, "utf8"),
         estimatedPromptTokens: estimatePromptTokens(fullPrompt),
-        usage: tokenUsageRef.current
+        usage: tokenUsageRef.current,
+        ...(agenticUsage ? { agentic: finalizeAgenticUsage(agenticUsage) } : {})
       };
       await writeStageMetrics({ outDir: params.outDir, stage: params.stage, startedAt, metrics });
       console.log(`${stageTag} completed in ${durationMs}ms${formatTokenUsageForLog(tokenUsageRef.current)}`);
@@ -527,7 +820,6 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
       killSignal: "SIGTERM",
       forceKillAfterDelay: 10_000
     });
-
     forwarders = [
       scanCodexJsonStream({
         stream: subprocess.stdout,
@@ -535,16 +827,24 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
         logLines: true,
         onUsage: (usage) => {
           tokenUsageRef.current = usage;
-        }
+        },
+        onJsonLine: agenticUsage ? (line) => scanAgenticUsageLine(line, agenticUsage) : undefined,
+        onActivity: markActivity
       }),
       forwardStageStream({
         stream: subprocess.stderr,
         stageTag,
-        channel: "stderr"
+        channel: "stderr",
+        onActivity: markActivity
       })
     ];
 
-    await subprocess;
+    await waitForStageOrIdleTimeout({
+      runParams: params,
+      subprocess,
+      startedAt,
+      getLastActivityAt: () => lastActivityAt
+    });
     await Promise.allSettled(forwarders);
     const durationMs = Date.now() - startedAt;
     const metrics = {
@@ -554,7 +854,8 @@ export async function runCodexStageLocal(params: CodexRunParams): Promise<CodexS
       promptChars: fullPrompt.length,
       promptBytes: Buffer.byteLength(fullPrompt, "utf8"),
       estimatedPromptTokens: estimatePromptTokens(fullPrompt),
-      usage: tokenUsageRef.current
+      usage: tokenUsageRef.current,
+      ...(agenticUsage ? { agentic: finalizeAgenticUsage(agenticUsage) } : {})
     };
     await writeStageMetrics({ outDir: params.outDir, stage: params.stage, startedAt, metrics });
     console.log(`${stageTag} completed in ${durationMs}ms${formatTokenUsageForLog(tokenUsageRef.current)}`);
@@ -573,5 +874,12 @@ export const __codexRunnerInternals = {
   configForStage,
   buildStageLaunch,
   estimatePromptTokens,
-  parseCodexUsageLine
+  parseCodexUsageLine,
+  isAgenticReviewer,
+  scanAgenticUsageLine,
+  createAgenticUsageAccumulator,
+  finalizeAgenticUsage,
+  renderAgenticToolWrapper,
+  writeAgenticToolWrappers,
+  CodexStageIdleTimeoutError
 };
