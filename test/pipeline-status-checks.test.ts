@@ -218,6 +218,44 @@ test("chunk mode selector enables reviews at one thousand changed lines", async 
 });
 
 
+test("chunked reviews only skip verifier after high threshold", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: true,
+        totalChangedLines: 1000
+      }),
+      false
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: true,
+        totalChangedLines: 15999
+      }),
+      false
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: true,
+        totalChangedLines: 16000
+      }),
+      true
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: false,
+        totalChangedLines: 30000
+      }),
+      false
+    );
+  } finally {
+    await closeQueueClients();
+  }
+});
+
+
 test("agentic chunk mode selector keeps kubernetes on direct chunks", async () => {
   ensureReviewRenderTestEnv();
   const { __pipelineInternals } = await import("../src/review/pipeline.js");

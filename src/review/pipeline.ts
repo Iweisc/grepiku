@@ -89,6 +89,7 @@ import {
 
 const env = loadEnv();
 const DEFAULT_CHUNKED_REVIEW_MIN_CHANGED_LINES = 1_000;
+const DEFAULT_CHUNKED_REVIEW_VERIFIER_SKIP_CHANGED_LINES = 16_000;
 const DEFAULT_CHUNKED_REVIEW_TARGET_CHANGED_LINES = 1_000;
 const DEFAULT_CHUNKED_REVIEW_MAX_CHANGED_LINES = 1_800;
 const DEFAULT_CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 700;
@@ -208,6 +209,13 @@ function shouldUseChunkedReviewer(params: {
   minChangedLines?: number;
 }): boolean {
   return params.chunkCount > 1 && params.totalChangedLines >= (params.minChangedLines ?? chunkedReviewMinChangedLines());
+}
+
+function shouldSkipVerifierForChunkedReview(params: {
+  useChunkedReviewer: boolean;
+  totalChangedLines: number;
+}): boolean {
+  return params.useChunkedReviewer && params.totalChangedLines >= DEFAULT_CHUNKED_REVIEW_VERIFIER_SKIP_CHANGED_LINES;
 }
 
 function shouldUseAgenticChunkReviewer(params: {
@@ -1971,7 +1979,11 @@ export async function processReviewJob(
       repoFullName: repo.fullName,
       pullRequest: refreshed
     });
-    if (verifierEligible && !useChunkedReviewer) {
+    const skipVerifierForChunkedReview = shouldSkipVerifierForChunkedReview({
+      useChunkedReviewer,
+      totalChangedLines: chunkPlan.stats.totalChangedLines
+    });
+    if (verifierEligible && !skipVerifierForChunkedReview) {
       const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
       verifierPromise = runCodexStage({
         stage: "verifier",
@@ -1990,7 +2002,7 @@ export async function processReviewJob(
     } else {
       const skippedChecks = buildVerifierSkippedChecks({
         headSha: refreshed.headSha,
-        summary: useChunkedReviewer
+        summary: skipVerifierForChunkedReview
           ? "skipped for chunked review"
           : "skipped for untrusted fork pull request"
       });
@@ -2000,7 +2012,7 @@ export async function processReviewJob(
         "utf8"
       );
       console.warn(
-        useChunkedReviewer
+        skipVerifierForChunkedReview
           ? `[run ${run.id} pr#${prNumber}] skipping verifier tools for chunked review`
           : `[run ${run.id} pr#${prNumber}] skipping verifier tools for head repo ${refreshed.headRepoFullName || "unknown"}`
       );
@@ -2518,6 +2530,7 @@ export const __pipelineInternals = {
   chunkedReviewMinChangedLines,
   chunkedReviewMaxParallel,
   shouldUseChunkedReviewer,
+  shouldSkipVerifierForChunkedReview,
   shouldUseAgenticChunkReviewer,
   resolveChunkReviewMode,
   reviewHasInspectedEvidence,
