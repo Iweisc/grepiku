@@ -88,10 +88,11 @@ import {
 } from "./editorDecision.js";
 
 const env = loadEnv();
-const CHUNKED_REVIEW_MIN_CHANGED_LINES = 16_000;
-const CHUNKED_REVIEW_TARGET_CHANGED_LINES = 6_000;
-const CHUNKED_REVIEW_MAX_CHANGED_LINES = 7_000;
-const CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 3_000;
+const DEFAULT_CHUNKED_REVIEW_MIN_CHANGED_LINES = 1_000;
+const DEFAULT_CHUNKED_REVIEW_VERIFIER_SKIP_CHANGED_LINES = 16_000;
+const DEFAULT_CHUNKED_REVIEW_TARGET_CHANGED_LINES = 1_000;
+const DEFAULT_CHUNKED_REVIEW_MAX_CHANGED_LINES = 1_800;
+const DEFAULT_CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES = 700;
 
 function shouldRecoverRunningDuplicateRun(params: {
   duplicateRunStatus: string;
@@ -160,13 +161,61 @@ async function failInterruptedDuplicateRun(params: {
   });
 }
 
-const CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 3_800;
-const CHUNKED_REVIEW_MAX_FILES = 240;
+const DEFAULT_CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES = 1_200;
+const DEFAULT_CHUNKED_REVIEW_MAX_FILES = 240;
+const DEFAULT_CHUNKED_REVIEW_MAX_PARALLEL = 48;
+const DEFAULT_K8S_CHUNKED_REVIEW_MAX_PARALLEL = 12;
 
 type LargePrReviewMode = "direct" | "agentic";
 
 function largePrReviewMode(): LargePrReviewMode {
   return env.largePrReviewMode;
+}
+
+function chunkedReviewMinChangedLines(): number {
+  return env.chunkedReviewMinChangedLines || DEFAULT_CHUNKED_REVIEW_MIN_CHANGED_LINES;
+}
+
+function chunkedReviewTargetChangedLines(): number {
+  return env.chunkedReviewTargetChangedLines || DEFAULT_CHUNKED_REVIEW_TARGET_CHANGED_LINES;
+}
+
+function chunkedReviewMaxChangedLines(): number {
+  return env.chunkedReviewMaxChangedLines || DEFAULT_CHUNKED_REVIEW_MAX_CHANGED_LINES;
+}
+
+function chunkedReviewHighTargetChangedLines(): number {
+  return env.chunkedReviewHighTargetChangedLines || DEFAULT_CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES;
+}
+
+function chunkedReviewHighMaxChangedLines(): number {
+  return env.chunkedReviewHighMaxChangedLines || DEFAULT_CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES;
+}
+
+function chunkedReviewMaxFiles(): number {
+  return env.chunkedReviewMaxFiles || DEFAULT_CHUNKED_REVIEW_MAX_FILES;
+}
+
+function chunkedReviewMaxParallel(sandboxExecutionMode = env.sandboxExecutionMode): number {
+  if (sandboxExecutionMode === "kubernetes") {
+    return env.k8sChunkedReviewMaxParallel || DEFAULT_K8S_CHUNKED_REVIEW_MAX_PARALLEL;
+  }
+  return env.chunkedReviewMaxParallel || DEFAULT_CHUNKED_REVIEW_MAX_PARALLEL;
+}
+
+function shouldUseChunkedReviewer(params: {
+  chunkCount: number;
+  totalChangedLines: number;
+  minChangedLines?: number;
+}): boolean {
+  return params.chunkCount > 1 && params.totalChangedLines >= (params.minChangedLines ?? chunkedReviewMinChangedLines());
+}
+
+function shouldSkipVerifierForChunkedReview(params: {
+  useChunkedReviewer: boolean;
+  totalChangedLines: number;
+}): boolean {
+  return params.useChunkedReviewer && params.totalChangedLines >= DEFAULT_CHUNKED_REVIEW_VERIFIER_SKIP_CHANGED_LINES;
 }
 
 function shouldUseAgenticChunkReviewer(params: {
@@ -178,8 +227,10 @@ function shouldUseAgenticChunkReviewer(params: {
   return (
     (params.mode ?? largePrReviewMode()) === "agentic" &&
     (params.sandboxExecutionMode ?? env.sandboxExecutionMode) !== "kubernetes" &&
-    params.chunkCount > 1 &&
-    params.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES
+    shouldUseChunkedReviewer({
+      chunkCount: params.chunkCount,
+      totalChangedLines: params.totalChangedLines
+    })
   );
 }
 
@@ -270,7 +321,6 @@ async function writeAgenticReviewerDiagnostics(params: {
   );
 }
 
-const CHUNKED_REVIEW_MAX_PARALLEL = 48;
 const CHUNKED_EDITOR_MAX_CANDIDATE_COMMENTS = 48;
 
 export type ReviewJobData = {
@@ -1195,7 +1245,7 @@ async function runChunkedReviewer(params: {
 }): Promise<ReviewOutput> {
   const drafts = await mapWithConcurrency(
     params.plan.chunks,
-    CHUNKED_REVIEW_MAX_PARALLEL,
+    chunkedReviewMaxParallel(),
     (chunk) =>
       runReviewerChunk({
         chunk,
@@ -1649,25 +1699,39 @@ export async function processReviewJob(
         deletions?: number;
       }>,
       changedFileStats: contextPack.changedFileStats,
-      targetChangedLines: CHUNKED_REVIEW_TARGET_CHANGED_LINES,
-      maxChangedLines: CHUNKED_REVIEW_MAX_CHANGED_LINES,
-      highRiskTargetChangedLines: CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES,
-      highRiskMaxChangedLines: CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES,
-      maxFiles: CHUNKED_REVIEW_MAX_FILES
+      targetChangedLines: chunkedReviewTargetChangedLines(),
+      maxChangedLines: chunkedReviewMaxChangedLines(),
+      highRiskTargetChangedLines: chunkedReviewHighTargetChangedLines(),
+      highRiskMaxChangedLines: chunkedReviewHighMaxChangedLines(),
+      maxFiles: chunkedReviewMaxFiles()
     });
     await fs.writeFile(
       path.join(outDir, "review_chunk_plan.json"),
       JSON.stringify(serializableChunkPlan(chunkPlan), null, 2),
       "utf8"
     );
-    const shouldUseChunkedReviewer =
-      chunkPlan.chunks.length > 1 &&
-      chunkPlan.stats.totalChangedLines >= CHUNKED_REVIEW_MIN_CHANGED_LINES;
+    const useChunkedReviewer = shouldUseChunkedReviewer({
+      chunkCount: chunkPlan.chunks.length,
+      totalChangedLines: chunkPlan.stats.totalChangedLines
+    });
     let draft: ReviewOutput;
-    if (shouldUseChunkedReviewer) {
+    if (useChunkedReviewer) {
+      const configuredChunkMode = largePrReviewMode();
+      const resolvedChunkMode = resolveChunkReviewMode({
+        mode: configuredChunkMode,
+        chunkCount: chunkPlan.chunks.length,
+        totalChangedLines: chunkPlan.stats.totalChangedLines
+      });
+      const chunkParallelism = chunkedReviewMaxParallel();
+      const kubernetesAgenticFallback =
+        configuredChunkMode === "agentic" &&
+        resolvedChunkMode === "direct" &&
+        env.sandboxExecutionMode === "kubernetes";
       console.log(
-        `[run ${run.id} pr#${prNumber}] using chunked reviewer mode=${largePrReviewMode()} ` +
-          `chunks=${chunkPlan.chunks.length} changedLines=${chunkPlan.stats.totalChangedLines}`
+        `[run ${run.id} pr#${prNumber}] using chunked reviewer mode=${resolvedChunkMode}` +
+          ` configuredMode=${configuredChunkMode} chunks=${chunkPlan.chunks.length}` +
+          ` changedLines=${chunkPlan.stats.totalChangedLines} maxParallel=${chunkParallelism}` +
+          (kubernetesAgenticFallback ? " reason=kubernetes-agentic-disabled" : "")
       );
       draft = await runChunkedReviewer({
         plan: chunkPlan,
@@ -1722,7 +1786,7 @@ export async function processReviewJob(
 
     let finalReview: ReviewOutput;
     let verdicts: VerdictsOutput;
-    if (shouldUseChunkedReviewer) {
+    if (useChunkedReviewer) {
       const editorInput = buildCompactEditorInput({
         draft,
         maxComments: Math.max(
@@ -1805,7 +1869,7 @@ export async function processReviewJob(
     };
     const shouldRunCoveragePass =
       coveragePlan.shouldRun &&
-      !shouldUseChunkedReviewer &&
+      !useChunkedReviewer &&
       env.sandboxExecutionMode !== "kubernetes" &&
       coveragePlan.targets.length > 0 &&
       !resolvedConfig.output.summaryOnly &&
@@ -1915,7 +1979,11 @@ export async function processReviewJob(
       repoFullName: repo.fullName,
       pullRequest: refreshed
     });
-    if (verifierEligible && !shouldUseChunkedReviewer) {
+    const skipVerifierForChunkedReview = shouldSkipVerifierForChunkedReview({
+      useChunkedReviewer,
+      totalChangedLines: chunkPlan.stats.totalChangedLines
+    });
+    if (verifierEligible && !skipVerifierForChunkedReview) {
       const checksPrompt = buildVerifierPrompt(refreshed.headSha, promptPaths);
       verifierPromise = runCodexStage({
         stage: "verifier",
@@ -1934,8 +2002,8 @@ export async function processReviewJob(
     } else {
       const skippedChecks = buildVerifierSkippedChecks({
         headSha: refreshed.headSha,
-        summary: shouldUseChunkedReviewer
-          ? "skipped for chunked large review"
+        summary: skipVerifierForChunkedReview
+          ? "skipped for chunked review"
           : "skipped for untrusted fork pull request"
       });
       await fs.writeFile(
@@ -1944,8 +2012,8 @@ export async function processReviewJob(
         "utf8"
       );
       console.warn(
-        shouldUseChunkedReviewer
-          ? `[run ${run.id} pr#${prNumber}] skipping verifier tools for chunked large review`
+        skipVerifierForChunkedReview
+          ? `[run ${run.id} pr#${prNumber}] skipping verifier tools for chunked review`
           : `[run ${run.id} pr#${prNumber}] skipping verifier tools for head repo ${refreshed.headRepoFullName || "unknown"}`
       );
       verifierPromise = Promise.resolve({ ok: true as const });
@@ -2459,6 +2527,10 @@ export const __pipelineInternals = {
   renderStatusComment,
   resolveStatusCheckConclusion,
   largePrReviewMode,
+  chunkedReviewMinChangedLines,
+  chunkedReviewMaxParallel,
+  shouldUseChunkedReviewer,
+  shouldSkipVerifierForChunkedReview,
   shouldUseAgenticChunkReviewer,
   resolveChunkReviewMode,
   reviewHasInspectedEvidence,

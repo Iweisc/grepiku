@@ -278,6 +278,35 @@ test("buildReviewDiffChunkPlan uses smaller high-risk buckets", () => {
   assert.equal(plan.stats.highRiskTargetChangedLines, 3);
 });
 
+
+test("buildReviewDiffChunkPlan creates useful chunks for one-thousand-line reviews", () => {
+  const files = [
+    ["apps/a/src/a.ts", 450],
+    ["apps/a/src/b.ts", 350],
+    ["apps/b/src/c.ts", 300],
+    ["apps/b/src/d.ts", 200]
+  ] as const;
+  const diffPatch = files
+    .map(([path, lines]) => filePatch(path, Array.from({ length: lines }, (_, index) => `${path} line ${index}`)))
+    .join("");
+
+  const plan = buildReviewDiffChunkPlan({
+    diffPatch,
+    changedFiles: files.map(([path, lines]) => ({ path, additions: lines, deletions: 0 })),
+    changedFileStats: files.map(([path, lines]) => ({ path, risk: "low" as const, additions: lines, deletions: 0 })),
+    targetChangedLines: 1000,
+    maxChangedLines: 1800,
+    highRiskTargetChangedLines: 700,
+    highRiskMaxChangedLines: 1200,
+    maxFiles: 240
+  });
+
+  assert.equal(plan.stats.totalChangedLines, 1300);
+  assert.equal(plan.stats.targetChangedLines, 1000);
+  assert.equal(plan.chunks.length, 2);
+  assert.deepEqual(plan.chunks.map((chunk) => chunk.changedLines), [800, 500]);
+});
+
 test("buildReviewDiffChunkPlan caps files per chunk for low-churn tails", () => {
   const files = Array.from({ length: 5 }, (_, index) => `apps/a/src/file-${index}.ts`);
   const diffPatch = files.map((path) => filePatch(path, [`line ${path}`])).join("");

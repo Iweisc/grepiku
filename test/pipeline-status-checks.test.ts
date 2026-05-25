@@ -186,7 +186,77 @@ test("inline comment sync ignores spoofed marker comments from non-bot authors",
 });
 
 
-test("agentic chunk mode selector only enables configured large chunked reviews", async () => {
+test("chunk mode selector enables reviews at one thousand changed lines", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    assert.equal((__pipelineInternals as any).chunkedReviewMinChangedLines(), 1000);
+    assert.equal(
+      (__pipelineInternals as any).shouldUseChunkedReviewer({
+        chunkCount: 2,
+        totalChangedLines: 999
+      }),
+      false
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldUseChunkedReviewer({
+        chunkCount: 2,
+        totalChangedLines: 1000
+      }),
+      true
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldUseChunkedReviewer({
+        chunkCount: 1,
+        totalChangedLines: 30000
+      }),
+      false
+    );
+  } finally {
+    await closeQueueClients();
+  }
+});
+
+
+test("chunked reviews only skip verifier after high threshold", async () => {
+  ensureReviewRenderTestEnv();
+  const { __pipelineInternals } = await import("../src/review/pipeline.js");
+  try {
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: true,
+        totalChangedLines: 1000
+      }),
+      false
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: true,
+        totalChangedLines: 15999
+      }),
+      false
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: true,
+        totalChangedLines: 16000
+      }),
+      true
+    );
+    assert.equal(
+      (__pipelineInternals as any).shouldSkipVerifierForChunkedReview({
+        useChunkedReviewer: false,
+        totalChangedLines: 30000
+      }),
+      false
+    );
+  } finally {
+    await closeQueueClients();
+  }
+});
+
+
+test("agentic chunk mode selector keeps kubernetes on direct chunks", async () => {
   ensureReviewRenderTestEnv();
   const { __pipelineInternals } = await import("../src/review/pipeline.js");
   try {
@@ -194,7 +264,7 @@ test("agentic chunk mode selector only enables configured large chunked reviews"
       (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
         mode: "agentic",
         chunkCount: 2,
-        totalChangedLines: 16000
+        totalChangedLines: 1000
       }),
       true
     );
@@ -202,15 +272,7 @@ test("agentic chunk mode selector only enables configured large chunked reviews"
       (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
         mode: "direct",
         chunkCount: 2,
-        totalChangedLines: 16000
-      }),
-      false
-    );
-    assert.equal(
-      (__pipelineInternals as any).shouldUseAgenticChunkReviewer({
-        mode: "agentic",
-        chunkCount: 1,
-        totalChangedLines: 30000
+        totalChangedLines: 1000
       }),
       false
     );
@@ -241,6 +303,8 @@ test("agentic chunk mode selector only enables configured large chunked reviews"
       }),
       "direct"
     );
+    assert.equal((__pipelineInternals as any).chunkedReviewMaxParallel("kubernetes"), 12);
+    assert.equal((__pipelineInternals as any).chunkedReviewMaxParallel("local"), 48);
   } finally {
     await closeQueueClients();
   }

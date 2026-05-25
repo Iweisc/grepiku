@@ -33,6 +33,14 @@ const EnvSchema = z.object({
   CODEX_STAGE_LOG_OUTPUT: z.string().default("false"),
   CODEX_MODEL_REASONING_EFFORT: z.enum(["low", "medium", "high", "xhigh"]).default("high"),
   LARGE_PR_REVIEW_MODE: z.enum(["direct", "agentic"]).default("direct"),
+  CHUNKED_REVIEW_MIN_CHANGED_LINES: z.string().default("1000"),
+  CHUNKED_REVIEW_TARGET_CHANGED_LINES: z.string().default("1000"),
+  CHUNKED_REVIEW_MAX_CHANGED_LINES: z.string().default("1800"),
+  CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES: z.string().default("700"),
+  CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES: z.string().default("1200"),
+  CHUNKED_REVIEW_MAX_FILES: z.string().default("240"),
+  CHUNKED_REVIEW_MAX_PARALLEL: z.string().default("48"),
+  K8S_CHUNKED_REVIEW_MAX_PARALLEL: z.string().default("12"),
   INTERNAL_API_URL: z.string().default("http://web:3000/internal/retrieval"),
   SANDBOX_EXECUTION_MODE: z.enum(["local", "kubernetes"]).default("local"),
   K8S_NAMESPACE: z.string().default(""),
@@ -82,6 +90,14 @@ export type Env = {
   codexStageLogOutput: boolean;
   codexModelReasoningEffort: "low" | "medium" | "high" | "xhigh";
   largePrReviewMode: "direct" | "agentic";
+  chunkedReviewMinChangedLines: number;
+  chunkedReviewTargetChangedLines: number;
+  chunkedReviewMaxChangedLines: number;
+  chunkedReviewHighTargetChangedLines: number;
+  chunkedReviewHighMaxChangedLines: number;
+  chunkedReviewMaxFiles: number;
+  chunkedReviewMaxParallel: number;
+  k8sChunkedReviewMaxParallel: number;
   internalApiUrl: string;
   sandboxExecutionMode: "local" | "kubernetes";
   k8sNamespace: string;
@@ -173,6 +189,20 @@ export function loadEnv(): Env {
     codexStageLogOutput: parseBooleanFlag(parsed.CODEX_STAGE_LOG_OUTPUT),
     codexModelReasoningEffort: parsed.CODEX_MODEL_REASONING_EFFORT,
     largePrReviewMode: parsed.LARGE_PR_REVIEW_MODE,
+    chunkedReviewMinChangedLines: parsePositiveInteger(parsed.CHUNKED_REVIEW_MIN_CHANGED_LINES, 1000),
+    chunkedReviewTargetChangedLines: parsePositiveInteger(parsed.CHUNKED_REVIEW_TARGET_CHANGED_LINES, 1000),
+    chunkedReviewMaxChangedLines: parsePositiveInteger(parsed.CHUNKED_REVIEW_MAX_CHANGED_LINES, 1800),
+    chunkedReviewHighTargetChangedLines: parsePositiveInteger(
+      parsed.CHUNKED_REVIEW_HIGH_TARGET_CHANGED_LINES,
+      700
+    ),
+    chunkedReviewHighMaxChangedLines: parsePositiveInteger(
+      parsed.CHUNKED_REVIEW_HIGH_MAX_CHANGED_LINES,
+      1200
+    ),
+    chunkedReviewMaxFiles: parsePositiveInteger(parsed.CHUNKED_REVIEW_MAX_FILES, 240),
+    chunkedReviewMaxParallel: parsePositiveInteger(parsed.CHUNKED_REVIEW_MAX_PARALLEL, 48),
+    k8sChunkedReviewMaxParallel: parsePositiveInteger(parsed.K8S_CHUNKED_REVIEW_MAX_PARALLEL, 12),
     internalApiUrl: parsed.INTERNAL_API_URL.trim(),
     sandboxExecutionMode: parsed.SANDBOX_EXECUTION_MODE,
     k8sNamespace: parsed.K8S_NAMESPACE.trim(),
