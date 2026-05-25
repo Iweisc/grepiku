@@ -54,16 +54,25 @@ export type GitWrapperDecision = {
   reason?: string;
 };
 
+type ResolvedGitSubcommand = {
+  subcommand: string | null;
+  index: number;
+};
+
 function isGlobalOptionWithInlineValue(arg: string): boolean {
   return Array.from(GLOBAL_OPTIONS_WITH_OPTIONAL_EQUALS).some((option) => arg.startsWith(`${option}=`));
 }
 
 export function resolveGitSubcommand(args: string[]): string | null {
+  return resolveGitSubcommandWithIndex(args).subcommand;
+}
+
+function resolveGitSubcommandWithIndex(args: string[]): ResolvedGitSubcommand {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (!arg) continue;
     if (arg === "--") {
-      return args[index + 1] || null;
+      return { subcommand: args[index + 1] || null, index: args[index + 1] ? index + 1 : -1 };
     }
     if (GLOBAL_FLAGS.has(arg) || isGlobalOptionWithInlineValue(arg)) {
       continue;
@@ -73,16 +82,17 @@ export function resolveGitSubcommand(args: string[]): string | null {
       continue;
     }
     if (arg.startsWith("-")) {
-      return null;
+      return { subcommand: null, index: -1 };
     }
-    return arg;
+    return { subcommand: arg, index };
   }
-  return null;
+  return { subcommand: null, index: -1 };
 }
 
-function hasWriteCapableOption(args: string[], subcommand: string): string | null {
-  for (const arg of args) {
-    if (arg === "--") break;
+function hasWriteCapableOption(args: string[], subcommand: string, subcommandIndex: number): string | null {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--" && index > subcommandIndex) break;
     if (WRITE_CAPABLE_OPTIONS.has(arg)) return arg;
     if (WRITE_CAPABLE_OPTION_PREFIXES.some((prefix) => arg.startsWith(prefix))) return arg;
     if (subcommand !== "grep" && arg === "-o") return arg;
@@ -91,11 +101,11 @@ function hasWriteCapableOption(args: string[], subcommand: string): string | nul
 }
 
 export function decideReadOnlyGit(args: string[]): GitWrapperDecision {
-  const subcommand = resolveGitSubcommand(args);
+  const { subcommand, index: subcommandIndex } = resolveGitSubcommandWithIndex(args);
   if (!subcommand) {
     return { allowed: false, subcommand: null, reason: "missing or unsupported git subcommand" };
   }
-  const writeOption = hasWriteCapableOption(args, subcommand);
+  const writeOption = hasWriteCapableOption(args, subcommand, subcommandIndex);
   if (writeOption) {
     return { allowed: false, subcommand, reason: `blocked write-capable git option: ${writeOption}` };
   }

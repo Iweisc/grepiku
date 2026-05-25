@@ -40,7 +40,9 @@ test("read-only git wrapper rejects write-capable options on allowed commands", 
     ["diff", "--output=/tmp/diff.patch", "HEAD"],
     ["diff", "--output", "/tmp/diff.patch", "HEAD"],
     ["diff", "-o", "/tmp/diff.patch", "HEAD"],
-    ["show", "-o", "/tmp/show.patch", "HEAD"]
+    ["show", "-o", "/tmp/show.patch", "HEAD"],
+    ["--", "diff", "--output=/tmp/diff.patch", "HEAD"],
+    ["--", "show", "-o", "/tmp/show.patch", "HEAD"]
   ]) {
     const decision = decideReadOnlyGit(args);
     assert.equal(decision.allowed, false, args.join(" "));
@@ -64,6 +66,7 @@ test("read-only git wrapper allows grep -o but still blocks output files", () =>
 test("read-only git wrapper ignores write-like pathspecs after argument separator", () => {
   assert.equal(decideReadOnlyGit(["grep", "needle", "--", "-o"]).allowed, true);
   assert.equal(decideReadOnlyGit(["diff", "HEAD", "--", "-o"]).allowed, true);
+  assert.equal(decideReadOnlyGit(["--", "diff", "HEAD", "--", "-o"]).allowed, true);
 });
 
 
