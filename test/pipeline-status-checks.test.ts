@@ -223,6 +223,24 @@ test("agentic chunk mode selector only enables configured large chunked reviews"
       }),
       false
     );
+    assert.equal(
+      (__pipelineInternals as any).resolveChunkReviewMode({
+        mode: "agentic",
+        sandboxExecutionMode: "local",
+        chunkCount: 2,
+        totalChangedLines: 30000
+      }),
+      "agentic"
+    );
+    assert.equal(
+      (__pipelineInternals as any).resolveChunkReviewMode({
+        mode: "agentic",
+        sandboxExecutionMode: "kubernetes",
+        chunkCount: 2,
+        totalChangedLines: 30000
+      }),
+      "direct"
+    );
   } finally {
     await closeQueueClients();
   }

@@ -35,6 +35,18 @@ test("read-only git wrapper rejects unsupported commands and missing subcommands
   assert.equal(decideReadOnlyGit(["branch"]).allowed, false);
 });
 
+test("read-only git wrapper rejects write-capable options on allowed commands", () => {
+  for (const args of [
+    ["diff", "--output=/tmp/diff.patch", "HEAD"],
+    ["diff", "--output", "/tmp/diff.patch", "HEAD"],
+    ["show", "-o", "/tmp/show.patch", "HEAD"]
+  ]) {
+    const decision = decideReadOnlyGit(args);
+    assert.equal(decision.allowed, false, args.join(" "));
+    assert.match(decision.reason || "", /write-capable git option/);
+  }
+});
+
 
 test("read-only git wrapper skips the configured wrapper directory when locating real git", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "grepiku-git-wrapper-"));

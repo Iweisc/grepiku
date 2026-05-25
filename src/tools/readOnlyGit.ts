@@ -45,6 +45,9 @@ const GLOBAL_FLAGS = new Set([
   "--bare"
 ]);
 
+const WRITE_CAPABLE_OPTIONS = new Set(["--output", "-o"]);
+const WRITE_CAPABLE_OPTION_PREFIXES = ["--output="];
+
 export type GitWrapperDecision = {
   allowed: boolean;
   subcommand: string | null;
@@ -77,10 +80,22 @@ export function resolveGitSubcommand(args: string[]): string | null {
   return null;
 }
 
+function hasWriteCapableOption(args: string[]): string | null {
+  for (const arg of args) {
+    if (WRITE_CAPABLE_OPTIONS.has(arg)) return arg;
+    if (WRITE_CAPABLE_OPTION_PREFIXES.some((prefix) => arg.startsWith(prefix))) return arg;
+  }
+  return null;
+}
+
 export function decideReadOnlyGit(args: string[]): GitWrapperDecision {
   const subcommand = resolveGitSubcommand(args);
   if (!subcommand) {
     return { allowed: false, subcommand: null, reason: "missing or unsupported git subcommand" };
+  }
+  const writeOption = hasWriteCapableOption(args);
+  if (writeOption) {
+    return { allowed: false, subcommand, reason: `blocked write-capable git option: ${writeOption}` };
   }
   if (BLOCKED_GIT_COMMANDS.has(subcommand)) {
     return { allowed: false, subcommand, reason: `blocked mutating or network git command: ${subcommand}` };

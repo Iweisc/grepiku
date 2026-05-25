@@ -183,6 +183,15 @@ function shouldUseAgenticChunkReviewer(params: {
   );
 }
 
+function resolveChunkReviewMode(params: {
+  mode?: LargePrReviewMode;
+  sandboxExecutionMode?: "local" | "kubernetes";
+  chunkCount: number;
+  totalChangedLines: number;
+}): LargePrReviewMode {
+  return shouldUseAgenticChunkReviewer(params) ? "agentic" : "direct";
+}
+
 function reviewHasInspectedEvidence(review: ReviewOutput, filesInspected: string[]): boolean {
   if (review.comments.length === 0) return true;
   const inspected = new Set(filesInspected.map((item) => normalizePath(item)));
@@ -1057,7 +1066,11 @@ async function runReviewerChunk(params: {
     }
   } satisfies ReviewPromptOptions;
   const reasoningEffort = reasoningEffortForChunk(params.chunk, chunkContextPack);
-  const reviewMode = largePrReviewMode();
+  const reviewMode = resolveChunkReviewMode({
+    mode: largePrReviewMode(),
+    chunkCount: params.chunkCount,
+    totalChangedLines: params.totalChangedLines
+  });
 
   console.log(
     `[run ${params.runId} pr#${params.prNumber}] reviewer ${params.chunk.id} starting ` +
@@ -2447,6 +2460,7 @@ export const __pipelineInternals = {
   resolveStatusCheckConclusion,
   largePrReviewMode,
   shouldUseAgenticChunkReviewer,
+  resolveChunkReviewMode,
   reviewHasInspectedEvidence,
   writeAgenticReviewerDiagnostics,
   shouldRecoverRunningDuplicateRun,

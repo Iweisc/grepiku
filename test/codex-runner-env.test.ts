@@ -190,9 +190,19 @@ test("agentic tool wrappers fall back to source entrypoints when dist is unavail
     const git = await readFile(path.join(root, "agentic-bin", "git"), "utf8");
     assert.ok((gr.includes("dist/tools/gr.js") && gr.includes("node ")) || (gr.includes("node_modules/.bin/tsx") && gr.includes("src/tools/gr.ts")));
     assert.match(git, /readOnlyGit\.(ts|js)/);
+    assert.doesNotMatch(gr, /exec TMPDIR=/);
+    assert.doesNotMatch(git, /exec TMPDIR=/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("agentic tool wrapper renders env assignments before exec", async () => {
+  const { renderAgenticToolWrapper } = await loadRunnerInternals();
+  assert.equal(
+    renderAgenticToolWrapper({ command: '"/repo/node_modules/.bin/tsx" "/repo/src/tools/gr.ts"', env: { TMPDIR: "/tmp" } }),
+    '#!/bin/sh\nexport TMPDIR="/tmp"\nexec "/repo/node_modules/.bin/tsx" "/repo/src/tools/gr.ts" "$@"\n'
+  );
 });
 
 test("agentic reviewer env prepends gr and git wrapper path and hardens pagers", async () => {

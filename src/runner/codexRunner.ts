@@ -665,15 +665,27 @@ function finalizeAgenticUsage(acc: AgenticUsageAccumulator): CodexAgenticReviewe
   };
 }
 
-async function resolveToolEntrypoint(params: { distPath: string; sourcePath: string }): Promise<string> {
+type ToolEntrypoint = {
+  command: string;
+  env: Record<string, string>;
+};
+
+async function resolveToolEntrypoint(params: { distPath: string; sourcePath: string }): Promise<ToolEntrypoint> {
   try {
     await fs.access(params.distPath);
-    return `node ${JSON.stringify(params.distPath)}`;
+    return { command: `node ${JSON.stringify(params.distPath)}`, env: {} };
   } catch {
     const tsxPath = path.join(runtimeRoot, "node_modules", ".bin", "tsx");
     await fs.access(tsxPath);
-    return `TMPDIR=/tmp ${JSON.stringify(tsxPath)} ${JSON.stringify(params.sourcePath)}`;
+    return { command: `${JSON.stringify(tsxPath)} ${JSON.stringify(params.sourcePath)}`, env: { TMPDIR: "/tmp" } };
   }
+}
+
+function renderAgenticToolWrapper(entrypoint: ToolEntrypoint): string {
+  const exports = Object.entries(entrypoint.env)
+    .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
+    .join("\n");
+  return `#!/bin/sh\n${exports ? `${exports}\n` : ""}exec ${entrypoint.command} "$@"\n`;
 }
 
 async function writeAgenticToolWrappers(stageHomeDir: string): Promise<void> {
@@ -688,12 +700,8 @@ async function writeAgenticToolWrappers(stageHomeDir: string): Promise<void> {
     sourcePath: path.join(runtimeRoot, "src", "tools", "readOnlyGit.ts")
   });
   const wrappers = [
-    ["gr", `#!/bin/sh
-exec ${grEntrypoint} "$@"
-`],
-    ["git", `#!/bin/sh
-exec ${gitEntrypoint} "$@"
-`]
+    ["gr", renderAgenticToolWrapper(grEntrypoint)],
+    ["git", renderAgenticToolWrapper(gitEntrypoint)]
   ] as const;
   for (const [name, body] of wrappers) {
     const filePath = path.join(binDir, name);
@@ -871,6 +879,7 @@ export const __codexRunnerInternals = {
   scanAgenticUsageLine,
   createAgenticUsageAccumulator,
   finalizeAgenticUsage,
+  renderAgenticToolWrapper,
   writeAgenticToolWrappers,
   CodexStageIdleTimeoutError
 };
